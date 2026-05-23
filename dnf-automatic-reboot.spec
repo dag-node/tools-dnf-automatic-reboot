@@ -74,8 +74,46 @@ install -m 0644 doc/README %{buildroot}%{_docdir}/%{name}/README
 install -d -m 0755 %{buildroot}%{_localstatedir}/log
 touch %{buildroot}%{_localstatedir}/log/%{name}.log
 
-%pre
-# Nothing needed before install
+%pre -p /bin/bash
+FAIL=0
+
+# dnf-automatic must be installed (Requires: covers normal installs; this
+# catches --nodeps bypasses).
+if ! rpm -q dnf-automatic > /dev/null 2>&1; then
+    echo "ERROR: dnf-automatic is not installed." >&2
+    echo "       Install it first:  dnf install dnf-automatic" >&2
+    FAIL=1
+fi
+
+# Conflicting timers must be disabled; dnf-automatic-reboot owns the schedule.
+for timer in dnf-automatic.timer dnf-automatic-install.timer; do
+    if systemctl is-enabled --quiet "${timer}" 2>/dev/null; then
+        echo "ERROR: ${timer} is still enabled." >&2
+        echo "       dnf-automatic-reboot replaces its scheduling and reboot handling." >&2
+        echo "       Disable it first:  systemctl disable --now ${timer}" >&2
+        FAIL=1
+    fi
+done
+
+# /etc/dnf/automatic.conf must not trigger reboots itself; this package does that.
+ACONF=/etc/dnf/automatic.conf
+if [[ -f "${ACONF}" ]]; then
+    reboot_val=$(grep -E '^\s*reboot\s*=' "${ACONF}" 2>/dev/null \
+                 | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
+                 | tr -d '[:space:]') || true
+    if [[ -n "${reboot_val}" && "${reboot_val}" != "never" ]]; then
+        echo "ERROR: /etc/dnf/automatic.conf has 'reboot = ${reboot_val}'." >&2
+        echo "       dnf-automatic must not reboot independently of this package." >&2
+        echo "       Set it to 'never' in ${ACONF}:  reboot = never" >&2
+        FAIL=1
+    fi
+fi
+
+if [[ "${FAIL}" -ne 0 ]]; then
+    echo "" >&2
+    echo "Installation aborted. Resolve the issues above and retry." >&2
+    exit 1
+fi
 
 %post
 # Reload systemd unit files

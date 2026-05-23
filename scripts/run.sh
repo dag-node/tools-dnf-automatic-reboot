@@ -60,6 +60,40 @@ conf_get() {
 }
 
 # ---------------------------------------------------------------------------
+# Pre-flight: abort if conflicting services would cause double-reboots
+# ---------------------------------------------------------------------------
+check_conflicts() {
+    local fail=0
+
+    for timer in dnf-automatic.timer dnf-automatic-install.timer; do
+        if systemctl is-enabled --quiet "${timer}" 2>/dev/null || \
+           systemctl is-active  --quiet "${timer}" 2>/dev/null; then
+            log "ERROR: ${timer} is enabled/active and conflicts with this service"
+            log "       Disable it: systemctl disable --now ${timer}"
+            fail=1
+        fi
+    done
+
+    local aconf=/etc/dnf/automatic.conf
+    if [[ -f "${aconf}" ]]; then
+        local reboot_val
+        reboot_val=$(grep -E '^\s*reboot\s*=' "${aconf}" 2>/dev/null \
+                     | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
+                     | tr -d '[:space:]') || true
+        if [[ -n "${reboot_val}" && "${reboot_val}" != "never" ]]; then
+            log "ERROR: /etc/dnf/automatic.conf has reboot = ${reboot_val}"
+            log "       Set 'reboot = never' in /etc/dnf/automatic.conf to avoid double-reboot conflicts"
+            fail=1
+        fi
+    fi
+
+    if [[ "${fail}" -ne 0 ]]; then
+        log "Aborting: resolve the conflicts above, then restart the service"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Read config
 # ---------------------------------------------------------------------------
 REBOOT_DELAY=$(conf_get reboot_delay_sec 60)
@@ -97,6 +131,7 @@ write_state() {
 # ---------------------------------------------------------------------------
 START_TS=$(date +%s)
 log "Starting (pid=${SELF_PID})"
+check_conflicts
 
 # ---------------------------------------------------------------------------
 # Detect concurrent dnf - warn but do not abort; dnf serialises via its own

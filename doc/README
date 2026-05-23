@@ -29,10 +29,11 @@ Files installed
 
   /usr/local/lib/dnf-automatic-reboot/needs-reboot.sh
       Isolated reboot-decision logic.  Called by both run.sh and watchdog.sh.
-      Handles false-positive filtering.  Exit 0=no reboot, 1=reboot needed.
+      Handles false-positive filtering.
+      Exit codes: 0=no reboot needed, 1=reboot needed, 2=tool error (no reboot).
 
   /etc/dnf/dnf-automatic-reboot.conf
-      Configuration.  Preserve across upgrades (%config(noreplace) in RPM).
+      Configuration.  Preserved across upgrades (%config(noreplace) in RPM).
 
   /usr/lib/systemd/system/dnf-automatic-reboot.service
   /usr/lib/systemd/system/dnf-automatic-reboot.timer
@@ -49,28 +50,35 @@ Files installed
 Quick start
 -----------
 
-  # 1. Install the package (or run make install as root)
-  dnf install dnf-automatic-reboot
+Steps 1 and 2 must be completed before running dnf install.  The RPM
+pre-install scriptlet validates them and refuses to install if they are
+not satisfied.
 
-  # 2. Configure dnf-automatic itself
+  # 1. Configure dnf-automatic: disable its own reboot handling and ensure
+  #    updates are applied automatically.
   vi /etc/dnf/automatic.conf
+      reboot = never
       apply_updates = yes
 
-  # 3. Ensure chrony steps the clock immediately on boot and signals sync
-  #    (critical on systems with unreliable RTC such as RPi)
+  # 2. Disable the stock dnf-automatic timers.  This package provides its
+  #    own schedule; running both would apply updates twice.
+  systemctl disable --now dnf-automatic.timer dnf-automatic-install.timer 2>/dev/null || true
+
+  # 3. Install the package
+  dnf install dnf-automatic-reboot
+
+  # 4. Ensure chrony steps the clock immediately on boot and signals sync.
+  #    Critical on systems with unreliable RTC (e.g. RPi without DS1307).
   grep -q 'makestep 1 -1' /etc/chrony.conf || echo 'makestep 1 -1' >> /etc/chrony.conf
   grep -q '^rtcsync'      /etc/chrony.conf || echo 'rtcsync'        >> /etc/chrony.conf
   systemctl restart chronyd
   #    NOTE: systemd-time-wait-sync.service is absent on UEK R8.
   #    The service unit uses Requires=time-sync.target as the best available
   #    gate.  With makestep 1 -1 and a synced RTC the clock offset at boot
-  #    is negligible.  See CLAUDE.md open issues for the full picture.
+  #    is negligible.
 
-  # 4. Configure reboot behaviour (optional - defaults are sane)
+  # 5. Review and optionally tune behaviour (defaults are sane)
   vi /etc/dnf/dnf-automatic-reboot.conf
-
-  # 5. Disable the stock dnf-automatic timers if enabled
-  systemctl disable --now dnf-automatic.timer dnf-automatic-install.timer 2>/dev/null || true
 
   # 6. Enable this package's timers
   systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
@@ -104,7 +112,7 @@ Diagnosing the systemd false-positive
       | paste - - | grep 'PrivateTmp=yes'
 
   # Compare running PID 1 build-id against on-disk binary
-  eu-readelf -n /proc/1/exe           | grep 'Build ID'
+  eu-readelf -n /proc/1/exe              | grep 'Build ID'
   eu-readelf -n /usr/lib/systemd/systemd | grep 'Build ID'
 
   # If they match: false positive (PrivateTmp or debuginfo mismatch).
@@ -131,14 +139,18 @@ Adding to false_positives filter
   filter_packages = kernel-uek,kernel-uek-core,my-package
 
 
-Forcing a manual test run
---------------------------
+Forcing a manual run
+--------------------
 
-  # Dry run (does not actually update or reboot):
+  # Run a full update cycle now -- will apply updates and reboot if needed:
   systemctl start dnf-automatic-reboot.service
   journalctl -u dnf-automatic-reboot.service -f
 
-  # Test needs-reboot detection only:
+  # If the service fails at startup, the journal will report the conflict
+  # (re-enabled timer or wrong reboot setting in automatic.conf):
+  journalctl -u dnf-automatic-reboot.service -e
+
+  # Test needs-reboot detection only (no update, no reboot):
   /usr/local/lib/dnf-automatic-reboot/needs-reboot.sh; echo "exit: $?"
 
   # Test watchdog (with no state file it exits immediately):
@@ -167,4 +179,4 @@ Hardware watchdog (recommended for headless systems)
       RebootWatchdogSec=10min
 
   This causes the kernel to reset the board if systemd stops petting the
-  watchdog for 60 seconds - covers cases this package cannot handle.
+  watchdog for 60 seconds -- covers cases this package cannot handle.
