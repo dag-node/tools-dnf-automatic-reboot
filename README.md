@@ -46,22 +46,30 @@ gracefully without it but false-positive detection for systemd will fall back to
 
 ## Building the RPM
 
-```bash
-# 1. Create rpmbuild tree (once per user)
-mkdir -p ~/rpmbuild/{SPECS,SOURCES,BUILD,RPMS,SRPMS}
+After editing any source file, rebuild with:
 
-# 2. Create the source tarball
+```bash
+# 1. Create the source tarball from the working tree
 make dist
 
-# 3. Copy sources
-cp dnf-automatic-reboot-1.0.tar.gz ~/rpmbuild/SOURCES/
-cp dnf-automatic-reboot.spec        ~/rpmbuild/SPECS/
-
-# 4. Build
-rpmbuild -ba ~/rpmbuild/SPECS/dnf-automatic-reboot.spec
+# 2. Build the RPM in-place (no ~/rpmbuild copying needed)
+rpmbuild -ba dnf-automatic-reboot.spec \
+  --define "_sourcedir $(pwd)" \
+  --define "_specdir $(pwd)"
 
 # Resulting RPM:
 ls ~/rpmbuild/RPMS/noarch/dnf-automatic-reboot-*.noarch.rpm
+```
+
+`make dist` packages the files listed in the Makefile (`SCRIPTS`, `UNITS`, `CONF`,
+`DOC`) into `dnf-automatic-reboot-$(VERSION).tar.gz`. The spec file is passed directly
+to `rpmbuild` and is not included in the tarball.
+
+`rpmbuild` still writes build artefacts under `~/rpmbuild/`; create the tree once if
+it does not exist:
+
+```bash
+mkdir -p ~/rpmbuild/{BUILD,RPMS,SRPMS}
 ```
 
 ## Installing

@@ -45,12 +45,14 @@ All behaviour is controlled by /etc/dnf/dnf-automatic-reboot.conf.
 %build
 # Nothing to compile - shell scripts only
 
+%global _localibdir /usr/local/lib/%{name}
+
 %install
 # Scripts
-install -d -m 0755 %{buildroot}%{_prefix}/lib/%{name}
-install -m 0755 scripts/run.sh          %{buildroot}%{_prefix}/lib/%{name}/run.sh
-install -m 0755 scripts/watchdog.sh     %{buildroot}%{_prefix}/lib/%{name}/watchdog.sh
-install -m 0755 scripts/needs-reboot.sh %{buildroot}%{_prefix}/lib/%{name}/needs-reboot.sh
+install -d -m 0755 %{buildroot}%{_localibdir}
+install -m 0755 scripts/run.sh          %{buildroot}%{_localibdir}/run.sh
+install -m 0755 scripts/watchdog.sh     %{buildroot}%{_localibdir}/watchdog.sh
+install -m 0755 scripts/needs-reboot.sh %{buildroot}%{_localibdir}/needs-reboot.sh
 
 # systemd units
 install -d -m 0755 %{buildroot}%{_unitdir}
@@ -87,7 +89,7 @@ touch %{buildroot}%{_localstatedir}/log/%{name}.log
 # by systemd.  restorecon applies the context matching the fcontext
 # database entry we ship in the %%files section via semanage.
 if [ -x /sbin/restorecon ]; then
-    restorecon -Rv %{_prefix}/lib/%{name}/ \
+    restorecon -Rv %{_localibdir}/ \
                    %{_sysconfdir}/dnf/dnf-automatic-reboot.conf \
                    %{_localstatedir}/log/%{name}.log \
                    2>/dev/null || true
@@ -116,7 +118,7 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 
 # Re-apply SELinux contexts after uninstall (removes custom labels)
 if [ $1 -eq 0 ] && [ -x /sbin/restorecon ]; then
-    restorecon -Rv %{_prefix}/lib/ 2>/dev/null || true
+    restorecon -Rv /usr/local/lib/ 2>/dev/null || true
 fi
 
 %files
@@ -124,9 +126,9 @@ fi
 %doc     %{_docdir}/%{name}/README
 
 # Scripts - shell_exec_t so systemd can exec them directly
-%attr(0755, root, root) %{_prefix}/lib/%{name}/run.sh
-%attr(0755, root, root) %{_prefix}/lib/%{name}/watchdog.sh
-%attr(0755, root, root) %{_prefix}/lib/%{name}/needs-reboot.sh
+%attr(0755, root, root) %{_localibdir}/run.sh
+%attr(0755, root, root) %{_localibdir}/watchdog.sh
+%attr(0755, root, root) %{_localibdir}/needs-reboot.sh
 
 # systemd units
 %{_unitdir}/dnf-automatic-reboot.service
