@@ -1,0 +1,34 @@
+[Unit]
+Description=dnf-automatic with shutdown inhibitor and conditional reboot
+Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
+After=network-online.target time-sync.target
+Wants=network-online.target
+# Block until time synchronization completes so RPM INSTALLTIME entries
+# written by dnf and the boot-time comparison in needs-restarting are both
+# stamped with the correct wall-clock time.
+# time-sync.target is reached once systemd-time-wait-sync.service unblocks,
+# which requires chronyd to signal sync completion.
+# Prerequisites on this host:
+#   systemctl enable systemd-time-wait-sync.service
+#   /etc/chrony.conf must contain: rtcsync
+#   /etc/chrony.conf must contain: makestep 1 -1
+Requires=time-sync.target
+# Prevent a second instance starting if one is already running.
+ConditionPathExists=!/run/dnf-automatic-reboot.lock
+
+[Service]
+Type=oneshot
+# Create lock file before run.sh starts so ConditionPathExists works
+ExecStartPre=/usr/bin/touch /run/dnf-automatic-reboot.lock
+ExecStart=/usr/local/lib/dnf-automatic-reboot/run.sh
+# run.sh removes the lock on clean exit; belt-and-suspenders removal here
+ExecStopPost=/usr/bin/rm -f /run/dnf-automatic-reboot.lock
+RemainAfterExit=no
+# run.sh owns all its own timeouts via the `timeout` command.
+# Do not let systemd kill it independently.
+TimeoutStartSec=infinity
+# Ensure log directory exists
+LogsDirectory=dnf-automatic-reboot
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dnf-automatic-reboot

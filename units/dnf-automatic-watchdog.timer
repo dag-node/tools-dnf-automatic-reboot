@@ -1,0 +1,13 @@
+[Unit]
+Description=dnf-automatic-reboot watchdog - runs every 5 minutes
+Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
+
+[Timer]
+# Poll frequently so stuck runs are caught quickly within the soft/hard
+# timeout windows.
+OnCalendar=*-*-* *:*:00/5
+RandomizedDelaySec=10s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

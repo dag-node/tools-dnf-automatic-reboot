@@ -1,0 +1,170 @@
+dnf-automatic-reboot
+====================
+
+Unattended update + conditional reboot for Oracle Linux 9 / RHEL 9 (aarch64).
+Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
+
+  - Holds a systemd shutdown inhibitor while updates are in progress so an
+    accidental reboot does not corrupt a partial update.
+  - Filters known false-positive reboot triggers (UEK aarch64 version-string
+    mismatch, systemd PrivateTmp build-id masking) to avoid a permanent
+    nightly reboot cycle.
+  - Detects genuine reboots (systemd binary actually changed, real kernel
+    update) and schedules a timed reboot.
+  - An independent watchdog timer handles hung runs: soft timeout checks
+    whether dnf is still active; hard timeout kills the process tree and
+    force-reboots.
+  - Detects concurrent manual dnf invocations and warns logged-in users.
+  - All timeouts and behaviour are configurable without editing scripts.
+
+
+Files installed
+---------------
+
+  /usr/local/lib/dnf-automatic-reboot/run.sh
+      Main orchestration.  Called by the service unit.
+
+  /usr/local/lib/dnf-automatic-reboot/watchdog.sh
+      Independent watchdog.  Called every 5 minutes by watchdog.timer.
+
+  /usr/local/lib/dnf-automatic-reboot/needs-reboot.sh
+      Isolated reboot-decision logic.  Called by both run.sh and watchdog.sh.
+      Handles false-positive filtering.  Exit 0=no reboot, 1=reboot needed.
+
+  /etc/dnf/dnf-automatic-reboot.conf
+      Configuration.  Preserve across upgrades (%config(noreplace) in RPM).
+
+  /usr/lib/systemd/system/dnf-automatic-reboot.service
+  /usr/lib/systemd/system/dnf-automatic-reboot.timer
+      Main service + daily timer (default: 03:00 +/- 10min random).
+
+  /usr/lib/systemd/system/dnf-automatic-watchdog.service
+  /usr/lib/systemd/system/dnf-automatic-watchdog.timer
+      Watchdog service + 5-minute polling timer.
+
+  /var/log/dnf-automatic-reboot.log
+      All events logged here in addition to the journal.
+
+
+Quick start
+-----------
+
+  # 1. Install the package (or run make install as root)
+  dnf install dnf-automatic-reboot
+
+  # 2. Configure dnf-automatic itself
+  vi /etc/dnf/automatic.conf
+      apply_updates = yes
+
+  # 3. Ensure chrony steps the clock immediately on boot and signals sync
+  #    (critical on systems with unreliable RTC such as RPi)
+  grep -q 'makestep 1 -1' /etc/chrony.conf || echo 'makestep 1 -1' >> /etc/chrony.conf
+  grep -q '^rtcsync'      /etc/chrony.conf || echo 'rtcsync'        >> /etc/chrony.conf
+  systemctl restart chronyd
+  #    NOTE: systemd-time-wait-sync.service is absent on UEK R8.
+  #    The service unit uses Requires=time-sync.target as the best available
+  #    gate.  With makestep 1 -1 and a synced RTC the clock offset at boot
+  #    is negligible.  See CLAUDE.md open issues for the full picture.
+
+  # 4. Configure reboot behaviour (optional - defaults are sane)
+  vi /etc/dnf/dnf-automatic-reboot.conf
+
+  # 5. Disable the stock dnf-automatic timers if enabled
+  systemctl disable --now dnf-automatic.timer dnf-automatic-install.timer 2>/dev/null || true
+
+  # 6. Enable this package's timers
+  systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
+
+  # 7. Verify
+  systemctl list-timers dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
+
+
+Checking inhibitor lock status
+-------------------------------
+
+  systemd-inhibit --list
+
+
+Viewing logs
+------------
+
+  journalctl -u dnf-automatic-reboot.service
+  journalctl -u dnf-automatic-watchdog.service
+  tail -f /var/log/dnf-automatic-reboot.log
+
+
+Diagnosing the systemd false-positive
+--------------------------------------
+
+  # Identify which PIDs are triggering the systemd flag
+  needs-restarting -v 2>/dev/null | grep -i systemd
+
+  # Check which services use PrivateTmp (common cause)
+  systemctl show '*' --property=PrivateTmp --property=Id 2>/dev/null \
+      | paste - - | grep 'PrivateTmp=yes'
+
+  # Compare running PID 1 build-id against on-disk binary
+  eu-readelf -n /proc/1/exe           | grep 'Build ID'
+  eu-readelf -n /usr/lib/systemd/systemd | grep 'Build ID'
+
+  # If they match: false positive (PrivateTmp or debuginfo mismatch).
+  # needs-reboot.sh handles this automatically when eu-readelf is available.
+  # eu-readelf is in the elfutils package:
+  dnf install elfutils
+
+
+Diagnosing UEK false-positive
+-------------------------------
+
+  uname -r
+  rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-uek | sort -V | tail -1
+
+  # If the strings match (modulo trailing .aarch64): confirmed false positive.
+  # needs-reboot.sh filters this automatically.
+
+
+Adding to false_positives filter
+---------------------------------
+
+  # Edit /etc/dnf/dnf-automatic-reboot.conf
+  [false_positives]
+  filter_packages = kernel-uek,kernel-uek-core,my-package
+
+
+Forcing a manual test run
+--------------------------
+
+  # Dry run (does not actually update or reboot):
+  systemctl start dnf-automatic-reboot.service
+  journalctl -u dnf-automatic-reboot.service -f
+
+  # Test needs-reboot detection only:
+  /usr/local/lib/dnf-automatic-reboot/needs-reboot.sh; echo "exit: $?"
+
+  # Test watchdog (with no state file it exits immediately):
+  /usr/local/lib/dnf-automatic-reboot/watchdog.sh
+
+
+Uninstalling
+------------
+
+  dnf remove dnf-automatic-reboot
+  # or
+  make uninstall
+
+  The log file /var/log/dnf-automatic-reboot.log is preserved on uninstall.
+  Remove manually if not needed:  rm /var/log/dnf-automatic-reboot.log
+
+
+Hardware watchdog (recommended for headless systems)
+-----------------------------------------------------
+
+  For protection against kernel panics and OOM events that prevent any
+  userspace recovery, enable the systemd hardware watchdog:
+
+  /etc/systemd/system.conf:
+      RuntimeWatchdogSec=60
+      RebootWatchdogSec=10min
+
+  This causes the kernel to reset the board if systemd stops petting the
+  watchdog for 60 seconds - covers cases this package cannot handle.

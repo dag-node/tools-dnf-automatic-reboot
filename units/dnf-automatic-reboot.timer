@@ -1,0 +1,15 @@
+[Unit]
+Description=dnf-automatic with inhibitor and conditional reboot - daily timer
+Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
+
+[Timer]
+# Run at 03:00 daily.  RandomizedDelaySec spreads load when many hosts
+# use the same schedule (e.g. in a fleet).
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=10min
+# If the system was off when the timer would have fired, run immediately
+# on next boot (within the window).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

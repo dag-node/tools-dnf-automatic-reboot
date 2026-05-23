@@ -1,0 +1,13 @@
+[Unit]
+Description=dnf-automatic-reboot watchdog check
+Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
+# Intentionally has no After= dependency on the main service so it runs
+# independently even when the main service is hung.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/dnf-automatic-reboot/watchdog.sh
+RemainAfterExit=no
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dnf-automatic-watchdog
