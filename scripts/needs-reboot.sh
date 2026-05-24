@@ -86,7 +86,7 @@ IFS="${OLD_IFS}"
 for pkg in "${FP_LIST[@]}"; do
     pkg=$(echo "${pkg}" | tr -d ' ')
     [[ -z "${pkg}" ]] && continue
-    filtered=$(echo "${filtered}" | grep -v -E "^\s*${pkg}\s*$") || true
+    filtered=$(echo "${filtered}" | grep -v -E "^\s*(\*\s*)?${pkg}\s*$") || true
 done
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ if [[ "${VERIFY_KERNEL}" == "yes" && "$(uname -m)" == "aarch64" ]]; then
         else
             log "UEK genuine mismatch: uname=${running} rpm=${highest_uek}"
             # Re-add kernel-uek lines to filtered so they trigger the reboot.
-            kern_lines=$(echo "${raw}" | grep -E "^\s*kernel-uek") || true
+            kern_lines=$(echo "${raw}" | grep -E "^\s*(\*\s*)?kernel-uek") || true
             if [[ -n "${kern_lines}" ]]; then
                 filtered="${filtered}"$'\n'"${kern_lines}"
             fi
@@ -125,7 +125,7 @@ fi
 # Method: compare the ELF build-id of the running PID 1 binary against
 # the build-id embedded in the installed package's binary on disk.
 # ---------------------------------------------------------------------------
-if echo "${filtered}" | grep -qE "^\s*systemd\s*$"; then
+if echo "${filtered}" | grep -qE "^\s*(\*\s*)?systemd\s*$"; then
     running_buildid=""
     disk_buildid=""
 
@@ -140,7 +140,7 @@ if echo "${filtered}" | grep -qE "^\s*systemd\s*$"; then
     if [[ -n "${running_buildid}" && -n "${disk_buildid}" ]]; then
         if [[ "${running_buildid}" == "${disk_buildid}" ]]; then
             log "systemd build-id match: running=${running_buildid} - false positive, filtering"
-            filtered=$(echo "${filtered}" | grep -v -E "^\s*systemd\s*$") || true
+            filtered=$(echo "${filtered}" | grep -v -E "^\s*(\*\s*)?systemd\s*$") || true
         else
             log "systemd build-id mismatch: running=${running_buildid} disk=${disk_buildid} - genuine"
         fi
