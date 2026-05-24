@@ -36,7 +36,7 @@ Companion service to dnf-automatic that:
     timeouts to recover from hung updates without operator intervention.
   - Warns logged-in users via wall(1) at all key events.
 
-All behaviour is controlled by /etc/dnf/dnf-automatic-reboot.conf.
+All behaviour is controlled by /etc/dnf/automatic-reboot.conf.
 
 %prep
 %autosetup
@@ -62,8 +62,8 @@ install -m 0644 units/dnf-automatic-watchdog.timer   %{buildroot}%{_unitdir}/
 
 # Config file - noreplace preserves local edits on upgrade
 install -d -m 0755 %{buildroot}%{_sysconfdir}/dnf
-install -m 0640 conf/dnf-automatic-reboot.conf \
-    %{buildroot}%{_sysconfdir}/dnf/dnf-automatic-reboot.conf
+install -m 0640 conf/automatic-reboot.conf \
+    %{buildroot}%{_sysconfdir}/dnf/automatic-reboot.conf
 
 # Documentation
 install -d -m 0755 %{buildroot}%{_docdir}/%{name}
@@ -127,7 +127,7 @@ fi
 # database entry we ship in the %%files section via semanage.
 if [ -x /sbin/restorecon ]; then
     restorecon -Rv %{_localibdir}/ \
-                   %{_sysconfdir}/dnf/dnf-automatic-reboot.conf \
+                   %{_sysconfdir}/dnf/automatic-reboot.conf \
                    %{_localstatedir}/log/%{name}.log \
                    2>/dev/null || true
 fi
@@ -137,7 +137,7 @@ echo "dnf-automatic-reboot installed."
 echo ""
 echo "Next steps:"
 echo "  1. Ensure /etc/dnf/automatic.conf has apply_updates = yes"
-echo "  2. Review /etc/dnf/dnf-automatic-reboot.conf"
+echo "  2. Review /etc/dnf/automatic-reboot.conf"
 echo "  3. Disable stock timers if not already done:"
 echo "       systemctl disable --now dnf-automatic.timer dnf-automatic-install.timer"
 echo "  4. Enable this package:"
@@ -174,7 +174,7 @@ fi
 %{_unitdir}/dnf-automatic-watchdog.timer
 
 # Config - preserved across upgrades; root:root 640 (no world read for safety)
-%config(noreplace) %attr(0640, root, root) %{_sysconfdir}/dnf/dnf-automatic-reboot.conf
+%config(noreplace) %attr(0640, root, root) %{_sysconfdir}/dnf/automatic-reboot.conf
 
 # Log file - var_log_t context applied by restorecon in %%post
 %ghost %attr(0640, root, root) %{_localstatedir}/log/%{name}.log
@@ -188,4 +188,4 @@ fi
 - Independent watchdog with configurable soft/hard timeouts
 - filter_packages defaults include kernel-uek,kernel-uek-core,systemd
 - Requires=time-sync.target; note systemd-time-wait-sync absent on UEK R8
-- All settings in /etc/dnf/dnf-automatic-reboot.conf
+- All settings in /etc/dnf/automatic-reboot.conf

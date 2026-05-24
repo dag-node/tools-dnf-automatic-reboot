@@ -21,7 +21,7 @@ README.md                       Build + install guide (this repo)
 CLAUDE.md                       This file
 dnf-automatic-reboot.spec       RPM spec
 Makefile                        build / install / dist / clean targets
-conf/dnf-automatic-reboot.conf  Runtime config installed to /etc/dnf/
+conf/automatic-reboot.conf  Runtime config installed to /etc/dnf/
 scripts/run.sh                  Main orchestration (inhibitor + dnf + reboot)
 scripts/watchdog.sh             Independent watchdog (soft/hard timeout)
 scripts/needs-reboot.sh         Reboot decision + false-positive filtering
@@ -33,7 +33,7 @@ doc/README                      Operational reference (installed to /usr/share/d
 
 ```
 /usr/local/lib/dnf-automatic-reboot/   scripts/
-/etc/dnf/dnf-automatic-reboot.conf     config (%config noreplace)
+/etc/dnf/automatic-reboot.conf     config (%config noreplace)
 /usr/lib/systemd/system/               unit files
 /usr/share/doc/dnf-automatic-reboot/   doc/README
 /var/log/dnf-automatic-reboot.log      runtime log (%ghost in RPM)
@@ -48,7 +48,7 @@ doc/README                      Operational reference (installed to /usr/share/d
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly CONF=/etc/dnf/dnf-automatic-reboot.conf
+readonly CONF=/etc/dnf/automatic-reboot.conf
 readonly LOG=/var/log/dnf-automatic-reboot.log
 readonly SELF=script-name   # used in log prefix
 
@@ -72,7 +72,7 @@ conf_get() {
 
 ### Config file parsing
 
-All tunables live in `conf/dnf-automatic-reboot.conf`. Scripts never have hardcoded
+All tunables live in `conf/automatic-reboot.conf`. Scripts never have hardcoded
 policy values — always `conf_get key default`. This keeps scripts testable without
 installing the config.
 

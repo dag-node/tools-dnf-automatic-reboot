@@ -12,7 +12,7 @@ dnf-automatic-reboot/
   Makefile                          Build, install, uninstall, dist targets
   dnf-automatic-reboot.spec         RPM spec file
   conf/
-    dnf-automatic-reboot.conf       Runtime configuration (installed to /etc/dnf/)
+    automatic-reboot.conf       Runtime configuration (installed to /etc/dnf/)
   scripts/
     run.sh                          Main orchestration: inhibitor + dnf + reboot decision
     watchdog.sh                     Independent watchdog: soft/hard timeout + stuck detection

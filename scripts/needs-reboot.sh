@@ -13,12 +13,12 @@
 #   2  Tool error (needs-restarting failed unexpectedly); treated as
 #      "no reboot" to avoid a reboot loop on tool failure.
 #
-# Configuration is read from /etc/dnf/dnf-automatic-reboot.conf.
+# Configuration is read from /etc/dnf/automatic-reboot.conf.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly CONF=/etc/dnf/dnf-automatic-reboot.conf
+readonly CONF=/etc/dnf/automatic-reboot.conf
 readonly LOG=/var/log/dnf-automatic-reboot.log
 readonly SELF=needs-reboot
 

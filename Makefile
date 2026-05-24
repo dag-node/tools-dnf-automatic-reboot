@@ -13,7 +13,7 @@ UNITS   = units/dnf-automatic-reboot.service \
           units/dnf-automatic-reboot.timer \
           units/dnf-automatic-watchdog.service \
           units/dnf-automatic-watchdog.timer
-CONF    = conf/dnf-automatic-reboot.conf
+CONF    = conf/automatic-reboot.conf
 DOC     = doc/README
 
 .PHONY: all install uninstall dist clean

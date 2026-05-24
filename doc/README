@@ -32,7 +32,7 @@ Files installed
       Handles false-positive filtering.
       Exit codes: 0=no reboot needed, 1=reboot needed, 2=tool error (no reboot).
 
-  /etc/dnf/dnf-automatic-reboot.conf
+  /etc/dnf/automatic-reboot.conf
       Configuration.  Preserved across upgrades (%config(noreplace) in RPM).
 
   /usr/lib/systemd/system/dnf-automatic-reboot.service
@@ -78,7 +78,7 @@ not satisfied.
   #    is negligible.
 
   # 5. Review and optionally tune behaviour (defaults are sane)
-  vi /etc/dnf/dnf-automatic-reboot.conf
+  vi /etc/dnf/automatic-reboot.conf
 
   # 6. Enable this package's timers
   systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
@@ -132,7 +132,7 @@ Diagnosing UEK false-positive
 Adding to false_positives filter
 ---------------------------------
 
-  # Edit /etc/dnf/dnf-automatic-reboot.conf
+  # Edit /etc/dnf/automatic-reboot.conf
   [false_positives]
   filter_packages = kernel-uek,kernel-uek-core,my-package
 

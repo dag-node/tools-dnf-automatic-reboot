@@ -19,13 +19,13 @@
 #   start=  unix timestamp
 #   pid=    PID of this script
 #
-# Configuration: /etc/dnf/dnf-automatic-reboot.conf
+# Configuration: /etc/dnf/automatic-reboot.conf
 # Log:           /var/log/dnf-automatic-reboot.log
 # ---------------------------------------------------------------------------
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly CONF=/etc/dnf/dnf-automatic-reboot.conf
+readonly CONF=/etc/dnf/automatic-reboot.conf
 readonly STATE_FILE=/run/dnf-automatic-reboot.state
 readonly LOCK_FILE=/run/dnf-automatic-reboot.lock
 readonly LOG=/var/log/dnf-automatic-reboot.log
