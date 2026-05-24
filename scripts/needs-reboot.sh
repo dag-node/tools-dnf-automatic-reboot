@@ -26,7 +26,16 @@ readonly SELF=needs-reboot
 # Logging
 # ---------------------------------------------------------------------------
 log() {
-    echo "$(date -Iseconds) ${SELF}: $*" | tee -a "${LOG}"
+    printf '<6>%s: %s\n' "${SELF}" "$*"
+    printf '%s %s: %s\n' "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true
+}
+log_warn() {
+    printf '<4>%s: %s\n' "${SELF}" "$*"
+    printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true
+}
+log_err() {
+    printf '<3>%s: %s\n' "${SELF}" "$*"
+    printf '%s %s: ERROR: %s\n' "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -63,7 +72,7 @@ fi
 
 if [[ "${nr_exit}" -gt 1 ]]; then
     # Anything above 1 is a tool-level failure (missing binary, timeout, etc.)
-    log "needs-restarting exited ${nr_exit} - tool error, treating as no reboot needed"
+    log_warn "needs-restarting exited ${nr_exit} - treating as no reboot needed"
     exit 2
 fi
 
@@ -153,7 +162,7 @@ verify_buildid() {
     done
 
     if [[ -z "${proc_exe}" ]]; then
-        log "${pkg}: no running process found, skipping build-id check"
+        log_warn "${pkg}: no running process found, skipping build-id check"
         return 1
     fi
 
@@ -163,7 +172,7 @@ verify_buildid() {
         | grep 'Build ID' | awk '{print $NF}') || true
 
     if [[ -z "${running_buildid}" || -z "${disk_buildid}" ]]; then
-        log "${pkg}: could not read build-ids"
+        log_warn "${pkg}: could not read build-ids"
         return 1
     fi
 
@@ -177,7 +186,7 @@ verify_buildid() {
 }
 
 if ! command -v eu-readelf &>/dev/null; then
-    log "eu-readelf unavailable - elfutils is required"
+    log_err "eu-readelf unavailable - elfutils is required"
     exit 2
 fi
 

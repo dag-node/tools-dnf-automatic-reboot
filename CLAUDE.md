@@ -52,7 +52,9 @@ readonly CONF=/etc/dnf/automatic-reboot.conf
 readonly LOG=/var/log/dnf-automatic-reboot.log
 readonly SELF=script-name   # used in log prefix
 
-log() { echo "$(date -Iseconds) ${SELF}: $*" | tee -a "${LOG}"; }
+log()      { printf '<6>%s: %s\n' "${SELF}" "$*"; printf '%s %s: %s\n'          "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true; }
+log_warn() { printf '<4>%s: %s\n' "${SELF}" "$*"; printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true; }
+log_err()  { printf '<3>%s: %s\n' "${SELF}" "$*"; printf '%s %s: ERROR: %s\n'   "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true; }
 
 # Config reader: conf_get KEY DEFAULT
 conf_get() {

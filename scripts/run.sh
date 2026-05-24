@@ -38,7 +38,16 @@ SELF_PID=$$
 # Logging
 # ---------------------------------------------------------------------------
 log() {
-    echo "$(date -Iseconds) ${SELF}[${SELF_PID}]: $*" | tee -a "${LOG}"
+    printf '<6>%s: %s\n' "${SELF}" "$*"
+    printf '%s %s: %s\n' "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true
+}
+log_warn() {
+    printf '<4>%s: %s\n' "${SELF}" "$*"
+    printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true
+}
+log_err() {
+    printf '<3>%s: %s\n' "${SELF}" "$*"
+    printf '%s %s: ERROR: %s\n' "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true
 }
 
 wall_msg() {
@@ -68,8 +77,7 @@ check_conflicts() {
     for timer in dnf-automatic.timer dnf-automatic-install.timer; do
         if systemctl is-enabled --quiet "${timer}" 2>/dev/null || \
            systemctl is-active  --quiet "${timer}" 2>/dev/null; then
-            log "ERROR: ${timer} is enabled/active and conflicts with this service"
-            log "       Disable it: systemctl disable --now ${timer}"
+            log_err "${timer} is enabled/active - conflicts with this service; disable with: systemctl disable --now ${timer}"
             fail=1
         fi
     done
@@ -81,14 +89,13 @@ check_conflicts() {
                      | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
                      | tr -d '[:space:]') || true
         if [[ -n "${reboot_val}" && "${reboot_val}" != "never" ]]; then
-            log "ERROR: /etc/dnf/automatic.conf has reboot = ${reboot_val}"
-            log "       Set 'reboot = never' in /etc/dnf/automatic.conf to avoid double-reboot conflicts"
+            log_err "/etc/dnf/automatic.conf has reboot = ${reboot_val}; set 'reboot = never' to avoid double-reboot conflicts"
             fail=1
         fi
     fi
 
     if [[ "${fail}" -ne 0 ]]; then
-        log "Aborting: resolve the conflicts above, then restart the service"
+        log_err "Aborting: resolve the conflicts above, then restart the service"
         exit 1
     fi
 }
@@ -138,7 +145,7 @@ check_conflicts
 # lock so this is safe.  The warning gives admins a chance to hold off.
 # ---------------------------------------------------------------------------
 if pgrep -x dnf > /dev/null 2>&1 || pgrep -x dnf-automatic > /dev/null 2>&1; then
-    log "WARNING: dnf process already running - will contend on dnf lock"
+    log_warn "dnf process already running - will contend on dnf lock"
     wall_msg "dnf-automatic-reboot: WARNING - manual dnf detected. Automatic update" \
              "will wait for the dnf lock. Do not reboot manually until this completes."
 fi
@@ -171,7 +178,7 @@ timeout --kill-after="${KILL_GRACE}s" "${DNF_TIMEOUT}m" /usr/bin/dnf-automatic \
     || dnf_exit=$?
 
 if [[ "${dnf_exit}" -ne 0 ]]; then
-    log "ERROR: dnf-automatic exited ${dnf_exit}"
+    log_err "dnf-automatic exited ${dnf_exit}"
     write_state "failed"
     wall_msg "dnf-automatic-reboot: Update FAILED (exit ${dnf_exit})." \
              "Manual inspection required."

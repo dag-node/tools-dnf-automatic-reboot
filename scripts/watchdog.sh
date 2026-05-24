@@ -41,7 +41,16 @@ readonly SELF=watchdog
 # Logging
 # ---------------------------------------------------------------------------
 log() {
-    echo "$(date -Iseconds) ${SELF}: $*" | tee -a "${LOG}"
+    printf '<6>%s: %s\n' "${SELF}" "$*"
+    printf '%s %s: %s\n' "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true
+}
+log_warn() {
+    printf '<4>%s: %s\n' "${SELF}" "$*"
+    printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true
+}
+log_err() {
+    printf '<3>%s: %s\n' "${SELF}" "$*"
+    printf '%s %s: ERROR: %s\n' "$(date -Iseconds)" "${SELF}" "$*" >> "${LOG}" 2>/dev/null || true
 }
 
 wall_msg() {
@@ -99,8 +108,7 @@ log "phase=${phase} elapsed=${elapsed_min}min pid=${service_pid}"
 # Scenario 2: dead PID with state file present
 # ---------------------------------------------------------------------------
 if ! kill -0 "${service_pid}" 2>/dev/null; then
-    log "WARNING: service PID ${service_pid} is dead but state file exists"
-    log "Updates may be incomplete. NOT rebooting - manual inspection required."
+    log_warn "service PID ${service_pid} is dead but state file exists - updates may be incomplete, NOT rebooting"
     wall_msg "dnf-automatic-reboot: WARNING - update process (PID ${service_pid})" \
              "died unexpectedly in phase=${phase}." \
              "Manual inspection required before rebooting."
@@ -112,7 +120,7 @@ fi
 # Scenario 3: hard timeout - PID still alive after HARD_MIN
 # ---------------------------------------------------------------------------
 if [[ "${elapsed_min}" -ge "${HARD_MIN}" ]]; then
-    log "HARD TIMEOUT ${HARD_MIN}min exceeded - PID ${service_pid} still alive - force rebooting"
+    log_err "hard timeout ${HARD_MIN}min exceeded - PID ${service_pid} still alive - force rebooting"
     wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_MIN}min exceeded." \
              "Killing stuck process and force rebooting now."
     # Kill children first, then the script itself, to release dnf lock files
