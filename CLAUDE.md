@@ -116,7 +116,7 @@ output and `grep -F` against `uname -r`. Match = false positive. Mismatch = genu
 during a previous boot cycle, INSTALLTIME stays newer than all subsequent boot
 timestamps permanently. Cross-verification: `eu-readelf -n /proc/1/exe` vs
 `eu-readelf -n /usr/lib/systemd/systemd` — matching build-ids = false positive.
-Requires `elfutils`. Degrades safely (keeps flag) if absent.
+Requires `elfutils` (hard RPM dependency).
 
 ## SELinux rules
 
@@ -134,7 +134,7 @@ Requires `elfutils`. Degrades safely (keeps flag) if absent.
 - `%systemd_post` / `%systemd_preun` / `%systemd_postun_with_restart` macros — never
   call `systemctl` directly in scriptlets.
 - `BuildArch: noarch` — shell scripts only, no compiled artifacts.
-- `Recommends: elfutils` not `Requires` — the package is functional without it.
+- `Requires: elfutils` — `eu-readelf` is required for the systemd build-id check.
 - Version bump: update both `Makefile` (`VERSION`) and `dnf-automatic-reboot.spec`
   (`Version:` + `%changelog`).
 
@@ -186,7 +186,7 @@ tail -f /var/log/dnf-automatic-reboot.log
 - Do not add `setenforce 0` or `permissive` as a workaround for any SELinux denial.
 - Do not hardcode policy (timeouts, package names) in scripts — use `conf_get`.
 - Do not call `systemctl` directly in RPM scriptlets — use the `%systemd_*` macros.
-- Do not add `Requires: elfutils` — the build-id path must degrade gracefully.
+- Do not downgrade `Requires: elfutils` to `Recommends` — `eu-readelf` is required and absence exits with code 2.
 - Do not filter a package in `filter_packages` without confirming the false positive
   with the build-id or version cross-check first.
 - Do not use `return` at script top level — use `exit`.

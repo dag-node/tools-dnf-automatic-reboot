@@ -17,8 +17,7 @@ Requires:       dnf-plugins-core
 Requires:       systemd
 Requires:       util-linux
 # eu-readelf for systemd build-id comparison (false-positive detection)
-# Soft dependency: needs-reboot.sh degrades gracefully without it
-Recommends:     elfutils
+Requires:       elfutils
 
 # We install systemd unit files
 BuildRequires:  systemd-rpm-macros

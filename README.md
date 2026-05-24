@@ -40,9 +40,7 @@ dnf install rpm-build systemd-rpm-macros
 dnf install dnf-automatic dnf-plugins-core elfutils
 ```
 
-`elfutils` provides `eu-readelf` for systemd build-id comparison. The package degrades
-gracefully without it but the systemd false-positive check falls back to the
-`filter_packages` list only.
+`elfutils` provides `eu-readelf`, required for systemd build-id comparison.
 
 ## Before installing
 

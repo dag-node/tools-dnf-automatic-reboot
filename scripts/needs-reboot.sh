@@ -68,8 +68,8 @@ if [[ "${nr_exit}" -gt 1 ]]; then
 fi
 
 # nr_exit == 1: reboot flagged; now filter false positives
-log "needs-restarting flagged reboot; raw output:"
-log "${raw}"
+flagged=$(echo "${raw}" | grep -E "^\s*\*\s*" | sed 's/^\s*\*\s*//' | paste -sd ',' -) || true
+log "Packages flagged by needs-restarting: ${flagged}"
 
 # ---------------------------------------------------------------------------
 # Build the filtered output by removing known false-positive package lines.
@@ -105,10 +105,10 @@ if [[ "${VERIFY_KERNEL}" == "yes" && "$(uname -m)" == "aarch64" ]]; then
         # Include it.  Strip the trailing arch suffix for comparison.
         highest_norm="${highest_uek%.aarch64}"
         if echo "${running}" | grep -qF "${highest_norm}"; then
-            log "UEK false positive confirmed: uname=${running} rpm=${highest_uek}"
+            log "Running kernel matches installed RPM (${running})"
             # Already removed from filtered above; nothing more to do.
         else
-            log "UEK genuine mismatch: uname=${running} rpm=${highest_uek}"
+            log "New kernel found, running=${running} installed=${highest_uek}"
             # Re-add kernel-uek lines to filtered so they trigger the reboot.
             kern_lines=$(echo "${raw}" | grep -E "^\s*(\*\s*)?kernel-uek") || true
             if [[ -n "${kern_lines}" ]]; then
@@ -139,27 +139,29 @@ if echo "${filtered}" | grep -qE "^\s*(\*\s*)?systemd\s*$"; then
 
     if [[ -n "${running_buildid}" && -n "${disk_buildid}" ]]; then
         if [[ "${running_buildid}" == "${disk_buildid}" ]]; then
-            log "systemd build-id match: running=${running_buildid} - false positive, filtering"
+            log "Skipping systemd, latest version already installed and running"
             filtered=$(echo "${filtered}" | grep -v -E "^\s*(\*\s*)?systemd\s*$") || true
         else
-            log "systemd build-id mismatch: running=${running_buildid} disk=${disk_buildid} - genuine"
+            log "New version of systemd found (running=${running_buildid} disk=${disk_buildid})"
         fi
     else
-        log "systemd: could not read build-ids (eu-readelf missing or /proc/1/exe unreadable)"
-        log "systemd will remain in reboot trigger list"
+        log "eu-readelf unavailable - elfutils is required"
+        exit 2
     fi
 fi
 
 # ---------------------------------------------------------------------------
 # Final decision
 # ---------------------------------------------------------------------------
-real=$(echo "${filtered}" | grep -v '^\s*$' \
-       | grep -v 'Core libraries\|updated since boot\|Reboot is required') || true
+real=$(echo "${filtered}" \
+       | grep -E "^\s*(\*\s*)?\S" \
+       | grep -v 'Core libraries\|updated since boot\|Reboot is required\|More information') || true
 
 if [[ -z "${real}" ]]; then
-    log "All reboot triggers were false positives - no reboot needed"
+    log "All triggers filtered as false positives - no reboot needed"
     exit 0
 fi
 
-log "Genuine reboot triggers: ${real}"
+real_list=$(echo "${real}" | sed 's/^\s*\*\s*//' | paste -sd ',' -) || true
+log "Reboot needed: ${real_list}"
 exit 1

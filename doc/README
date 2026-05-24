@@ -116,9 +116,7 @@ Diagnosing the systemd false-positive
   eu-readelf -n /usr/lib/systemd/systemd | grep 'Build ID'
 
   # If they match: false positive (PrivateTmp or debuginfo mismatch).
-  # needs-reboot.sh handles this automatically when eu-readelf is available.
-  # eu-readelf is in the elfutils package:
-  dnf install elfutils
+  # needs-reboot.sh handles this automatically via eu-readelf (elfutils, required).
 
 
 Diagnosing UEK false-positive
