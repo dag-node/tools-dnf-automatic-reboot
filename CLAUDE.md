@@ -114,8 +114,10 @@ output and `grep -F` against `uname -r`. Match = false positive. Mismatch = genu
 
 `needs-restarting` uses `INSTALLTIME > boot_ts` for systemd. If systemd was updated
 during a previous boot cycle, INSTALLTIME stays newer than all subsequent boot
-timestamps permanently. Cross-verification: `eu-readelf -n /proc/1/exe` vs
-`eu-readelf -n /usr/lib/systemd/systemd` — matching build-ids = false positive.
+timestamps permanently. Cross-verification: walk `/proc/*/exe`, find a process whose binary is owned
+by the package (`rpm -qf`), compare ELF build-ids of the running process against
+the on-disk binary via `eu-readelf` — matching build-ids = false positive.
+Applies generically to any non-kernel package in `filter_packages`.
 Requires `elfutils` (hard RPM dependency).
 
 ## SELinux rules

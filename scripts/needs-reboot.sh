@@ -119,36 +119,77 @@ if [[ "${VERIFY_KERNEL}" == "yes" && "$(uname -m)" == "aarch64" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# systemd perpetual-flag detection
-# Check whether the systemd flag is caused by PrivateTmp namespace masking
-# or a debuginfo build-id mismatch rather than a real update.
-# Method: compare the ELF build-id of the running PID 1 binary against
-# the build-id embedded in the installed package's binary on disk.
+# Build-id cross-verification for filtered non-kernel packages.
+# For each package removed from the trigger list, confirm it is a genuine
+# false positive by comparing the ELF build-id of its running process
+# against the installed binary on disk.  If build-ids differ the package
+# is a genuine update and is re-added to filtered.
 # ---------------------------------------------------------------------------
-if echo "${filtered}" | grep -qE "^\s*(\*\s*)?systemd\s*$"; then
-    running_buildid=""
-    disk_buildid=""
 
-    # eu-readelf is in elfutils; file(1) cannot extract build-ids reliably
-    if command -v eu-readelf &>/dev/null; then
-        running_buildid=$(eu-readelf -n /proc/1/exe 2>/dev/null \
-            | grep 'Build ID' | awk '{print $NF}') || true
-        disk_buildid=$(eu-readelf -n /usr/lib/systemd/systemd 2>/dev/null \
-            | grep 'Build ID' | awk '{print $NF}') || true
-    fi
+# verify_buildid PKG
+# Walks /proc/*/exe to find a running process whose binary is owned by PKG,
+# then compares ELF build-ids between that process and the on-disk binary.
+# Returns: 0=false positive confirmed  1=cannot verify  2=genuine update
+verify_buildid() {
+    local pkg="$1"
+    local link target owner proc_exe="" disk_bin=""
+    local running_buildid="" disk_buildid=""
 
-    if [[ -n "${running_buildid}" && -n "${disk_buildid}" ]]; then
-        if [[ "${running_buildid}" == "${disk_buildid}" ]]; then
-            log "Skipping systemd, latest version already installed and running"
-            filtered=$(echo "${filtered}" | grep -v -E "^\s*(\*\s*)?systemd\s*$") || true
-        else
-            log "New version of systemd found (running=${running_buildid} disk=${disk_buildid})"
+    for link in /proc/[0-9]*/exe; do
+        target=$(readlink "${link}" 2>/dev/null) || continue
+        target="${target% (deleted)}"
+        [[ -f "${target}" ]] || continue
+        owner=$(rpm -qf "${target}" --qf '%{NAME}' 2>/dev/null) || continue
+        if [[ "${owner}" == "${pkg}" ]]; then
+            proc_exe="${link}"
+            disk_bin="${target}"
+            break
         fi
-    else
-        log "eu-readelf unavailable - elfutils is required"
-        exit 2
+    done
+
+    if [[ -z "${proc_exe}" ]]; then
+        log "${pkg}: no running process found, skipping build-id check"
+        return 1
     fi
+
+    running_buildid=$(eu-readelf -n "${proc_exe}" 2>/dev/null \
+        | grep 'Build ID' | awk '{print $NF}') || true
+    disk_buildid=$(eu-readelf -n "${disk_bin}" 2>/dev/null \
+        | grep 'Build ID' | awk '{print $NF}') || true
+
+    if [[ -z "${running_buildid}" || -z "${disk_buildid}" ]]; then
+        log "${pkg}: could not read build-ids"
+        return 1
+    fi
+
+    if [[ "${running_buildid}" == "${disk_buildid}" ]]; then
+        log "${pkg} false positive: build-id matches running process"
+        return 0
+    else
+        log "${pkg} genuine: build-id mismatch"
+        return 2
+    fi
+}
+
+if ! command -v eu-readelf &>/dev/null; then
+    log "eu-readelf unavailable - elfutils is required"
+    exit 2
 fi
+
+for pkg in "${FP_LIST[@]}"; do
+    pkg=$(echo "${pkg}" | tr -d ' ')
+    [[ -z "${pkg}" ]] && continue
+    # Kernel packages use version-string cross-check above, not build-id
+    [[ "${pkg}" == kernel* ]] && continue
+    # Only process packages that were actually flagged by needs-restarting
+    echo "${raw}" | grep -qE "^\s*(\*\s*)?${pkg}\s*$" || continue
+    buildid_result=0
+    verify_buildid "${pkg}" || buildid_result=$?
+    if [[ "${buildid_result}" -eq 2 ]]; then
+        pkg_lines=$(echo "${raw}" | grep -E "^\s*(\*\s*)?${pkg}\s*$") || true
+        [[ -n "${pkg_lines}" ]] && filtered="${filtered}"$'\n'"${pkg_lines}"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # Final decision
