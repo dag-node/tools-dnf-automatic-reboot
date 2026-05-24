@@ -119,14 +119,17 @@ Diagnosing the systemd false-positive
   # needs-reboot.sh handles this automatically via eu-readelf (elfutils, required).
 
 
-Diagnosing UEK false-positive
--------------------------------
+Diagnosing kernel false-positive (aarch64 and x86_64)
+------------------------------------------------------
 
   uname -r
+  # aarch64 (UEK):
   rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-uek | sort -V | tail -1
+  # x86_64 (RHEL 8/9):
+  rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel     | sort -V | tail -1
 
-  # If the strings match (modulo trailing .aarch64): confirmed false positive.
-  # needs-reboot.sh filters this automatically.
+  # If the RPM string matches uname -r (modulo the trailing .<arch> suffix):
+  # confirmed false positive.  needs-reboot.sh filters this automatically.
 
 
 Adding to false_positives filter
@@ -134,7 +137,7 @@ Adding to false_positives filter
 
   # Edit /etc/dnf/automatic-reboot.conf
   [false_positives]
-  filter_packages = kernel-uek,kernel-uek-core,my-package
+  filter_packages = kernel-uek,kernel-uek-core,kernel,kernel-core,systemd,my-package
 
 
 Forcing a manual run

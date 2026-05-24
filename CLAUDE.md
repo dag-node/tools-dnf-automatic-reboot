@@ -104,11 +104,14 @@ Watchdog decisions by phase:
 
 ## Known false positives (needs-reboot.sh handles automatically)
 
-### kernel-uek / kernel-uek-core (aarch64)
+### Kernel packages (aarch64 and x86_64)
 
 `needs-restarting` compares RPM EVR string against `uname -r` without normalising
-the trailing `.aarch64` arch suffix. Cross-verification: strip `.aarch64` from RPM
-output and `grep -F` against `uname -r`. Match = false positive. Mismatch = genuine.
+the trailing `.<arch>` suffix. Cross-verification: strip `.$(uname -m)` from the
+highest installed RPM EVR and `grep -F` against `uname -r`. Match = false positive.
+Mismatch = genuine. Covers `kernel-uek`/`kernel-uek-core` (aarch64 UEK) and
+`kernel`/`kernel-core` (x86_64 RHEL 8/9) with the same code path. Packages not
+installed on the running system are skipped automatically.
 
 ### systemd (all)
 

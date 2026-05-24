@@ -90,32 +90,37 @@ for pkg in "${FP_LIST[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Kernel cross-verification for aarch64
-# Confirm filtered kernel-uek entries are genuinely spurious by comparing
-# uname -r against the highest installed RPM EVR.
+# Kernel cross-verification (aarch64 and x86_64)
+# For every kernel* package in filter_packages that was flagged, confirm it
+# is a genuine false positive by comparing uname -r against the highest
+# installed RPM EVR.  The trailing .<arch> suffix is stripped using the live
+# value of uname -m, so the same logic covers kernel-uek/kernel-uek-core on
+# aarch64 and kernel/kernel-core on x86_64.  Packages not installed on this
+# system are skipped automatically.
 # ---------------------------------------------------------------------------
-if [[ "${VERIFY_KERNEL}" == "yes" && "$(uname -m)" == "aarch64" ]]; then
+if [[ "${VERIFY_KERNEL}" == "yes" ]]; then
     running=$(uname -r)
-    highest_uek=""
-    highest_uek=$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-uek 2>/dev/null \
+    arch=$(uname -m)
+    for pkg in "${FP_LIST[@]}"; do
+        pkg=$(echo "${pkg}" | tr -d ' ')
+        [[ -z "${pkg}" ]] && continue
+        [[ "${pkg}" == kernel* ]] || continue
+        # Only cross-verify packages that were actually flagged
+        echo "${raw}" | grep -qE "^\s*(\*\s*)?${pkg}\s*$" || continue
+        highest=""
+        highest=$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' "${pkg}" 2>/dev/null \
                   | sort -V | tail -1) || true
-
-    if [[ -n "${highest_uek}" ]]; then
-        # Normalise: the RPM release tag ends in .aarch64; uname -r may not
-        # Include it.  Strip the trailing arch suffix for comparison.
-        highest_norm="${highest_uek%.aarch64}"
+        [[ -z "${highest}" ]] && continue
+        # Strip the trailing .<arch> suffix so the RPM EVR matches uname -r format
+        highest_norm="${highest%.${arch}}"
         if echo "${running}" | grep -qF "${highest_norm}"; then
-            log "Running kernel matches installed RPM (${running})"
-            # Already removed from filtered above; nothing more to do.
+            log "${pkg} false positive: running kernel matches installed RPM (${running})"
         else
-            log "New kernel found, running=${running} installed=${highest_uek}"
-            # Re-add kernel-uek lines to filtered so they trigger the reboot.
-            kern_lines=$(echo "${raw}" | grep -E "^\s*(\*\s*)?kernel-uek") || true
-            if [[ -n "${kern_lines}" ]]; then
-                filtered="${filtered}"$'\n'"${kern_lines}"
-            fi
+            log "${pkg} genuine: running=${running} installed=${highest}"
+            pkg_lines=$(echo "${raw}" | grep -E "^\s*(\*\s*)?${pkg}\s*$") || true
+            [[ -n "${pkg_lines}" ]] && filtered="${filtered}"$'\n'"${pkg_lines}"
         fi
-    fi
+    done
 fi
 
 # ---------------------------------------------------------------------------
