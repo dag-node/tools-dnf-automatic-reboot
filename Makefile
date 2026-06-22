@@ -27,7 +27,7 @@ install:
 	install -d -m 0755 $(DESTDIR)$(LIBDIR)
 	install -d -m 0755 $(DESTDIR)$(UNITDIR)
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)
-	install -m 0755 $(SCRIPTS) $(DESTDIR)$(LIBDIR)/
+	install -m 0750 $(SCRIPTS) $(DESTDIR)$(LIBDIR)/
 	install -m 0644 $(UNITS)   $(DESTDIR)$(UNITDIR)/
 	install -m 0640 $(CONF)    $(DESTDIR)$(CONFDIR)/$(NAME).conf
 	install -m 0644 $(DOC)     $(DESTDIR)$(DOCDIR)/README

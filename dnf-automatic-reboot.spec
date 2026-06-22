@@ -53,9 +53,9 @@ All behaviour is controlled by /etc/dnf/automatic-reboot.conf.
 %install
 # Scripts
 install -d -m 0755 %{buildroot}%{_localibdir}
-install -m 0755 scripts/run.sh          %{buildroot}%{_localibdir}/run.sh
-install -m 0755 scripts/watchdog.sh     %{buildroot}%{_localibdir}/watchdog.sh
-install -m 0755 scripts/needs-reboot.sh %{buildroot}%{_localibdir}/needs-reboot.sh
+install -m 0750 scripts/run.sh          %{buildroot}%{_localibdir}/run.sh
+install -m 0750 scripts/watchdog.sh     %{buildroot}%{_localibdir}/watchdog.sh
+install -m 0750 scripts/needs-reboot.sh %{buildroot}%{_localibdir}/needs-reboot.sh
 
 # systemd units
 install -d -m 0755 %{buildroot}%{_unitdir}
@@ -253,10 +253,12 @@ fi
 %license doc/README
 %doc     %{_docdir}/%{name}/README
 
-# Scripts - shell_exec_t so systemd can exec them directly
-%attr(0755, root, root) %{_localibdir}/run.sh
-%attr(0755, root, root) %{_localibdir}/watchdog.sh
-%attr(0755, root, root) %{_localibdir}/needs-reboot.sh
+# Scripts - shell_exec_t so systemd can exec them directly.
+# 0750 root:root: executed by systemd as root; no world read/exec needed
+# (mirrors the 0640 config hardening).
+%attr(0750, root, root) %{_localibdir}/run.sh
+%attr(0750, root, root) %{_localibdir}/watchdog.sh
+%attr(0750, root, root) %{_localibdir}/needs-reboot.sh
 
 # systemd units
 %{_unitdir}/dnf-automatic-reboot.service
