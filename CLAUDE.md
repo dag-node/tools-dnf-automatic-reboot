@@ -34,7 +34,7 @@ doc/README                      Operational reference (installed to /usr/share/d
 ```
 /usr/local/lib/dnf-automatic-reboot/   scripts/
 /etc/dnf/automatic-reboot.conf     config (%config noreplace)
-/usr/lib/systemd/system/               unit files
+/usr/lib/systemd/system/               unit files (incl. grub-boot-success.service)
 /usr/share/doc/dnf-automatic-reboot/   doc/README
 /var/log/dnf-automatic-reboot.log      runtime log (%ghost in RPM)
 ```
@@ -125,6 +125,33 @@ the on-disk binary via `eu-readelf` — matching build-ids = false positive.
 Applies generically to any non-kernel package in `filter_packages`.
 Requires `elfutils` (hard RPM dependency).
 
+## UEK GRUB BLS default (kernel not booted after update)
+
+On OL9 UEK hosts a newly installed `kernel-uek-core` is not selected at the next
+boot. `/usr/lib/kernel/install.d/20-grub.install` only advances the GRUB
+`saved_entry` when `DEFAULTKERNEL` (`/etc/sysconfig/kernel`) names the installed
+package AND `GRUB_UPDATE_DEFAULT_KERNEL=true` (`/etc/default/grub`); neither is set
+by default on UEK, so `kernel-install` silently never advances `saved_entry`.
+
+Fixed at install time by the RPM `%post` scriptlet (not a per-update script, not
+installed on the client):
+
+- Sets `DEFAULTKERNEL=kernel-uek-core` and `GRUB_UPDATE_DEFAULT_KERNEL="true"` so
+  every future kernel update advances `saved_entry` automatically.
+- Repairs the current backlog with `grubby --set-default` pointing at the newest
+  installed kernel.
+- Enables `grub-boot-success.service`, which runs `grub2-set-bootflag boot_success`
+  each boot so GRUB's indeterminate-boot fallback cannot revert `saved_entry`.
+
+Scope is UEK-only and idempotent. `%post` acts only when the package owning the
+running kernel (`rpm -qf /lib/modules/$(uname -r)/vmlinuz`) matches
+`kernel_default_package`; on any other host it is a no-op and non-UEK kernels are
+never touched. Behaviour is controlled by the `[kernel]` section of
+`automatic-reboot.conf` (`manage_kernel_default`, `kernel_default_package`), which
+`%post` reads with the same `conf_get` grep used by the scripts.
+`grub-boot-success.service` ships on all hosts (noarch payload) but carries
+`ConditionKernelVersion=*uek*` so it stays inert if ever present off UEK.
+
 ## SELinux rules
 
 - Scripts at `/usr/local/lib/dnf-automatic-reboot/` inherit `bin_t` / `shell_exec_t`
@@ -139,7 +166,12 @@ Requires `elfutils` (hard RPM dependency).
 - `%config(noreplace)` on the config file — local edits survive upgrades.
 - `%ghost` on the log file — RPM owns the path and SELinux label without owning content.
 - `%systemd_post` / `%systemd_preun` / `%systemd_postun_with_restart` macros — never
-  call `systemctl` directly in scriptlets.
+  call `systemctl` directly in scriptlets. **One deliberate exception:**
+  `grub-boot-success.service` must be enabled on UEK hosts only, and per-host
+  conditional enablement cannot be expressed via systemd presets. `%post`/`%preun`
+  therefore `systemctl enable`/`disable` it directly inside the UEK guard. Do not
+  "fix" this to a preset + macro — that would enable it on x86_64 too. The unit's
+  `ConditionKernelVersion=*uek*` is the inert-everywhere-else backstop.
 - `BuildArch: noarch` — shell scripts only, no compiled artifacts.
 - `Requires: elfutils` — `eu-readelf` is required for the systemd build-id check.
 - Version bump: update both `Makefile` (`VERSION`) and `dnf-automatic-reboot.spec`

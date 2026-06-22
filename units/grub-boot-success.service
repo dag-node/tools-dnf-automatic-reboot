@@ -1,0 +1,21 @@
+[Unit]
+Description=Mark current boot successful for GRUB BLS fallback
+Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
+# Marking the boot successful only makes sense once basic init is up.
+DefaultDependencies=no
+After=sysinit.target
+# Scope to UEK kernels only: their release string (uname -r) contains "uek".
+# On stock x86_64 RHEL/OL kernels kernel-install advances saved_entry and the
+# boot_success path is already handled, so this unit must stay inert there.
+ConditionKernelVersion=*uek*
+ConditionPathExists=/usr/sbin/grub2-set-bootflag
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Clears GRUB's boot_indeterminate counter so the indeterminate-boot
+# fallback cannot revert saved_entry to a previously booted kernel.
+ExecStart=/usr/sbin/grub2-set-bootflag boot_success
+
+[Install]
+WantedBy=multi-user.target

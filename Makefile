@@ -1,5 +1,5 @@
 NAME    = dnf-automatic-reboot
-VERSION = 1.0
+VERSION = 1.1
 TARBALL = $(NAME)-$(VERSION).tar.gz
 
 PREFIX      = /usr/local
@@ -12,7 +12,8 @@ SCRIPTS = scripts/run.sh scripts/watchdog.sh scripts/needs-reboot.sh
 UNITS   = units/dnf-automatic-reboot.service \
           units/dnf-automatic-reboot.timer \
           units/dnf-automatic-watchdog.service \
-          units/dnf-automatic-watchdog.timer
+          units/dnf-automatic-watchdog.timer \
+          units/grub-boot-success.service
 CONF    = conf/automatic-reboot.conf
 DOC     = doc/README
 
@@ -39,6 +40,7 @@ uninstall:
 	rm -f  $(DESTDIR)$(UNITDIR)/dnf-automatic-reboot.timer
 	rm -f  $(DESTDIR)$(UNITDIR)/dnf-automatic-watchdog.service
 	rm -f  $(DESTDIR)$(UNITDIR)/dnf-automatic-watchdog.timer
+	rm -f  $(DESTDIR)$(UNITDIR)/grub-boot-success.service
 	rm -rf $(DESTDIR)$(LIBDIR)
 	rm -rf $(DESTDIR)$(DOCDIR)
 

@@ -43,6 +43,11 @@ Files installed
   /usr/lib/systemd/system/dnf-automatic-watchdog.timer
       Watchdog service + 5-minute polling timer.
 
+  /usr/lib/systemd/system/grub-boot-success.service
+      UEK-only.  Runs grub2-set-bootflag boot_success each boot so GRUB's
+      indeterminate-boot fallback cannot revert saved_entry to an old kernel.
+      Enabled by %post on UEK hosts; inert elsewhere (ConditionKernelVersion).
+
   /var/log/dnf-automatic-reboot.log
       All events logged here in addition to the journal.
 
@@ -130,6 +135,34 @@ Diagnosing kernel false-positive (aarch64 and x86_64)
 
   # If the RPM string matches uname -r (modulo the trailing .<arch> suffix):
   # confirmed false positive.  needs-reboot.sh filters this automatically.
+
+
+UEK kernel default (kernel not booted after update)
+---------------------------------------------------
+
+  Symptom: a new kernel-uek-core is installed but the system reboots into the
+  previous kernel.  Cause: on OL9 UEK, kernel-install does not advance the GRUB
+  saved_entry unless DEFAULTKERNEL and GRUB_UPDATE_DEFAULT_KERNEL are set, and
+  neither is by default.
+
+  The RPM %post scriptlet fixes this once, at install time, on UEK hosts only
+  (it acts only when rpm -qf /lib/modules/$(uname -r)/vmlinuz is the package
+  named by kernel_default_package).  It is idempotent and never touches non-UEK
+  kernels.  After install no per-update action is needed: kernel-install then
+  advances saved_entry on every future kernel update on its own.
+
+  Control it in /etc/dnf/automatic-reboot.conf:
+      [kernel]
+      manage_kernel_default  = yes
+      kernel_default_package = kernel-uek-core
+
+  Verify the provisioning took effect:
+      grep DEFAULTKERNEL /etc/sysconfig/kernel
+      grep GRUB_UPDATE_DEFAULT_KERNEL /etc/default/grub
+      grubby --default-kernel
+      rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-uek-core | sort -V | tail -1
+      systemctl is-enabled grub-boot-success.service     # UEK: enabled
+      grub2-editenv /boot/grub2/grubenv list             # saved_entry, boot_success
 
 
 Adding to false_positives filter

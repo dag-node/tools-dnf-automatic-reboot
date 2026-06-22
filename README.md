@@ -22,9 +22,21 @@ dnf-automatic-reboot/
     dnf-automatic-reboot.timer      Daily timer (03:00 +/- 10 min)
     dnf-automatic-watchdog.service  Oneshot watchdog service
     dnf-automatic-watchdog.timer    5-minute polling timer
+    grub-boot-success.service       UEK-only boot_success marker (BLS fallback guard)
   doc/
     README                          Operational reference (installed to /usr/share/doc/)
 ```
+
+## UEK kernel default (kernel not booted after update)
+
+On OL9 UEK hosts a freshly installed `kernel-uek-core` is not selected at the next
+boot, because `kernel-install` does not advance the GRUB `saved_entry` unless
+`DEFAULTKERNEL` and `GRUB_UPDATE_DEFAULT_KERNEL=true` are set. The RPM `%post`
+scriptlet fixes this once at install time (UEK hosts only; non-UEK kernels are
+never touched): it sets both keys, repairs the current default with `grubby`, and
+enables `grub-boot-success.service` so GRUB's indeterminate-boot fallback cannot
+revert to an old kernel. Tunable via the `[kernel]` section of
+`automatic-reboot.conf`. See [doc/README](doc/README).
 
 ## Prerequisites
 
@@ -37,10 +49,12 @@ dnf install rpm-build systemd-rpm-macros
 ### Target system
 
 ```bash
-dnf install dnf-automatic dnf-plugins-core elfutils
+dnf install dnf-automatic dnf-plugins-core elfutils grubby grub2-tools-minimal
 ```
 
 `elfutils` provides `eu-readelf`, required for systemd build-id comparison.
+`grubby` and `grub2-tools-minimal` provide `grubby`/`grub2-set-bootflag`, used by
+the UEK GRUB-default fix (these are normally already present on OL9).
 
 ## Before installing
 
