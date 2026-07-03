@@ -164,11 +164,19 @@ if [[ "${elapsed_min}" -ge "${SOFT_MIN}" ]]; then
             log "Watchdog scheduling reboot in ${REBOOT_DELAY}s"
             wall_msg "dnf-automatic-reboot: Watchdog detected stuck check." \
                      "Scheduling reboot in ${REBOOT_DELAY} seconds."
+            schedule_rc=0
             /usr/bin/systemd-run \
                 --on-active="${REBOOT_DELAY}" \
                 --timer-property=AccuracySec=1s \
                 --description="dnf-automatic-reboot watchdog reboot" \
-                /usr/bin/systemctl reboot
+                /usr/bin/systemctl reboot || schedule_rc=$?
+            if [[ "${schedule_rc}" -eq 0 ]]; then
+                log "Reboot dispatch confirmed: systemd-run accepted the transient timer"
+            else
+                log_err "Reboot dispatch FAILED: systemd-run exited ${schedule_rc} - system will NOT reboot"
+                wall_msg "dnf-automatic-reboot: ERROR - watchdog failed to schedule reboot (systemd-run exited ${schedule_rc})." \
+                         "Manual reboot required."
+            fi
         else
             log "Watchdog: no reboot needed - killing stuck service"
         fi

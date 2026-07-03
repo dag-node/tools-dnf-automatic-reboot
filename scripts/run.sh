@@ -218,11 +218,20 @@ trap - EXIT   # prevent double-cleanup after this point
 if [[ "${reboot_needed}" -eq 1 ]]; then
     log "Scheduling reboot in ${REBOOT_DELAY}s"
     wall_msg "dnf-automatic-reboot: Updates complete. System will reboot in ${REBOOT_DELAY} seconds."
+    schedule_rc=0
     /usr/bin/systemd-run \
         --on-active="${REBOOT_DELAY}" \
         --timer-property=AccuracySec=1s \
         --description="dnf-automatic-reboot scheduled reboot" \
-        /usr/bin/systemctl reboot
+        /usr/bin/systemctl reboot || schedule_rc=$?
+    if [[ "${schedule_rc}" -eq 0 ]]; then
+        log "Reboot dispatch confirmed: systemd-run accepted the transient timer"
+    else
+        log_err "Reboot dispatch FAILED: systemd-run exited ${schedule_rc} - system will NOT reboot"
+        wall_msg "dnf-automatic-reboot: ERROR - failed to schedule reboot (systemd-run exited ${schedule_rc})." \
+                 "Manual reboot required."
+        exit 1
+    fi
 else
     log "No reboot required"
     wall_msg "dnf-automatic-reboot: Updates complete. No reboot required."
