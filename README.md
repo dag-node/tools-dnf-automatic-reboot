@@ -83,26 +83,19 @@ systemctl disable --now dnf-automatic.timer dnf-automatic-install.timer 2>/dev/n
 ## Building the RPM
 
 ```bash
-# Create the source tarball from the working tree
-make dist
+mkdir -p ~/rpmbuild/{BUILD,RPMS,SRPMS,SOURCES,SPECS}   # once
 
-# Build the RPM in-place (no ~/rpmbuild copying needed)
+make dist
 rpmbuild -ba dnf-automatic-reboot.spec \
   --define "_sourcedir $(pwd)" \
   --define "_specdir $(pwd)"
-
-ls ~/rpmbuild/RPMS/noarch/dnf-automatic-reboot-*.noarch.rpm
 ```
 
-`make dist` packages the files listed in the Makefile (`SCRIPTS`, `UNITS`, `CONF`,
-`DOC`) into `dnf-automatic-reboot-$(VERSION).tar.gz`. The spec file is passed directly
-to `rpmbuild` and is not included in the tarball.
-
-Create the rpmbuild tree once if it does not exist:
-
-```bash
-mkdir -p ~/rpmbuild/{BUILD,RPMS,SRPMS}
-```
+`make dist` packages `SCRIPTS`, `UNITS`, `CONF`, and `DOC` from the Makefile into
+`dnf-automatic-reboot-$(VERSION).tar.gz`. `rpmbuild -ba` builds directly from the spec
+and tarball in the working tree via `_sourcedir`/`_specdir` — no copying into
+`~/rpmbuild/SOURCES` needed. The finished package lands at
+`~/rpmbuild/RPMS/noarch/dnf-automatic-reboot-$(VERSION)-1.*.noarch.rpm`.
 
 ## Installing
 
