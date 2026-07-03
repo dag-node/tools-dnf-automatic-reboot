@@ -5,7 +5,7 @@ Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
 [Timer]
 # Poll frequently so stuck runs are caught quickly within the soft/hard
 # timeout windows.
-OnCalendar=*-*-* *:*:00/5
+OnCalendar=*-*-* *:0/5:00
 RandomizedDelaySec=10s
 Persistent=false
 
