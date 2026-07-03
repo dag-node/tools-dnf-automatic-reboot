@@ -21,6 +21,7 @@ IFS=$'\n\t'
 readonly CONF=/etc/dnf/automatic-reboot.conf
 readonly LOG=/var/log/dnf-automatic-reboot.log
 readonly SELF=needs-reboot
+readonly HISTORY_FILE=/var/lib/dnf-automatic-reboot/restart-state
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -51,12 +52,28 @@ conf_get() {
     printf '%s' "${val:-${default}}"
 }
 
+# write_state_entry PKG EVR BOOT_ID STATE
+# Replaces PKG's row in HISTORY_FILE (one row per package - a new EVR
+# supersedes the old row rather than accumulating history) via atomic
+# temp-file rename, safe against a concurrent watchdog-triggered run.
+# Failure is silent and non-fatal: the package is re-evaluated fresh next run.
+write_state_entry() {
+    local pkg="$1" evr="$2" boot="$3" state="$4" tmp
+    mkdir -p "$(dirname "${HISTORY_FILE}")" 2>/dev/null || true
+    tmp=$(mktemp "${HISTORY_FILE}.XXXXXX" 2>/dev/null) || return 0
+    { grep -vE "^${pkg}"$'\t' "${HISTORY_FILE}" 2>/dev/null || true
+      printf '%s\t%s\t%s\t%s\t%s\n' "${pkg}" "${evr}" "${boot}" "$(date +%s)" "${state}"
+    } > "${tmp}" 2>/dev/null || { rm -f "${tmp}"; return 0; }
+    mv -f "${tmp}" "${HISTORY_FILE}" 2>/dev/null || rm -f "${tmp}"
+}
+
 # ---------------------------------------------------------------------------
 # Read config
 # ---------------------------------------------------------------------------
 FILTER_PACKAGES=$(conf_get filter_packages "kernel-uek,kernel-uek-core")
 VERIFY_KERNEL=$(conf_get verify_kernel_version "yes")
 WALL_MESSAGES=$(conf_get wall_messages "yes")
+LEARN_FALSE_POSITIVES=$(conf_get learn_false_positives "yes")
 
 # ---------------------------------------------------------------------------
 # Run needs-restarting with a hard timeout
@@ -205,13 +222,81 @@ for pkg in "${FP_LIST[@]}"; do
     fi
 done
 
-# ---------------------------------------------------------------------------
-# Final decision
-# ---------------------------------------------------------------------------
 real=$(echo "${filtered}" \
        | grep -E "^\s*(\*\s*)?\S" \
        | grep -v 'Core libraries\|updated since boot\|Reboot is required\|More information') || true
 
+# ---------------------------------------------------------------------------
+# Restart-state learning (any package still in `real`, excluding kernel*,
+# which keeps the version-string check above as sole authority).
+#
+# A package's restart-state is keyed on its exact installed EVR and reaches
+# "confirmed" only after surviving a real reboot still flagged at that same
+# EVR: /proc/sys/kernel/random/boot_id tells "a reboot happened since this
+# package was first flagged" apart from "no reboot yet" without wall-clock
+# timestamps, so this check is immune to the boot-time skew that produces
+# the underlying false positive. A new EVR always starts a fresh, unverified
+# cycle, so a genuine future update is never masked by an old confirmation.
+# Confirmed packages are skipped without a reboot; everything else - first
+# observation of a package/EVR pair included - stays in `real`, since one
+# reboot is the minimum needed to prove a flag spurious.
+# ---------------------------------------------------------------------------
+if [[ "${LEARN_FALSE_POSITIVES}" == "yes" && -n "${real}" ]]; then
+    boot_id=""
+    boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || true
+    if [[ -n "${boot_id}" ]]; then
+        learned=""
+        while IFS= read -r line; do
+            [[ -z "${line}" ]] && continue
+            pkg=$(echo "${line}" | sed 's/^\s*\*\s*//' | tr -d ' \t')
+            [[ -z "${pkg}" ]] && continue
+
+            if [[ "${pkg}" == kernel* ]]; then
+                learned="${learned}"$'\n'"${line}"
+                continue
+            fi
+
+            evr=""
+            evr=$(rpm -q --qf '%{EVR}' "${pkg}" 2>/dev/null) || true
+            if [[ -z "${evr}" ]]; then
+                learned="${learned}"$'\n'"${line}"
+                continue
+            fi
+
+            entry=""
+            entry=$(grep -E "^${pkg}"$'\t' "${HISTORY_FILE}" 2>/dev/null | tail -1) || true
+
+            if [[ -n "${entry}" ]]; then
+                h_evr=$(echo "${entry}" | cut -f2)
+                h_boot=$(echo "${entry}" | cut -f3)
+                h_state=$(echo "${entry}" | cut -f5)
+
+                if [[ "${h_evr}" == "${evr}" && "${h_state}" == "confirmed" ]]; then
+                    log "${pkg} restart-state confirmed false positive (evr=${evr}) - skipping"
+                    continue
+                fi
+
+                if [[ "${h_evr}" == "${evr}" && "${h_state}" == "pending" && "${h_boot}" != "${boot_id}" ]]; then
+                    log "${pkg} still flagged at evr=${evr} after a reboot - confirming false positive"
+                    write_state_entry "${pkg}" "${evr}" "${boot_id}" confirmed
+                    continue
+                fi
+
+                if [[ "${h_evr}" != "${evr}" ]]; then
+                    log "${pkg}: evr ${evr} supersedes tracked ${h_evr} - treating as a fresh restart requirement"
+                fi
+            fi
+
+            write_state_entry "${pkg}" "${evr}" "${boot_id}" pending
+            learned="${learned}"$'\n'"${line}"
+        done <<< "${real}"
+        real="${learned#$'\n'}"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Final decision
+# ---------------------------------------------------------------------------
 if [[ -z "${real}" ]]; then
     log "All triggers filtered as false positives - no reboot needed"
     exit 0

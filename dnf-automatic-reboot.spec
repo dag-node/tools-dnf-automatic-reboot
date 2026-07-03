@@ -1,5 +1,5 @@
 Name:           dnf-automatic-reboot
-Version:        1.1
+Version:        1.2
 Release:        1%{?dist}
 Summary:        Unattended update and conditional reboot for OL9/RHEL9 aarch64
 
@@ -78,6 +78,9 @@ install -m 0644 doc/README %{buildroot}%{_docdir}/%{name}/README
 install -d -m 0755 %{buildroot}%{_localstatedir}/log
 touch %{buildroot}%{_localstatedir}/log/%{name}.log
 
+# Restart-state directory for the false-positive learning tracker
+install -d -m 0750 %{buildroot}%{_localstatedir}/lib/%{name}
+
 %pre -p /bin/bash
 FAIL=0
 
@@ -134,6 +137,7 @@ if [ -x /sbin/restorecon ]; then
     restorecon -Rv %{_localibdir}/ \
                    %{_sysconfdir}/dnf/automatic-reboot.conf \
                    %{_localstatedir}/log/%{name}.log \
+                   %{_localstatedir}/lib/%{name} \
                    2>/dev/null || true
 fi
 
@@ -275,7 +279,24 @@ fi
 # Log file - var_log_t context applied by restorecon in %%post
 %ghost %attr(0640, root, root) %{_localstatedir}/log/%{name}.log
 
+# Restart-state directory - var_lib_t context applied by restorecon in
+# %%post.  %%ghost on the file itself: RPM owns the path and SELinux label
+# without owning content, same pattern as the log file above.
+%dir %attr(0750, root, root) %{_localstatedir}/lib/%{name}
+%ghost %attr(0640, root, root) %{_localstatedir}/lib/%{name}/restart-state
+
 %changelog
+* Fri Jul 03 2026 Packager <packager@example.com> - 1.2-1
+- Learn non-kernel false positives (e.g. glibc) by observing whether a
+  package is still flagged by needs-restarting after a real reboot, keyed
+  on exact EVR and proven via kernel boot ID rather than timestamps
+- New learn_false_positives config key and
+  /var/lib/dnf-automatic-reboot/restart-state tracking file
+- Fix watchdog timer OnCalendar: was firing every 5 seconds instead of
+  every 5 minutes (step was on the wrong field)
+- run.sh and watchdog.sh now check systemd-run's exit code when dispatching
+  the scheduled reboot and log dispatch success/failure explicitly, instead
+  of assuming a fire-and-forget systemd-run call always succeeds
 * Mon Jun 22 2026 Packager <packager@example.com> - 1.1-1
 - Fix UEK kernel not booted after update: provision GRUB BLS saved_entry
   handling at install time (DEFAULTKERNEL + GRUB_UPDATE_DEFAULT_KERNEL) so

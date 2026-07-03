@@ -1,5 +1,5 @@
 NAME    = dnf-automatic-reboot
-VERSION = 1.1
+VERSION = 1.2
 TARBALL = $(NAME)-$(VERSION).tar.gz
 
 PREFIX      = /usr/local
@@ -7,6 +7,7 @@ LIBDIR      = $(PREFIX)/lib/$(NAME)
 UNITDIR     = /usr/lib/systemd/system
 CONFDIR     = /etc/dnf
 DOCDIR      = /usr/share/doc/$(NAME)
+STATEDIR    = /var/lib/$(NAME)
 
 SCRIPTS = scripts/run.sh scripts/watchdog.sh scripts/needs-reboot.sh
 UNITS   = units/dnf-automatic-reboot.service \
@@ -27,6 +28,7 @@ install:
 	install -d -m 0755 $(DESTDIR)$(LIBDIR)
 	install -d -m 0755 $(DESTDIR)$(UNITDIR)
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)
+	install -d -m 0750 $(DESTDIR)$(STATEDIR)
 	install -m 0750 $(SCRIPTS) $(DESTDIR)$(LIBDIR)/
 	install -m 0644 $(UNITS)   $(DESTDIR)$(UNITDIR)/
 	install -m 0640 $(CONF)    $(DESTDIR)$(CONFDIR)/$(NAME).conf
@@ -43,6 +45,7 @@ uninstall:
 	rm -f  $(DESTDIR)$(UNITDIR)/grub-boot-success.service
 	rm -rf $(DESTDIR)$(LIBDIR)
 	rm -rf $(DESTDIR)$(DOCDIR)
+	rm -rf $(DESTDIR)$(STATEDIR)
 
 dist:
 	tar czf $(TARBALL) --transform 's,^,$(NAME)-$(VERSION)/,' \

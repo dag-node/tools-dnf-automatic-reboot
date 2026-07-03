@@ -37,6 +37,7 @@ doc/README                      Operational reference (installed to /usr/share/d
 /usr/lib/systemd/system/               unit files (incl. grub-boot-success.service)
 /usr/share/doc/dnf-automatic-reboot/   doc/README
 /var/log/dnf-automatic-reboot.log      runtime log (%ghost in RPM)
+/var/lib/dnf-automatic-reboot/restart-state   restart-state learning (%ghost in RPM)
 ```
 
 ## Coding conventions
@@ -104,6 +105,17 @@ Watchdog decisions by phase:
 | `checking` | Run independent needs-reboot check, kill PID | Kill + force reboot |
 | `failed` | Leave for operator | Kill + force reboot |
 
+### Restart-state file `/var/lib/dnf-automatic-reboot/restart-state`
+
+Written and read by `needs-reboot.sh` only; survives reboots (unlike the `/run` state
+file above, by design — see [Known false positives](#known-false-positives-needs-rebootsh-handles-automatically)).
+Tab-delimited, one row per tracked package, replaced in place (a new EVR supersedes
+the old row rather than accumulating history):
+
+```
+<name>\t<evr>\t<boot_id>\t<first_seen_epoch>\t<pending|confirmed>
+```
+
 ## Known false positives (needs-reboot.sh handles automatically)
 
 ### Kernel packages (aarch64 and x86_64)
@@ -124,6 +136,22 @@ by the package (`rpm -qf`), compare ELF build-ids of the running process against
 the on-disk binary via `eu-readelf` — matching build-ids = false positive.
 Applies generically to any non-kernel package in `filter_packages`.
 Requires `elfutils` (hard RPM dependency).
+
+### Any non-kernel package (self-learning)
+
+Packages outside `filter_packages` (e.g. `glibc`) have no build-id-verifiable owned
+daemon binary, so `verify_buildid`'s `/proc/*/exe`-ownership check does not apply to
+them. `needs-reboot.sh` instead learns their restart-state by observation, recorded in
+[`/var/lib/dnf-automatic-reboot/restart-state`](#restart-state-file-varlibdnf-automatic-rebootrestart-state):
+a package/EVR pair reaches `confirmed` (skipped, no reboot) only once it is still
+flagged by `needs-restarting` at that exact EVR after a reboot has genuinely occurred,
+proven by a change in `/proc/sys/kernel/random/boot_id` rather than any timestamp
+comparison. The first observation of a given package/EVR pair always triggers one
+reboot — that reboot is what proves the flag spurious or genuine. A new EVR on an
+already-`confirmed` package starts a fresh, unverified cycle, so a real future update
+is never masked by an old confirmation. `kernel*` packages are exempt; the
+version-string check above remains their sole authority. Controlled by
+`learn_false_positives` in `automatic-reboot.conf`.
 
 ## UEK GRUB BLS default (kernel not booted after update)
 
@@ -158,6 +186,8 @@ never touched. Behaviour is controlled by the `[kernel]` section of
   via `restorecon` called in `%post`.
 - Config at `/etc/dnf/` inherits `etc_t`.
 - Log at `/var/log/` inherits `var_log_t` via `%ghost` ownership.
+- Restart-state directory at `/var/lib/dnf-automatic-reboot/` inherits `var_lib_t`
+  from base policy; no custom `fcontext` needed.
 - Never use `chcon` in scripts — use `restorecon` or `semanage fcontext`.
 - If a new AVC denial appears: `ausearch -m avc -ts recent | audit2why` first.
 
@@ -165,6 +195,9 @@ never touched. Behaviour is controlled by the `[kernel]` section of
 
 - `%config(noreplace)` on the config file — local edits survive upgrades.
 - `%ghost` on the log file — RPM owns the path and SELinux label without owning content.
+- `%ghost` on the restart-state file, `%dir` on its parent `/var/lib/dnf-automatic-reboot/`
+  — the directory is package-exclusive (unlike `/var/log`, which the `filesystem` package
+  owns), so it needs an explicit `%dir` entry to be tracked, labeled, and removed on erase.
 - `%systemd_post` / `%systemd_preun` / `%systemd_postun_with_restart` macros — never
   call `systemctl` directly in scriptlets. **One deliberate exception:**
   `grub-boot-success.service` must be enabled on UEK hosts only, and per-host
@@ -228,5 +261,9 @@ tail -f /var/log/dnf-automatic-reboot.log
 - Do not downgrade `Requires: elfutils` to `Recommends` — `eu-readelf` is required and absence exits with code 2.
 - Do not filter a package in `filter_packages` without confirming the false positive
   with the build-id or version cross-check first.
+- Do not key restart-state entries on package name alone — always name + EVR, so a
+  genuine future update is never masked by an old confirmation.
+- Do not extend restart-state learning to `kernel*` packages — the version-string
+  check is their sole, more authoritative, source of truth.
 - Do not use `return` at script top level — use `exit`.
 - Do not use Unicode characters in scripts or config files.
