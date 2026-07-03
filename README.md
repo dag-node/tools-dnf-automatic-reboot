@@ -49,9 +49,10 @@ dnf install rpm-build systemd-rpm-macros
 ### Target system
 
 ```bash
-dnf install dnf-automatic dnf-plugins-core elfutils grubby grub2-tools-minimal
+dnf install dnf-automatic yum-utils elfutils grubby grub2-tools-minimal
 ```
 
+`yum-utils` provides `needs-restarting`, which drives every reboot decision.
 `elfutils` provides `eu-readelf`, required for systemd build-id comparison.
 `grubby` and `grub2-tools-minimal` provide `grubby`/`grub2-set-bootflag`, used by
 the UEK GRUB-default fix (these are normally already present on OL9).
@@ -106,7 +107,7 @@ mkdir -p ~/rpmbuild/{BUILD,RPMS,SRPMS}
 ## Installing
 
 ```bash
-dnf install ~/rpmbuild/RPMS/noarch/dnf-automatic-reboot-1.0-1.*.noarch.rpm
+dnf install ~/rpmbuild/RPMS/noarch/dnf-automatic-reboot-*.noarch.rpm
 ```
 
 The `%pre` scriptlet checks that `dnf-automatic` is installed, both stock timers are
@@ -191,6 +192,7 @@ rm -f /var/log/dnf-automatic-reboot.log
 |---|---|---|
 | `needs-restarting` always flags `kernel-uek` / `kernel-uek-core` | OL9 aarch64 UEK | Filtered by `needs-reboot.sh` via version cross-check |
 | `needs-restarting` flags `systemd` after update even post-reboot | All | Filtered by `needs-reboot.sh` via `eu-readelf` build-id comparison |
+| `needs-restarting` flags other core libraries (e.g. `glibc`) even with no live process using a stale version | All | Learned automatically by `needs-reboot.sh`: confirmed only after surviving a real reboot still flagged at the same version, proven via kernel boot ID; see [doc/README](doc/README) |
 | `systemd-time-wait-sync.service` absent on UEK R8 | OL9 UEK R8 | Open — `time-sync.target` used as best available gate; see [below](#time-sync-on-uek-r8) |
 | NTS sources fail under FUTURE crypto policy | OL9 FUTURE policy | Fix: `update-crypto-policies --set DEFAULT` |
 

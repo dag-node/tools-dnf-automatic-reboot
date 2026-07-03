@@ -51,6 +51,11 @@ Files installed
   /var/log/dnf-automatic-reboot.log
       All events logged here in addition to the journal.
 
+  /var/lib/dnf-automatic-reboot/restart-state
+      Restart-state learning: tracks, per package, whether it has been
+      confirmed as a false positive after surviving a real reboot still
+      flagged at the same version.  See "Restart-state learning" below.
+
 
 Quick start
 -----------
@@ -173,6 +178,31 @@ Adding to false_positives filter
   filter_packages = kernel-uek,kernel-uek-core,kernel,kernel-core,systemd,my-package
 
 
+Restart-state learning
+-----------------------
+
+  needs-reboot.sh learns false positives for any package outside
+  filter_packages (glibc is the common case) by watching whether it is
+  still flagged by needs-restarting at the exact same version after a real
+  reboot -- proven via /proc/sys/kernel/random/boot_id, not timestamps.
+  The first time a package/version is flagged it still triggers one
+  reboot; only reappearing at the same version after that reboot confirms
+  it as a false positive and stops further reboots for it.  A new version
+  on the same package always starts a fresh, unverified cycle.
+
+  # View current restart-state (name, evr, boot_id, first_seen, state)
+  column -t /var/lib/dnf-automatic-reboot/restart-state
+
+  # Force re-verification of a package (e.g. to discard a stale
+  # confirmed entry after manually rebooting)
+  sed -i '/^glibc\t/d' /var/lib/dnf-automatic-reboot/restart-state
+
+  # Disable the mechanism entirely
+  # /etc/dnf/automatic-reboot.conf:
+  [false_positives]
+  learn_false_positives = no
+
+
 Forcing a manual run
 --------------------
 
@@ -200,6 +230,9 @@ Uninstalling
 
   The log file /var/log/dnf-automatic-reboot.log is preserved on uninstall.
   Remove manually if not needed:  rm /var/log/dnf-automatic-reboot.log
+
+  The restart-state file is preserved the same way.  Remove manually if
+  not needed:  rm -rf /var/lib/dnf-automatic-reboot
 
 
 Hardware watchdog (recommended for headless systems)
