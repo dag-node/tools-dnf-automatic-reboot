@@ -11,8 +11,9 @@ BuildArch:      noarch
 
 # dnf-automatic provides the /usr/bin/dnf-automatic binary we call
 Requires:       dnf-automatic
-# needs-restarting is in the dnf-plugins-core package
-Requires:       dnf-plugins-core
+# needs-restarting is provided by yum-utils on EL9 (confirmed via
+# rpm -qf against the live binary; dnf-plugins-core does not own it)
+Requires:       yum-utils
 # systemd-inhibit, systemd-run, wall are all in systemd or util-linux
 Requires:       systemd
 Requires:       util-linux
