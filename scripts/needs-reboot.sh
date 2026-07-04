@@ -72,7 +72,6 @@ write_state_entry() {
 # ---------------------------------------------------------------------------
 FILTER_PACKAGES=$(conf_get filter_packages "kernel-uek,kernel-uek-core")
 VERIFY_KERNEL=$(conf_get verify_kernel_version "yes")
-WALL_MESSAGES=$(conf_get wall_messages "yes")
 LEARN_FALSE_POSITIVES=$(conf_get learn_false_positives "yes")
 
 # ---------------------------------------------------------------------------
@@ -138,7 +137,7 @@ if [[ "${VERIFY_KERNEL}" == "yes" ]]; then
                   | sort -V | tail -1) || true
         [[ -z "${highest}" ]] && continue
         # Strip the trailing .<arch> suffix so the RPM EVR matches uname -r format
-        highest_norm="${highest%.${arch}}"
+        highest_norm="${highest%".${arch}"}"
         if echo "${running}" | grep -qF "${highest_norm}"; then
             log "${pkg} false positive: running kernel matches installed RPM (${running})"
         else

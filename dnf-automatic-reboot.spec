@@ -287,7 +287,7 @@ fi
 %ghost %attr(0640, root, root) %{_localstatedir}/lib/%{name}/restart-state
 
 %changelog
-* Fri Jul 03 2026 Packager <packager@example.com> - 1.2-1
+* Fri Jul 03 2026 DagNode <packages@dagnode.com> - 1.2-1
 - Learn non-kernel false positives (e.g. glibc) by observing whether a
   package is still flagged by needs-restarting after a real reboot, keyed
   on exact EVR and proven via kernel boot ID rather than timestamps
@@ -298,7 +298,7 @@ fi
 - run.sh and watchdog.sh now check systemd-run's exit code when dispatching
   the scheduled reboot and log dispatch success/failure explicitly, instead
   of assuming a fire-and-forget systemd-run call always succeeds
-* Mon Jun 22 2026 Packager <packager@example.com> - 1.1-1
+* Mon Jun 22 2026 DagNode <packages@dagnode.com> - 1.1-1
 - Fix UEK kernel not booted after update: provision GRUB BLS saved_entry
   handling at install time (DEFAULTKERNEL + GRUB_UPDATE_DEFAULT_KERNEL) so
   kernel-install advances the default on every future kernel update
@@ -309,7 +309,7 @@ fi
 - Provisioning is UEK-gated and idempotent; non-UEK kernels are never touched
 - Requires: grubby, grub2-tools-minimal
 
-* Sat May 23 2026 Packager <packager@example.com> - 1.0-1
+* Sat May 23 2026 DagNode <packages@dagnode.com> - 1.0-1
 - Initial release
 - Inhibitor lock prevents reboot during updates
 - UEK aarch64 false-positive filtering with version cross-verification

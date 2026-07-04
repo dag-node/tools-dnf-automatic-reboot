@@ -3,13 +3,14 @@ Description=dnf-automatic with shutdown inhibitor and conditional reboot
 Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
 After=network-online.target time-sync.target
 Wants=network-online.target
-# Block until time synchronization completes so RPM INSTALLTIME entries
-# written by dnf and the boot-time comparison in needs-restarting are both
-# stamped with the correct wall-clock time.
-# time-sync.target is reached once systemd-time-wait-sync.service unblocks,
-# which requires chronyd to signal sync completion.
-# Prerequisites on this host:
-#   systemctl enable systemd-time-wait-sync.service
+# Gate startup on time synchronization so RPM INSTALLTIME entries written by
+# dnf and the boot-time comparison in needs-restarting are both stamped with
+# the correct wall-clock time.
+# NOTE: systemd-time-wait-sync.service is absent on UEK R8, so time-sync.target
+# is reached when chronyd.service finishes starting, not when chrony achieves
+# sync. This is the best available gate on this platform; the eu-readelf
+# build-id path in needs-reboot.sh is immune to clock skew regardless.
+# Prerequisites on this host (see doc/README):
 #   /etc/chrony.conf must contain: rtcsync
 #   /etc/chrony.conf must contain: makestep 1 -1
 Requires=time-sync.target
