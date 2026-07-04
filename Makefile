@@ -17,6 +17,7 @@ UNITS   = units/dnf-automatic-reboot.service \
           units/grub-boot-success.service
 CONF    = conf/automatic-reboot.conf
 DOC     = doc/README
+LICENSE = LICENSE
 
 .PHONY: all install uninstall dist clean
 
@@ -33,6 +34,7 @@ install:
 	install -m 0644 $(UNITS)   $(DESTDIR)$(UNITDIR)/
 	install -m 0640 $(CONF)    $(DESTDIR)$(CONFDIR)/$(NAME).conf
 	install -m 0644 $(DOC)     $(DESTDIR)$(DOCDIR)/README
+	install -m 0644 $(LICENSE) $(DESTDIR)$(DOCDIR)/LICENSE
 
 uninstall:
 	rm -f  $(DESTDIR)$(LIBDIR)/run.sh
@@ -49,7 +51,7 @@ uninstall:
 
 dist:
 	tar czf $(TARBALL) --transform 's,^,$(NAME)-$(VERSION)/,' \
-	    Makefile $(SCRIPTS) $(UNITS) $(CONF) $(DOC)
+	    Makefile $(SCRIPTS) $(UNITS) $(CONF) $(DOC) $(LICENSE)
 	@echo "Created $(TARBALL)"
 
 clean:

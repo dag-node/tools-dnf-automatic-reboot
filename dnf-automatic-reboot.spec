@@ -4,7 +4,7 @@ Release:        1%{?dist}
 Summary:        Unattended update and conditional reboot for OL9/RHEL9 aarch64
 
 License:        MIT
-URL:            https://github.com/example/dnf-automatic-reboot
+URL:            https://github.com/dag-node/tools-dnf-automatic-reboot
 Source0:        %{name}-%{version}.tar.gz
 
 BuildArch:      noarch
@@ -255,7 +255,7 @@ if [ $1 -eq 0 ] && [ -x /sbin/restorecon ]; then
 fi
 
 %files
-%license doc/README
+%license LICENSE
 %doc     %{_docdir}/%{name}/README
 
 # Scripts - shell_exec_t so systemd can exec them directly.
