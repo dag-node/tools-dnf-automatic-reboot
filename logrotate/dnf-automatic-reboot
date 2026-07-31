@@ -1,0 +1,10 @@
+/var/log/dnf-automatic-reboot.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    su root root
+    create 0640 root root
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=dnf-automatic-reboot failure notification for %I
+Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/dnf-automatic-reboot/notify-failure.sh %I
+Environment=LC_ALL=C
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dnf-automatic-reboot

@@ -6,30 +6,32 @@ Wants=network-online.target
 # Gate startup on time synchronization so RPM INSTALLTIME entries written by
 # dnf and the boot-time comparison in needs-restarting are both stamped with
 # the correct wall-clock time.
-# NOTE: systemd-time-wait-sync.service is absent on UEK R8, so time-sync.target
-# is reached when chronyd.service finishes starting, not when chrony achieves
-# sync. This is the best available gate on this platform; the eu-readelf
-# build-id path in needs-reboot.sh is immune to clock skew regardless.
-# Prerequisites on this host (see doc/README):
-#   /etc/chrony.conf must contain: rtcsync
+# NOTE: systemd-time-wait-sync.service is absent on UEK R8, and nothing else
+# pulls in time-sync.target by default, so this ordering is satisfied
+# trivially unless chrony-wait.service is enabled - it is ordered
+# Before=time-sync.target and runs `chronyc waitsync`, which makes the gate
+# real. The RPM %post enables it when [time] enable_chrony_wait = yes.
+# Prerequisite on this host (see doc/README):
 #   /etc/chrony.conf must contain: makestep 1 -1
 Requires=time-sync.target
 # Prevent a second instance starting if one is already running.
 ConditionPathExists=!/run/dnf-automatic-reboot.lock
+# A failed run is otherwise visible only in the journal; %n names the unit.
+OnFailure=dnf-automatic-reboot-failure@%n.service
 
 [Service]
 Type=oneshot
 # Create lock file before run.sh starts so ConditionPathExists works
 ExecStartPre=/usr/bin/touch /run/dnf-automatic-reboot.lock
-ExecStart=/usr/local/lib/dnf-automatic-reboot/run.sh
+ExecStart=/usr/libexec/dnf-automatic-reboot/run.sh
 # run.sh removes the lock on clean exit; belt-and-suspenders removal here
 ExecStopPost=/usr/bin/rm -f /run/dnf-automatic-reboot.lock
 RemainAfterExit=no
 # run.sh owns all its own timeouts via the `timeout` command.
 # Do not let systemd kill it independently.
 TimeoutStartSec=infinity
-# Ensure log directory exists
-LogsDirectory=dnf-automatic-reboot
+# needs-restarting output is translated; the parsers match C strings.
+Environment=LC_ALL=C
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=dnf-automatic-reboot

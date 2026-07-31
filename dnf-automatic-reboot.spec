@@ -1,5 +1,5 @@
 Name:           dnf-automatic-reboot
-Version:        1.2
+Version:        1.3
 Release:        1%{?dist}
 Summary:        Unattended update and conditional reboot for OL9/RHEL9 aarch64
 
@@ -14,8 +14,10 @@ Requires:       dnf-automatic
 # needs-restarting is provided by yum-utils on EL9 (confirmed via
 # rpm -qf against the live binary; dnf-plugins-core does not own it)
 Requires:       yum-utils
-# systemd-inhibit, systemd-run, wall are all in systemd or util-linux
-Requires:       systemd
+# systemd-inhibit, systemd-run, wall are all in systemd or util-linux.
+# >= 252 for `systemctl kill --kill-whom`, spelled --kill-who before that;
+# the watchdog relies on it to reach the whole service cgroup.
+Requires:       systemd >= 252
 Requires:       util-linux
 # eu-readelf for systemd build-id comparison (false-positive detection)
 Requires:       elfutils
@@ -23,20 +25,30 @@ Requires:       elfutils
 # the %%post logic degrades gracefully if either is somehow absent)
 Requires:       grubby
 Requires:       grub2-tools-minimal
+# logrotate consumes the drop-in in %%{_sysconfdir}/logrotate.d; without it
+# /var/log/dnf-automatic-reboot.log grows without bound
+Requires:       logrotate
 
 # We install systemd unit files
 BuildRequires:  systemd-rpm-macros
+# %%check runs `make check`, which needs make, awk and flock
+BuildRequires:  make
+BuildRequires:  gawk
+BuildRequires:  util-linux
 
 %description
 Companion service to dnf-automatic that:
 
   - Holds a systemd shutdown inhibitor during updates to prevent
     corruption from an accidental reboot mid-update.
-  - Filters known false-positive reboot triggers on Oracle Linux 9
-    aarch64: UEK kernel version-string mismatches and systemd
-    PrivateTmp build-id masking.
+  - Filters false-positive reboot triggers with positive evidence:
+    kernel version comparison against the running kernel, and ELF
+    build-id comparison for daemons whose package was reinstalled.
   - Detects genuine update-triggered reboot requirements and schedules
-    a timed reboot.
+    a timed reboot, refusing to reboot into a kernel the GRUB default
+    would not select.
+  - Restarts services still mapping pre-update files, which
+    needs-restarting -r does not report.
   - Provides an independent watchdog with configurable soft and hard
     timeouts to recover from hung updates without operator intervention.
   - Warns logged-in users via wall(1) at all key events.
@@ -49,37 +61,57 @@ All behaviour is controlled by /etc/dnf/automatic-reboot.conf.
 %build
 # Nothing to compile - shell scripts only
 
-%global _localibdir /usr/local/lib/%{name}
+%check
+# Syntax, lint and the test suite.  The suite stubs every external command, so
+# it neither touches the build host nor needs root; tests that must exec a stub
+# skip themselves where the build root is mounted noexec.
+make check
+
+# Package-private script directory.  /usr/libexec is the FHS location for
+# programs a package runs but users do not; /usr/local is reserved for the
+# local administrator and must not be written by an RPM.  It also carries
+# bin_t from the base SELinux policy, which /usr/local/lib does not.
+%global pkglibexecdir %{_libexecdir}/%{name}
 
 %install
 # Scripts
-install -d -m 0755 %{buildroot}%{_localibdir}
-install -m 0750 scripts/run.sh          %{buildroot}%{_localibdir}/run.sh
-install -m 0750 scripts/watchdog.sh     %{buildroot}%{_localibdir}/watchdog.sh
-install -m 0750 scripts/needs-reboot.sh %{buildroot}%{_localibdir}/needs-reboot.sh
+install -d -m 0755 %{buildroot}%{pkglibexecdir}
+install -m 0750 scripts/run.sh            %{buildroot}%{pkglibexecdir}/run.sh
+install -m 0750 scripts/watchdog.sh       %{buildroot}%{pkglibexecdir}/watchdog.sh
+install -m 0750 scripts/needs-reboot.sh   %{buildroot}%{pkglibexecdir}/needs-reboot.sh
+install -m 0750 scripts/notify-failure.sh %{buildroot}%{pkglibexecdir}/notify-failure.sh
 
 # systemd units
 install -d -m 0755 %{buildroot}%{_unitdir}
-install -m 0644 units/dnf-automatic-reboot.service   %{buildroot}%{_unitdir}/
-install -m 0644 units/dnf-automatic-reboot.timer     %{buildroot}%{_unitdir}/
-install -m 0644 units/dnf-automatic-watchdog.service %{buildroot}%{_unitdir}/
-install -m 0644 units/dnf-automatic-watchdog.timer   %{buildroot}%{_unitdir}/
-install -m 0644 units/grub-boot-success.service      %{buildroot}%{_unitdir}/
+install -m 0644 units/dnf-automatic-reboot.service          %{buildroot}%{_unitdir}/
+install -m 0644 units/dnf-automatic-reboot.timer            %{buildroot}%{_unitdir}/
+install -m 0644 units/dnf-automatic-watchdog.service        %{buildroot}%{_unitdir}/
+install -m 0644 units/dnf-automatic-watchdog.timer          %{buildroot}%{_unitdir}/
+install -m 0644 units/dnf-automatic-reboot-failure@.service %{buildroot}%{_unitdir}/
+install -m 0644 units/grub-boot-success.service             %{buildroot}%{_unitdir}/
 
 # Config file - noreplace preserves local edits on upgrade
 install -d -m 0755 %{buildroot}%{_sysconfdir}/dnf
 install -m 0640 conf/automatic-reboot.conf \
     %{buildroot}%{_sysconfdir}/dnf/automatic-reboot.conf
 
+# tmpfiles.d - owns the mode and label of the log and state paths
+install -d -m 0755 %{buildroot}%{_tmpfilesdir}
+install -m 0644 tmpfiles/%{name}.conf %{buildroot}%{_tmpfilesdir}/%{name}.conf
+
+# logrotate.d
+install -d -m 0755 %{buildroot}%{_sysconfdir}/logrotate.d
+install -m 0644 logrotate/%{name} %{buildroot}%{_sysconfdir}/logrotate.d/%{name}
+
 # Documentation
 install -d -m 0755 %{buildroot}%{_docdir}/%{name}
 install -m 0644 doc/README %{buildroot}%{_docdir}/%{name}/README
 
-# Log file placeholder so RPM owns it and applies the SELinux label
+# Log file placeholder so RPM owns the path and its SELinux label
 install -d -m 0755 %{buildroot}%{_localstatedir}/log
 touch %{buildroot}%{_localstatedir}/log/%{name}.log
 
-# Restart-state directory for the false-positive learning tracker
+# State directory for the false-positive learning tracker
 install -d -m 0750 %{buildroot}%{_localstatedir}/lib/%{name}
 
 %pre -p /bin/bash
@@ -130,16 +162,50 @@ fi
 %systemd_post dnf-automatic-watchdog.service
 %systemd_post dnf-automatic-watchdog.timer
 
-# Apply correct SELinux file contexts after install.
-# Scripts in /usr/local/lib need bin_t or shell_exec_t to be executed
-# by systemd.  restorecon applies the context matching the fcontext
-# database entry we ship in the %%files section via semanage.
+# Create the log file and state directory with the packaged mode and label
+# before any script writes to them.
+systemd-tmpfiles --create %{_tmpfilesdir}/%{name}.conf >/dev/null 2>&1 || true
+
+# Scripts live under %{_libexecdir}, which the base SELinux policy labels
+# bin_t; restorecon reapplies that after install.
 if [ -x /sbin/restorecon ]; then
-    restorecon -Rv %{_localibdir}/ \
+    restorecon -Rv %{pkglibexecdir}/ \
                    %{_sysconfdir}/dnf/automatic-reboot.conf \
                    %{_localstatedir}/log/%{name}.log \
                    %{_localstatedir}/lib/%{name} \
                    2>/dev/null || true
+fi
+
+ARC_CONF=/etc/dnf/automatic-reboot.conf
+arc_conf_get() {
+    _val=$(grep -E "^[[:space:]]*$1[[:space:]]*=" "${ARC_CONF}" 2>/dev/null \
+           | tail -1 | sed 's/^[^=]*=[[:space:]]*//' | sed 's/[[:space:]]*#.*//') || true
+    if [ -n "${_val}" ]; then printf '%s' "${_val}"; else printf '%s' "$2"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Real time-sync.target gate.
+#
+# The service unit orders itself After=/Requires=time-sync.target so rpm
+# INSTALLTIME stamps and the boot-time comparison inside needs-restarting see
+# a correct clock.  On UEK R8 systemd-time-wait-sync.service does not exist
+# and nothing else is ordered Before=time-sync.target, so that dependency is
+# satisfied trivially.  chrony ships chrony-wait.service - `chronyc waitsync`,
+# ordered Before=time-sync.target - disabled by default; enabling it is what
+# makes the ordering mean anything.
+#
+# Enabling another package's unit cannot be expressed as a preset of ours, so
+# this is a second deliberate exception to the macro-only scriptlet rule (see
+# grub-boot-success.service below for the first).  Never disabled on erase:
+# a synchronised clock is not this package's to take away.
+# ---------------------------------------------------------------------------
+ARC_CHRONY_WAIT=$(arc_conf_get enable_chrony_wait yes)
+if [ "${ARC_CHRONY_WAIT}" = "yes" ] \
+   && systemctl cat chrony-wait.service >/dev/null 2>&1 \
+   && ! systemctl is-enabled --quiet chrony-wait.service 2>/dev/null; then
+    if systemctl --no-reload enable chrony-wait.service >/dev/null 2>&1; then
+        echo "dnf-automatic-reboot: enabled chrony-wait.service - time-sync.target now waits for real clock sync"
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -152,12 +218,6 @@ fi
 # package so non-UEK kernels are never touched.  Behaviour is controlled by
 # the [kernel] section of /etc/dnf/automatic-reboot.conf (read below).
 # ---------------------------------------------------------------------------
-ARC_CONF=/etc/dnf/automatic-reboot.conf
-arc_conf_get() {
-    _val=$(grep -E "^[[:space:]]*$1[[:space:]]*=" "${ARC_CONF}" 2>/dev/null \
-           | tail -1 | sed 's/^[^=]*=[[:space:]]*//' | sed 's/[[:space:]]*#.*//') || true
-    if [ -n "${_val}" ]; then printf '%s' "${_val}"; else printf '%s' "$2"; fi
-}
 ARC_MANAGE=$(arc_conf_get manage_kernel_default yes)
 ARC_KPKG=$(arc_conf_get kernel_default_package kernel-uek-core)
 
@@ -232,6 +292,12 @@ echo "       systemctl disable --now dnf-automatic.timer dnf-automatic-install.t
 echo "  4. Enable this package:"
 echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer"
 
+%posttrans
+# Versions before 1.3 installed the scripts under /usr/local/lib.  RPM removes
+# the files it owned there but never owned the directory itself.  This has to
+# run after the old package's files are gone, so %%posttrans rather than %%post.
+rmdir /usr/local/lib/%{name} >/dev/null 2>&1 || true
+
 %preun
 %systemd_preun dnf-automatic-reboot.service
 %systemd_preun dnf-automatic-reboot.timer
@@ -240,6 +306,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 
 # grub-boot-success.service is enabled directly (not via preset) on UEK hosts,
 # so disable it directly on final uninstall.  No-op if it was never enabled.
+# chrony-wait.service is deliberately left enabled: it belongs to chrony and a
+# synchronised clock is not this package's to remove.
 if [ $1 -eq 0 ]; then
     systemctl --no-reload disable grub-boot-success.service >/dev/null 2>&1 || true
     systemctl stop grub-boot-success.service >/dev/null 2>&1 || true
@@ -249,27 +317,26 @@ fi
 %systemd_postun_with_restart dnf-automatic-reboot.timer
 %systemd_postun_with_restart dnf-automatic-watchdog.timer
 
-# Re-apply SELinux contexts after uninstall (removes custom labels)
-if [ $1 -eq 0 ] && [ -x /sbin/restorecon ]; then
-    restorecon -Rv /usr/local/lib/ 2>/dev/null || true
-fi
-
 %files
 %license LICENSE
 %doc     %{_docdir}/%{name}/README
 
-# Scripts - shell_exec_t so systemd can exec them directly.
+# Scripts - bin_t so systemd can exec them directly.
 # 0750 root:root: executed by systemd as root; no world read/exec needed
 # (mirrors the 0640 config hardening).
-%attr(0750, root, root) %{_localibdir}/run.sh
-%attr(0750, root, root) %{_localibdir}/watchdog.sh
-%attr(0750, root, root) %{_localibdir}/needs-reboot.sh
+%dir %attr(0755, root, root) %{pkglibexecdir}
+%attr(0750, root, root) %{pkglibexecdir}/run.sh
+%attr(0750, root, root) %{pkglibexecdir}/watchdog.sh
+%attr(0750, root, root) %{pkglibexecdir}/needs-reboot.sh
+%attr(0750, root, root) %{pkglibexecdir}/notify-failure.sh
 
 # systemd units
 %{_unitdir}/dnf-automatic-reboot.service
 %{_unitdir}/dnf-automatic-reboot.timer
 %{_unitdir}/dnf-automatic-watchdog.service
 %{_unitdir}/dnf-automatic-watchdog.timer
+# Failure notifier, instantiated by OnFailure= with the failed unit name
+%{_unitdir}/dnf-automatic-reboot-failure@.service
 # Boot-success safeguard - shipped on all hosts (noarch) but only enabled on
 # UEK by %%post; ConditionKernelVersion=*uek* keeps it inert elsewhere.
 %{_unitdir}/grub-boot-success.service
@@ -277,16 +344,73 @@ fi
 # Config - preserved across upgrades; root:root 640 (no world read for safety)
 %config(noreplace) %attr(0640, root, root) %{_sysconfdir}/dnf/automatic-reboot.conf
 
-# Log file - var_log_t context applied by restorecon in %%post
+# tmpfiles.d - creates the log and state paths with the modes declared below
+%{_tmpfilesdir}/%{name}.conf
+
+# logrotate.d - admin-editable, so noreplace
+%config(noreplace) %{_sysconfdir}/logrotate.d/%{name}
+
+# Log file - created by systemd-tmpfiles, %%ghost so RPM owns the path and its
+# SELinux label without owning the content
 %ghost %attr(0640, root, root) %{_localstatedir}/log/%{name}.log
 
-# Restart-state directory - var_lib_t context applied by restorecon in
-# %%post.  %%ghost on the file itself: RPM owns the path and SELinux label
-# without owning content, same pattern as the log file above.
+# State directory - package-exclusive, unlike /var/log which the filesystem
+# package owns, so it needs an explicit %%dir entry to be tracked, labeled and
+# removed on erase.  %%ghost on the files: same pattern as the log above.
 %dir %attr(0750, root, root) %{_localstatedir}/lib/%{name}
 %ghost %attr(0640, root, root) %{_localstatedir}/lib/%{name}/restart-state
+%ghost %attr(0640, root, root) %{_localstatedir}/lib/%{name}/kernel-reboot-attempts
 
 %changelog
+* Fri Jul 31 2026 DagNode <packages@dagnode.com> - 1.3-1
+New:
+- Restart services still mapping pre-update files via needs-restarting -s,
+  which -r never reports; new [services] section with restart_services and
+  restart_services_exclude
+- Report enabled repositories with gpgcheck=0, and security advisories that
+  apply to the host but that dnf will not install; a repository priority= or
+  excludepkgs= leaves an advisory visible to updateinfo but invisible to the
+  depsolver while every run reports success; new [security] section
+- Verify grubby --default-kernel already points at the newest installed kernel
+  before scheduling a kernel reboot, and cap consecutive attempts per target
+  version, so a saved_entry that never advances cannot loop; new
+  verify_grub_default and kernel_reboot_attempt_limit
+- Enable chrony-wait.service at install time so Requires=time-sync.target is a
+  real gate on UEK R8, where systemd-time-wait-sync.service does not exist
+- Report failed runs to wall(1) and the log through OnFailure=
+- Ship tmpfiles.d and logrotate.d drop-ins so the log is created 0640 and
+  rotated weekly; it was created 0644 by the first script to write to it and
+  grew without bound
+- Ship a test suite; make check runs lint and tests, and %%check runs it during
+  the build
+
+Fixed, most severe first:
+- Parse needs-restarting output with an allowlist under LC_ALL=C and keep its
+  stderr out of the parsed stream; a translated locale or a plugin warning line
+  was read as a package name and rebooted the host on every run
+- Treat every unverifiable state as a genuine reboot requirement: missing
+  elfutils no longer aborts a kernel decision it cannot affect, and a package
+  with no verifiable running process is no longer dropped
+- Kill the whole service cgroup at watchdog timeout; signalling the recorded
+  PID and its direct children left dnf-automatic running behind timeout(1)
+- Do not force-reboot at hard timeout while phase=updating, where an rpm
+  transaction may be half-applied; opt back in with
+  force_reboot_on_hard_timeout
+- Fail the run instead of reporting success when the reboot state cannot be
+  established
+- Compare build-ids across every running process a package owns; stopping at
+  the first match cleared systemd on PID 1 while journald ran the old image
+- Prefer an orderly systemctl reboot over --force
+- Replace the fixed 30s needs-restarting timeout, which expired into a
+  fail-open "no reboot" on slow links, with a configurable
+  needs_restarting_timeout_sec defaulting to 120s and a cache-first attempt
+- Validate numeric config values instead of failing inside an arithmetic test,
+  and keep the warning off stdout where it was captured into the value returned
+
+Upgrade notes:
+- Scripts move from /usr/local/lib to /usr/libexec; update anything that calls
+  them by path
+- Requires systemd >= 252 for systemctl kill --kill-whom
 * Fri Jul 03 2026 DagNode <packages@dagnode.com> - 1.2-1
 - Learn non-kernel false positives (e.g. glibc) by observing whether a
   package is still flagged by needs-restarting after a real reboot, keyed
