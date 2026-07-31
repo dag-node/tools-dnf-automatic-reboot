@@ -6,14 +6,17 @@ Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
 
   - Holds a systemd shutdown inhibitor while updates are in progress so an
     accidental reboot does not corrupt a partial update.
-  - Filters known false-positive reboot triggers (UEK aarch64 version-string
-    mismatch, systemd PrivateTmp build-id masking) to avoid a permanent
-    nightly reboot cycle.
-  - Detects genuine reboots (systemd binary actually changed, real kernel
-    update) and schedules a timed reboot.
+  - Filters false-positive reboot triggers on positive evidence only: the
+    running kernel already being the newest installed one, or matching ELF
+    build-ids between a running daemon and its on-disk binary.  Anything
+    that cannot be verified either way still triggers a reboot.
+  - Detects genuine reboots and schedules a timed reboot, refusing to reboot
+    into a kernel the GRUB default would not select.
+  - Restarts services still mapping pre-update files, which
+    needs-restarting -r never reports.
   - An independent watchdog timer handles hung runs: soft timeout checks
-    whether dnf is still active; hard timeout kills the process tree and
-    force-reboots.
+    whether dnf is still active; hard timeout kills the whole service cgroup
+    and reboots only when the recorded phase proves dnf finished cleanly.
   - Detects concurrent manual dnf invocations and warns logged-in users.
   - All timeouts and behaviour are configurable without editing scripts.
 
@@ -21,16 +24,22 @@ Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
 Files installed
 ---------------
 
-  /usr/local/lib/dnf-automatic-reboot/run.sh
+  /usr/libexec/dnf-automatic-reboot/run.sh
       Main orchestration.  Called by the service unit.
 
-  /usr/local/lib/dnf-automatic-reboot/watchdog.sh
+  /usr/libexec/dnf-automatic-reboot/watchdog.sh
       Independent watchdog.  Called every 5 minutes by watchdog.timer.
 
-  /usr/local/lib/dnf-automatic-reboot/needs-reboot.sh
+  /usr/libexec/dnf-automatic-reboot/needs-reboot.sh
       Isolated reboot-decision logic.  Called by both run.sh and watchdog.sh.
       Handles false-positive filtering.
-      Exit codes: 0=no reboot needed, 1=reboot needed, 2=tool error (no reboot).
+      Exit codes: 0=no reboot needed, 1=reboot needed,
+                  2=undecidable, or a genuine kernel update that rebooting
+                    would not apply (no reboot; the run is marked failed).
+
+  /usr/libexec/dnf-automatic-reboot/notify-failure.sh
+      Failure notifier.  Started by OnFailure= from both service units;
+      writes the reason to wall(1), the journal and the log.
 
   /etc/dnf/automatic-reboot.conf
       Configuration.  Preserved across upgrades (%config(noreplace) in RPM).
@@ -43,10 +52,21 @@ Files installed
   /usr/lib/systemd/system/dnf-automatic-watchdog.timer
       Watchdog service + 5-minute polling timer.
 
+  /usr/lib/systemd/system/dnf-automatic-reboot-failure@.service
+      Instantiated by OnFailure= with the failed unit name, so a failed run
+      is never visible only to somebody who thinks to read the journal.
+
   /usr/lib/systemd/system/grub-boot-success.service
       UEK-only.  Runs grub2-set-bootflag boot_success each boot so GRUB's
       indeterminate-boot fallback cannot revert saved_entry to an old kernel.
       Enabled by %post on UEK hosts; inert elsewhere (ConditionKernelVersion).
+
+  /usr/lib/tmpfiles.d/dnf-automatic-reboot.conf
+      Creates the log file and state directory with the intended mode and
+      SELinux label before any script writes to them.
+
+  /etc/logrotate.d/dnf-automatic-reboot
+      Weekly rotation, 8 kept, compressed.
 
   /var/log/dnf-automatic-reboot.log
       All events logged here in addition to the journal.
@@ -55,6 +75,11 @@ Files installed
       Restart-state learning: tracks, per package, whether it has been
       confirmed as a false positive after surviving a real reboot still
       flagged at the same version.  See "Restart-state learning" below.
+
+  /var/lib/dnf-automatic-reboot/kernel-reboot-attempts
+      Consecutive reboots scheduled for a kernel version that has not become
+      the running one.  Cleared as soon as it does.  See "Kernel reboot loop
+      guard" below.
 
 
 Quick start
@@ -78,14 +103,17 @@ not satisfied.
   dnf install dnf-automatic-reboot
 
   # 4. Ensure chrony steps the clock immediately on boot and signals sync.
-  #    Critical on systems with unreliable RTC (e.g. RPi without DS1307).
+  #    Critical on systems with no RTC (e.g. RPi4).
   grep -q 'makestep 1 -1' /etc/chrony.conf || echo 'makestep 1 -1' >> /etc/chrony.conf
-  grep -q '^rtcsync'      /etc/chrony.conf || echo 'rtcsync'        >> /etc/chrony.conf
   systemctl restart chronyd
-  #    NOTE: systemd-time-wait-sync.service is absent on UEK R8.
-  #    The service unit uses Requires=time-sync.target as the best available
-  #    gate.  With makestep 1 -1 and a synced RTC the clock offset at boot
-  #    is negligible.
+  #    systemd-time-wait-sync.service is absent on UEK R8 and nothing else is
+  #    ordered Before=time-sync.target, so the unit's Requires=time-sync.target
+  #    gates nothing on its own.  chrony ships chrony-wait.service (chronyc
+  #    waitsync), disabled by default; %post enables it when
+  #    [time] enable_chrony_wait = yes.  Verify:
+  systemctl is-enabled chrony-wait.service
+  #    rtcsync is only meaningful with an RTC present; leave it commented out
+  #    otherwise.
 
   # 5. Review and optionally tune behaviour (defaults are sane)
   vi /etc/dnf/automatic-reboot.conf
@@ -109,6 +137,126 @@ Viewing logs
   journalctl -u dnf-automatic-reboot.service
   journalctl -u dnf-automatic-watchdog.service
   tail -f /var/log/dnf-automatic-reboot.log
+
+
+Why packages are flagged at all
+--------------------------------
+
+  needs-restarting -r runs exactly one test per package:
+
+      rpm INSTALLTIME > boot time
+
+  It never compares version strings.  The package list is fixed - kernel,
+  kernel-core, kernel-rt, glibc, linux-firmware, systemd, dbus, dbus-broker,
+  dbus-daemon, microcode_ctl - plus any *.conf drop-in under
+  /etc/dnf/plugins/needs-restarting.d/ (this is how kernel-uek gets on the
+  list on OL9).
+
+  The boot time comes from systemd's UnitsLoadStartTimestamp over D-Bus,
+  falling back to max(mtime of /proc/1, btime in /proc/stat).  On a host with
+  no RTC that timestamp is recorded before chrony corrects the clock, so it
+  sits permanently in the past and every package on the list stays flagged
+  forever.  Fitting an RTC removes the cause outright.
+
+  # See the boot time it is deciding against
+  busctl get-property org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+    org.freedesktop.systemd1.Manager UnitsLoadStartTimestamp \
+    | awk '{print "unitsload", strftime("%F %T", $2/1000000)}'
+  awk '/^btime/{print "btime    ", strftime("%F %T", $2)}' /proc/stat
+  stat -c 'proc1     %y' /proc/1
+  rpm -q --qf '%{INSTALLTIME:date}\n' glibc systemd
+
+
+Unsigned repositories
+----------------------
+
+  Every run reports enabled repositories with an explicit gpgcheck=0 before
+  installing anything, because unattended installation from an unsigned
+  repository is a code path nobody is watching.  It reports and continues; it
+  does not abort, since a deliberate local unsigned repository is a valid
+  choice and refusing to patch the host is worse.
+
+  # Same check by hand
+  grep -rh gpgcheck /etc/yum.repos.d/ /etc/dnf/dnf.conf | sort | uniq -c
+
+
+Advisories dnf will not apply
+------------------------------
+
+  After each update, any security advisory that applies to this host but that
+  dnf refuses to install is reported at error level and to wall(1).
+
+  dnf updateinfo reads the whole package sack; the depsolver does not.  A
+  repository priority=, an excludepkgs=, a disabled channel or a versionlock
+  leaves an advisory permanently visible-but-unappliable while every run
+  reports success and the host stays unpatched.
+
+  Repository priority is the common cause.  From dnf.conf(5): "If there is
+  more than one candidate package for a particular operation, the one from a
+  repo with the lowest priority value is picked, possibly despite being a
+  lower version."  A priority= on a distribution channel therefore pins every
+  package that channel ships and masks errata from every other channel.
+  Priorities protect a distribution from third-party repositories; between a
+  distribution's own channels they only create this hole.  kernel-uek* and
+  kernel* are different package names and never compete, so UEK needs none.
+
+  # Diagnose a report
+  dnf updateinfo list --updates --security      # what dnf says applies
+  dnf check-update --security; echo "rc=$?"     # 100 = actionable, 0 = nothing
+  dnf --assumeno --setopt='*.priority=99' update --security
+
+  # If levelling priorities surfaces the updates, remove priority= from the
+  # distribution repositories.  Keep it only on third-party repos (EPEL).
+  grep -rn 'priority' /etc/yum.repos.d/*.repo
+
+  # Turn the check off in /etc/dnf/automatic-reboot.conf
+  [security]
+  warn_unapplied_advisories = no
+
+
+Services still running pre-update code
+---------------------------------------
+
+  needs-restarting -r inspects only the fixed package list above.  A security
+  update to sshd, nginx, bind or anything linking a refreshed library patches
+  the on-disk file and leaves the vulnerable image resident, with no reboot
+  flag raised.  run.sh closes this with a needs-restarting -s pass whenever no
+  reboot is scheduled.
+
+  # What is still mapping pre-update files right now
+  LC_ALL=C dnf -q -C needs-restarting -s
+
+  # Control it in /etc/dnf/automatic-reboot.conf
+  [services]
+  restart_services         = yes
+  restart_services_exclude = dbus.service,dbus-broker.service,systemd-logind.service,...
+
+  Units are restarted with systemctl try-restart, so a unit that is not
+  running is left alone.  Extend the exclude list, never shorten it: dbus and
+  dbus-broker break every client holding a bus connection, systemd-logind
+  drops session tracking.
+
+
+Kernel reboot loop guard
+-------------------------
+
+  Before scheduling a reboot for a kernel update, needs-reboot.sh checks that
+  grubby --default-kernel already points at the newest installed kernel.  If
+  it does not, the reboot would come back up on the same kernel and be
+  requested again on the next run - an unbounded reboot loop.  The reboot is
+  withheld and logged at error level instead.
+
+  kernel_reboot_attempt_limit is the backstop for every other cause of a
+  kernel that never becomes the running one (GRUB fallback reverting
+  saved_entry, a kernel that panics, a read-only /boot).
+
+  # Inspect and reset
+  column -t /var/lib/dnf-automatic-reboot/kernel-reboot-attempts
+  rm -f /var/lib/dnf-automatic-reboot/kernel-reboot-attempts
+
+  # Repair a stale GRUB default by hand
+  grubby --set-default "/boot/vmlinuz-$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' \
+      kernel-uek-core | sort -V | tail -1)"
 
 
 Diagnosing the systemd false-positive
@@ -138,8 +286,10 @@ Diagnosing kernel false-positive (aarch64 and x86_64)
   # x86_64 (RHEL 8/9):
   rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel     | sort -V | tail -1
 
-  # If the RPM string matches uname -r (modulo the trailing .<arch> suffix):
-  # confirmed false positive.  needs-reboot.sh filters this automatically.
+  # uname -r and rpm's VERSION-RELEASE.ARCH are the same string on both UEK
+  # and stock EL kernels, so this is an equality test.  Equal means the
+  # running kernel already is the newest installed one: confirmed false
+  # positive, filtered automatically.  Different means a genuine update.
 
 
 UEK kernel default (kernel not booted after update)
@@ -215,10 +365,10 @@ Forcing a manual run
   journalctl -u dnf-automatic-reboot.service -e
 
   # Test needs-reboot detection only (no update, no reboot):
-  /usr/local/lib/dnf-automatic-reboot/needs-reboot.sh; echo "exit: $?"
+  /usr/libexec/dnf-automatic-reboot/needs-reboot.sh; echo "exit: $?"
 
   # Test watchdog (with no state file it exits immediately):
-  /usr/local/lib/dnf-automatic-reboot/watchdog.sh
+  /usr/libexec/dnf-automatic-reboot/watchdog.sh
 
 
 Uninstalling
@@ -231,8 +381,9 @@ Uninstalling
   The log file /var/log/dnf-automatic-reboot.log is preserved on uninstall.
   Remove manually if not needed:  rm /var/log/dnf-automatic-reboot.log
 
-  The restart-state file is preserved the same way.  Remove manually if
-  not needed:  rm -rf /var/lib/dnf-automatic-reboot
+  The restart-state and kernel-reboot-attempts files are preserved the same
+  way.  Remove manually if not needed:
+      rm -rf /var/lib/dnf-automatic-reboot
 
 
 Hardware watchdog (recommended for headless systems)
