@@ -140,6 +140,10 @@ write_stub_programs() {
     # Recorded so tests can assert exactly which privileged action was taken.
     cat > "${TEST_ROOT_DIR}/usr/bin/systemctl" <<'STUB'
 #!/bin/bash
+if [[ "$1" == "--version" ]]; then
+    printf 'systemd %s (stub)\n' "${STUB_SYSTEMD_VERSION:-252}"
+    exit 0
+fi
 printf 'systemctl %s\n' "$*" >> "${STUB_LOG}"
 [[ "${STUB_SYSTEMCTL_FAIL:-}" == "yes" ]] && exit 1
 exit 0
@@ -255,6 +259,13 @@ load_needs_reboot_library() {
     set +e
     IFS=$' \t\n'
     install_command_stubs
+}
+
+load_watchdog_library() {
+    # shellcheck source=/dev/null
+    source "${REPO_ROOT}/scripts/watchdog.sh"
+    set +e
+    IFS=$' \t\n'
 }
 
 load_run_library() {
@@ -906,6 +917,25 @@ test_watchdog_hard_timeout_while_checking_reboots() {
     assert_contains "${recorded_calls}" "systemctl reboot" "safe to reboot after a clean dnf"
 }
 
+test_watchdog_kill_option_follows_systemd_version() {
+    load_watchdog_library
+    # Surveyed: systemd 239 (EL8) accepts only --kill-who, 252 (EL9) both.
+    assert_equals "--kill-who=all"  "$(systemctl_kill_target_option 239)" "EL8 systemd"
+    assert_equals "--kill-whom=all" "$(systemctl_kill_target_option 252)" "EL9 systemd"
+    assert_equals "--kill-who=all"  "$(systemctl_kill_target_option '')" \
+        "an unreadable version takes the spelling every surveyed version accepts"
+}
+
+test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who() {
+    export STUB_SYSTEMD_VERSION=239
+    sleep 60 &
+    local background_pid=$!
+    write_watchdog_state updating 200 "${background_pid}"
+    bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
+    kill "${background_pid}" 2>/dev/null
+    assert_contains "$(cat "${STUB_LOG}")" "kill --kill-who=all" "EL8 spelling used on systemd 239"
+}
+
 test_watchdog_prefers_orderly_reboot() {
     sleep 60 &
     local background_pid=$!
@@ -1001,6 +1031,8 @@ run_test "watchdog: hard timeout while updating does not reboot" test_watchdog_h
 run_test "watchdog: hard timeout while updating can be forced"   test_watchdog_hard_timeout_while_updating_can_be_forced   needs-exec
 run_test "watchdog: hard timeout while checking reboots"         test_watchdog_hard_timeout_while_checking_reboots         needs-exec
 run_test "watchdog: prefers orderly reboot"          test_watchdog_prefers_orderly_reboot          needs-exec
+run_test "watchdog: kill option follows systemd version" test_watchdog_kill_option_follows_systemd_version
+run_test "watchdog: systemd 239 kills with --kill-who" test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who needs-exec
 
 printf '\n'
 if [[ "${TESTS_SKIPPED}" -gt 0 ]]; then

@@ -16,9 +16,10 @@ Requires:       dnf-automatic
 # rpm -qf against the live binary; dnf-plugins-core does not own it)
 Requires:       yum-utils
 # systemd-inhibit, systemd-run, wall are all in systemd or util-linux.
-# >= 252 for `systemctl kill --kill-whom`, spelled --kill-who before that;
-# the watchdog relies on it to reach the whole service cgroup.
-Requires:       systemd >= 252
+# 239 is EL8's.  The watchdog signals the whole service cgroup with
+# `systemctl kill --kill-who=all` there and `--kill-whom=all` from 252, the
+# release that renamed the option; watchdog.sh picks the spelling at runtime.
+Requires:       systemd >= 239
 Requires:       util-linux
 # eu-readelf for systemd build-id comparison (false-positive detection)
 Requires:       elfutils

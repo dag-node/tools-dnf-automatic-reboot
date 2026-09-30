@@ -111,9 +111,29 @@ FORCE_REBOOT_ON_HARD_TIMEOUT=$(conf_get force_reboot_on_hard_timeout no)
 # Signalling only the recorded PID (or only its direct children) leaves the
 # rpm transaction alive while the caller proceeds to reboot.
 # ---------------------------------------------------------------------------
+
+# systemctl_kill_target_option SYSTEMD_VERSION -> the option that makes
+# `systemctl kill` signal every process of the unit.  systemd 252 renamed
+# `--kill-who` to `--kill-whom`: on the surveyed hosts systemd 239 (EL8)
+# accepts only `--kill-who`, and 252 (EL9) accepts either.  A version that
+# does not parse gets `--kill-who`, which 239 and 252 accept.
+systemctl_kill_target_option() {
+    local systemd_version="$1"
+    if [[ "${systemd_version}" =~ ^[0-9]+$ && "${systemd_version}" -ge 252 ]]; then
+        printf '%s' '--kill-whom=all'
+    else
+        printf '%s' '--kill-who=all'
+    fi
+}
+
 kill_service_cgroup() {
-    local recorded_pid="$1"
-    "${SYSTEMCTL_BIN}" kill --kill-whom=all --signal=SIGKILL "${MAIN_SERVICE_UNIT}" 2>/dev/null || true
+    local recorded_pid="$1" systemd_version kill_target_option
+    systemd_version=$("${SYSTEMCTL_BIN}" --version 2>/dev/null \
+                      | sed -n '1s/^systemd \([0-9]\+\).*/\1/p') || true
+    kill_target_option=$(systemctl_kill_target_option "${systemd_version}")
+    if ! "${SYSTEMCTL_BIN}" kill "${kill_target_option}" --signal=SIGKILL "${MAIN_SERVICE_UNIT}" 2>/dev/null; then
+        log_err "systemctl kill ${kill_target_option} ${MAIN_SERVICE_UNIT} failed - processes of the run may survive"
+    fi
     sleep 2
     if kill -0 "${recorded_pid}" 2>/dev/null; then
         log_warn "PID ${recorded_pid} survived the cgroup kill - signalling it directly"
@@ -162,137 +182,145 @@ schedule_reboot() {
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# Scenario 1: no state file
-# ---------------------------------------------------------------------------
-if [[ ! -f "${STATE_FILE}" ]]; then
-    exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# Parse state file
-# ---------------------------------------------------------------------------
-run_phase=""
-start_uptime_seconds=""
-service_pid=0
-
-run_phase=$(grep            '^phase=' "${STATE_FILE}" | cut -d= -f2) || true
-start_uptime_seconds=$(grep '^start_uptime=' "${STATE_FILE}" | cut -d= -f2) || true
-service_pid=$(grep            '^pid=' "${STATE_FILE}" | cut -d= -f2) || true
-
-if [[ ! "${start_uptime_seconds}" =~ ^[0-9]+$ || ! "${service_pid}" =~ ^[0-9]+$ ]]; then
-    log "Malformed state file - removing"
-    rm -f "${STATE_FILE}" "${LOCK_FILE}"
-    exit 0
-fi
-
-# Elapsed time is measured on CLOCK_BOOTTIME.  With no RTC, a run started
-# before chrony synchronises sees the wall clock step forward by however long
-# the host was off, which read as wall-clock time would trip the hard timeout
-# and kill an rpm transaction minutes after it began.  /run does not survive
-# a reboot, so a recorded uptime always belongs to the current boot.
-current_uptime_seconds=""
-read -r current_uptime_seconds _ < "${UPTIME_FILE}" 2>/dev/null || true
-current_uptime_seconds="${current_uptime_seconds%%.*}"
-if [[ ! "${current_uptime_seconds}" =~ ^[0-9]+$ ]]; then
-    log_err "cannot read ${UPTIME_FILE} - run not supervised this cycle"
-    exit 1
-fi
-elapsed_min=$(( (current_uptime_seconds - start_uptime_seconds) / 60 ))
-
-log "phase=${run_phase} elapsed=${elapsed_min}min pid=${service_pid}"
-
-# ---------------------------------------------------------------------------
-# Scenario 2: dead PID with state file present
-# ---------------------------------------------------------------------------
-if ! kill -0 "${service_pid}" 2>/dev/null; then
-    log_warn "service PID ${service_pid} is dead but state file exists - updates may be incomplete, NOT rebooting"
-    wall_msg "dnf-automatic-reboot: WARNING - update process (PID ${service_pid})" \
-             "died unexpectedly in phase=${run_phase}." \
-             "Manual inspection required before rebooting."
-    rm -f "${STATE_FILE}" "${LOCK_FILE}"
-    exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# Scenario 3: hard timeout - PID still alive after HARD_TIMEOUT_MIN
-#
-# phase=checking means dnf-automatic already returned cleanly, so the rpm
-# transaction is complete and rebooting is safe.  phase=updating means it did
-# not, so an rpm transaction may be half-applied - the same uncertainty for
-# which scenario 2 already refuses to reboot.  Rebooting there is opt-in.
-# ---------------------------------------------------------------------------
-if [[ "${elapsed_min}" -ge "${HARD_TIMEOUT_MIN}" ]]; then
-    log_err "hard timeout ${HARD_TIMEOUT_MIN}min exceeded - PID ${service_pid} still alive in phase=${run_phase}"
-    kill_service_cgroup "${service_pid}"
-    rm -f "${STATE_FILE}" "${LOCK_FILE}"
-
-    if [[ "${run_phase}" == "checking" || "${FORCE_REBOOT_ON_HARD_TIMEOUT}" == "yes" ]]; then
-        wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded." \
-                 "Killed the stuck run and rebooting now."
-        reboot_now
-    else
-        log_err "phase=${run_phase} at hard timeout - an rpm transaction may be incomplete, NOT rebooting; set force_reboot_on_hard_timeout=yes to override"
-        wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded in phase=${run_phase}." \
-                 "Killed the stuck run. Updates may be incomplete - inspect with 'dnf history' before rebooting."
-    fi
-    exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# Scenario 4: soft timeout - PID alive, past SOFT_TIMEOUT_MIN
-# ---------------------------------------------------------------------------
-if [[ "${elapsed_min}" -ge "${SOFT_TIMEOUT_MIN}" ]]; then
-
-    # Is dnf still doing anything?
-    dnf_active=0
-    pgrep -x dnf           > /dev/null 2>&1 && dnf_active=1
-    pgrep -x dnf-3         > /dev/null 2>&1 && dnf_active=1
-    pgrep -x dnf-automatic > /dev/null 2>&1 && dnf_active=1
-    # Active network connection owned by any dnf process
-    ss -tp 2>/dev/null | grep -qE '\bdnf\b'  && dnf_active=1
-
-    if [[ "${dnf_active}" -eq 1 ]]; then
-        log "Soft timeout reached but dnf still active - waiting for hard timeout"
+# Sourcing defines this file's functions without running the checks, so
+# tests/run-tests.sh can exercise them directly.
+main() {
+    # ---------------------------------------------------------------------------
+    # Scenario 1: no state file
+    # ---------------------------------------------------------------------------
+    if [[ ! -f "${STATE_FILE}" ]]; then
         exit 0
     fi
 
-    log "Soft timeout reached and dnf idle (phase=${run_phase})"
+    # ---------------------------------------------------------------------------
+    # Parse state file
+    # ---------------------------------------------------------------------------
+    run_phase=""
+    start_uptime_seconds=""
+    service_pid=0
 
-    if [[ "${run_phase}" == "checking" ]]; then
-        # needs-reboot.sh appears to be hung - run independently
-        log "Phase=checking with idle dnf - running independent reboot check"
-        needs_reboot_exit_code=0
-        "${LIBRARY_DIRECTORY}/needs-reboot.sh" || needs_reboot_exit_code=$?
+    run_phase=$(grep            '^phase=' "${STATE_FILE}" | cut -d= -f2) || true
+    start_uptime_seconds=$(grep '^start_uptime=' "${STATE_FILE}" | cut -d= -f2) || true
+    service_pid=$(grep            '^pid=' "${STATE_FILE}" | cut -d= -f2) || true
 
-        # Kill the stuck run so it cannot hold the inhibitor lock past the reboot
+    if [[ ! "${start_uptime_seconds}" =~ ^[0-9]+$ || ! "${service_pid}" =~ ^[0-9]+$ ]]; then
+        log "Malformed state file - removing"
+        rm -f "${STATE_FILE}" "${LOCK_FILE}"
+        exit 0
+    fi
+
+    # Elapsed time is measured on CLOCK_BOOTTIME.  With no RTC, a run started
+    # before chrony synchronises sees the wall clock step forward by however long
+    # the host was off, which read as wall-clock time would trip the hard timeout
+    # and kill an rpm transaction minutes after it began.  /run does not survive
+    # a reboot, so a recorded uptime always belongs to the current boot.
+    current_uptime_seconds=""
+    read -r current_uptime_seconds _ < "${UPTIME_FILE}" 2>/dev/null || true
+    current_uptime_seconds="${current_uptime_seconds%%.*}"
+    if [[ ! "${current_uptime_seconds}" =~ ^[0-9]+$ ]]; then
+        log_err "cannot read ${UPTIME_FILE} - run not supervised this cycle"
+        exit 1
+    fi
+    elapsed_min=$(( (current_uptime_seconds - start_uptime_seconds) / 60 ))
+
+    log "phase=${run_phase} elapsed=${elapsed_min}min pid=${service_pid}"
+
+    # ---------------------------------------------------------------------------
+    # Scenario 2: dead PID with state file present
+    # ---------------------------------------------------------------------------
+    if ! kill -0 "${service_pid}" 2>/dev/null; then
+        log_warn "service PID ${service_pid} is dead but state file exists - updates may be incomplete, NOT rebooting"
+        wall_msg "dnf-automatic-reboot: WARNING - update process (PID ${service_pid})" \
+                 "died unexpectedly in phase=${run_phase}." \
+                 "Manual inspection required before rebooting."
+        rm -f "${STATE_FILE}" "${LOCK_FILE}"
+        exit 0
+    fi
+
+    # ---------------------------------------------------------------------------
+    # Scenario 3: hard timeout - PID still alive after HARD_TIMEOUT_MIN
+    #
+    # phase=checking means dnf-automatic already returned cleanly, so the rpm
+    # transaction is complete and rebooting is safe.  phase=updating means it did
+    # not, so an rpm transaction may be half-applied - the same uncertainty for
+    # which scenario 2 already refuses to reboot.  Rebooting there is opt-in.
+    # ---------------------------------------------------------------------------
+    if [[ "${elapsed_min}" -ge "${HARD_TIMEOUT_MIN}" ]]; then
+        log_err "hard timeout ${HARD_TIMEOUT_MIN}min exceeded - PID ${service_pid} still alive in phase=${run_phase}"
         kill_service_cgroup "${service_pid}"
         rm -f "${STATE_FILE}" "${LOCK_FILE}"
 
-        case "${needs_reboot_exit_code}" in
-            1)
-                schedule_reboot || true
-                ;;
-            2)
-                log_err "Watchdog: reboot state could not be established - killed the stuck run, not rebooting"
-                wall_msg "dnf-automatic-reboot: Watchdog killed a stuck check but could not" \
-                         "determine whether a reboot is needed. Manual inspection required."
-                ;;
-            *)
-                log "Watchdog: no reboot needed - stuck run killed"
-                ;;
-        esac
-
-    elif [[ "${run_phase}" == "failed" ]]; then
-        log "Phase=failed at soft timeout - leaving for operator; hard timeout will kill the run"
-
-    else
-        # phase=updating but dnf is idle: dnf finished but the script is hung
-        # between dnf-automatic and needs-reboot.  Leave for hard timeout;
-        # we do not know if updates completed cleanly.
-        log "Phase=${run_phase} with idle dnf at soft timeout - leaving for hard timeout"
+        if [[ "${run_phase}" == "checking" || "${FORCE_REBOOT_ON_HARD_TIMEOUT}" == "yes" ]]; then
+            wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded." \
+                     "Killed the stuck run and rebooting now."
+            reboot_now
+        else
+            log_err "phase=${run_phase} at hard timeout - an rpm transaction may be incomplete, NOT rebooting; set force_reboot_on_hard_timeout=yes to override"
+            wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded in phase=${run_phase}." \
+                     "Killed the stuck run. Updates may be incomplete - inspect with 'dnf history' before rebooting."
+        fi
+        exit 0
     fi
-fi
 
-# Not yet at soft timeout - nothing to do
-exit 0
+    # ---------------------------------------------------------------------------
+    # Scenario 4: soft timeout - PID alive, past SOFT_TIMEOUT_MIN
+    # ---------------------------------------------------------------------------
+    if [[ "${elapsed_min}" -ge "${SOFT_TIMEOUT_MIN}" ]]; then
+
+        # Is dnf still doing anything?
+        dnf_active=0
+        pgrep -x dnf           > /dev/null 2>&1 && dnf_active=1
+        pgrep -x dnf-3         > /dev/null 2>&1 && dnf_active=1
+        pgrep -x dnf-automatic > /dev/null 2>&1 && dnf_active=1
+        # Active network connection owned by any dnf process
+        ss -tp 2>/dev/null | grep -qE '\bdnf\b'  && dnf_active=1
+
+        if [[ "${dnf_active}" -eq 1 ]]; then
+            log "Soft timeout reached but dnf still active - waiting for hard timeout"
+            exit 0
+        fi
+
+        log "Soft timeout reached and dnf idle (phase=${run_phase})"
+
+        if [[ "${run_phase}" == "checking" ]]; then
+            # needs-reboot.sh appears to be hung - run independently
+            log "Phase=checking with idle dnf - running independent reboot check"
+            needs_reboot_exit_code=0
+            "${LIBRARY_DIRECTORY}/needs-reboot.sh" || needs_reboot_exit_code=$?
+
+            # Kill the stuck run so it cannot hold the inhibitor lock past the reboot
+            kill_service_cgroup "${service_pid}"
+            rm -f "${STATE_FILE}" "${LOCK_FILE}"
+
+            case "${needs_reboot_exit_code}" in
+                1)
+                    schedule_reboot || true
+                    ;;
+                2)
+                    log_err "Watchdog: reboot state could not be established - killed the stuck run, not rebooting"
+                    wall_msg "dnf-automatic-reboot: Watchdog killed a stuck check but could not" \
+                             "determine whether a reboot is needed. Manual inspection required."
+                    ;;
+                *)
+                    log "Watchdog: no reboot needed - stuck run killed"
+                    ;;
+            esac
+
+        elif [[ "${run_phase}" == "failed" ]]; then
+            log "Phase=failed at soft timeout - leaving for operator; hard timeout will kill the run"
+
+        else
+            # phase=updating but dnf is idle: dnf finished but the script is hung
+            # between dnf-automatic and needs-reboot.  Leave for hard timeout;
+            # we do not know if updates completed cleanly.
+            log "Phase=${run_phase} with idle dnf at soft timeout - leaving for hard timeout"
+        fi
+    fi
+
+    # Not yet at soft timeout - nothing to do
+    exit 0
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
