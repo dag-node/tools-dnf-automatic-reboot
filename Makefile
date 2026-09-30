@@ -33,12 +33,22 @@ TESTS = tests/run-tests.sh
 TOOLS = tools/verify-grub-boot-flags.sh \
         tools/verify-el-prerequisites.sh
 
-.PHONY: all install uninstall dist clean check lint test
+# rpmbuild output goes to ./rpmbuild, emptied on every build, so exactly one
+# build of this version is there to install.  DIST and RPM_RELEASE are optional:
+#   make rpm DIST=.el9 RPM_RELEASE=0.12.gitabc1234
+RPM_TOPDIR = $(CURDIR)/rpmbuild
+RPMBUILD_DEFINES = --define "_topdir $(RPM_TOPDIR)" \
+                   --define "_sourcedir $(CURDIR)" --define "_specdir $(CURDIR)" \
+                   $(if $(DIST),--define "dist $(DIST)") \
+                   $(if $(RPM_RELEASE),--define "rpm_release $(RPM_RELEASE)")
+
+.PHONY: all install uninstall dist rpm clean check lint test
 
 all:
 	@echo "Run: make check     (syntax, lint and tests)"
 	@echo "Run: make install   (as root)"
 	@echo "Run: make dist      (to create source tarball)"
+	@echo "Run: make rpm       (to build the RPM into ./rpmbuild)"
 
 # Gate for every change: parse, lint, then run the suite.
 check: lint test
@@ -90,8 +100,14 @@ uninstall:
 dist: check
 	tar czf $(TARBALL) --transform 's,^,$(NAME)-$(VERSION)/,' \
 	    Makefile $(SCRIPTS) $(UNITS) $(CONF) $(TMPFILES) $(LOGROTATE) \
-	    $(TESTS) $(DOC) $(LICENSE) $(NAME).spec
+	    $(TESTS) $(TOOLS) $(DOC) $(LICENSE) $(NAME).spec
 	@echo "Created $(TARBALL)"
+
+rpm: dist
+	rm -rf $(RPM_TOPDIR)
+	rpmbuild -ba $(NAME).spec $(RPMBUILD_DEFINES)
+	@echo "Built:"; ls -1 $(RPM_TOPDIR)/RPMS/noarch/*.rpm
 
 clean:
 	rm -f $(TARBALL)
+	rm -rf $(RPM_TOPDIR)
