@@ -29,6 +29,9 @@ DOC       = doc/README
 LICENSE   = LICENSE
 
 TESTS = tests/run-tests.sh
+# Operator diagnostics: linted with the scripts, never installed.
+TOOLS = tools/verify-grub-boot-flags.sh \
+        tools/verify-el-prerequisites.sh
 
 .PHONY: all install uninstall dist clean check lint test
 
@@ -41,13 +44,13 @@ all:
 check: lint test
 
 lint:
-	@for script in $(SCRIPTS) $(TESTS); do bash -n $$script || exit 1; echo "syntax OK  $$script"; done
+	@for script in $(SCRIPTS) $(TESTS) $(TOOLS); do bash -n $$script || exit 1; echo "syntax OK  $$script"; done
 	@if command -v shellcheck >/dev/null 2>&1; then \
-	    shellcheck -S warning $(SCRIPTS) && echo "shellcheck OK"; \
+	    shellcheck -S warning $(SCRIPTS) $(TOOLS) && echo "shellcheck OK"; \
 	else \
 	    echo "shellcheck not installed - skipping lint"; \
 	fi
-	@if LC_ALL=C grep -nP '[^\x00-\x7F]' $(SCRIPTS) $(CONF) $(UNITS) $(TMPFILES) $(LOGROTATE); then \
+	@if LC_ALL=C grep -nP '[^\x00-\x7F]' $(SCRIPTS) $(TOOLS) $(CONF) $(UNITS) $(TMPFILES) $(LOGROTATE); then \
 	    echo "ERROR: non-ASCII characters found (scripts and config must be ASCII only)"; exit 1; \
 	else \
 	    echo "ascii OK"; \
