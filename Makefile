@@ -89,7 +89,7 @@ uninstall:
 dist: check
 	tar czf $(TARBALL) --transform 's,^,$(NAME)-$(VERSION)/,' \
 	    Makefile $(SCRIPTS) $(UNITS) $(CONF) $(TMPFILES) $(LOGROTATE) \
-	    $(TESTS) $(DOC) $(LICENSE)
+	    $(TESTS) $(DOC) $(LICENSE) $(NAME).spec
 	@echo "Created $(TARBALL)"
 
 clean:

@@ -24,6 +24,7 @@ IFS=$' \t\n'
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 readonly REPO_ROOT
+readonly SPEC_FILE="${REPO_ROOT}/dnf-automatic-reboot.spec"
 
 TESTS_RUN=0
 TESTS_FAILED=0
@@ -56,10 +57,17 @@ run_test() {
     # only extended inside the subshell so stubs cannot leak between tests.
     make_test_root
 
+    local skip_reason=""
     if [[ "${requirement}" == "needs-exec" && "${TEST_ROOT_IS_EXECUTABLE}" != "yes" ]]; then
+        skip_reason="temporary tree is noexec"
+    elif [[ "${requirement}" == "needs-rpmspec" ]] \
+         && ! { command -v rpmspec >/dev/null 2>&1 && [[ -f "${SPEC_FILE}" ]]; }; then
+        skip_reason="rpmspec or the spec file is unavailable"
+    fi
+    if [[ -n "${skip_reason}" ]]; then
         TESTS_SKIPPED=$(( TESTS_SKIPPED + 1 ))
-        SKIPPED_TEST_NAMES+=("${test_name}")
-        printf '  skip %s (temporary tree is noexec)\n' "${test_name}"
+        SKIPPED_TEST_NAMES+=("${test_name} (${skip_reason})")
+        printf '  skip %s (%s)\n' "${test_name}" "${skip_reason}"
         rm -rf "${TEST_ROOT_DIR:?}" 2>/dev/null
         return 0
     fi
@@ -987,6 +995,324 @@ test_watchdog_prefers_orderly_reboot() {
 }
 
 # ---------------------------------------------------------------------------
+# preflight: %pre refuses any host the package cannot reboot safely
+#
+# The real scriptlet, as rpm expands it, with %{?preflight_root} pointed at
+# the fixture tree.  Built RPMs expand that macro to nothing.
+# ---------------------------------------------------------------------------
+readonly FIXTURE_KERNEL=/boot/vmlinuz-6.12.0-206.104.4.4.el9uek.aarch64
+
+# make_preflight_host: a fixture that passes every check.
+make_preflight_host() {
+    printf 'NAME="Oracle Linux Server"\nPLATFORM_ID="platform:el9"\n' > "${TEST_ROOT_DIR}/etc/os-release"
+    mkdir -p "${TEST_ROOT_DIR}/run/systemd/system" "${TEST_ROOT_DIR}/boot/loader/entries" \
+             "${TEST_ROOT_DIR}/boot/grub2" "${TEST_ROOT_DIR}/etc/default" "${TEST_ROOT_DIR}/etc/sysconfig"
+    printf 'GRUB_ENABLE_BLSCFG=true\nGRUB_DEFAULT=saved\nGRUB_UPDATE_DEFAULT_KERNEL=true\n' \
+        > "${TEST_ROOT_DIR}/etc/default/grub"
+    printf 'DEFAULTKERNEL=kernel-uek-core\n' > "${TEST_ROOT_DIR}/etc/sysconfig/kernel"
+    # What grub2-mkconfig's 00_header emits for GRUB_DEFAULT=saved.
+    printf '%s\n' 'if [ "${next_entry}" ] ; then' '   set default="${next_entry}"' 'else' \
+                  '   set default="${saved_entry}"' 'fi' > "${TEST_ROOT_DIR}/boot/grub2/grub.cfg"
+    : > "${TEST_ROOT_DIR}/boot/loader/entries/b7c51e4d-6.12.0-206.104.4.4.el9uek.aarch64.conf"
+    : > "${TEST_ROOT_DIR}${FIXTURE_KERNEL}"
+    export STUB_GRUBBY_DEFAULT="${FIXTURE_KERNEL}"
+    export STUB_INSTALLED_VERSION=""
+    export STUB_MISSING_PACKAGES=""
+    export STUB_RUNNING_KERNEL_PACKAGE="kernel-uek-core"
+    # Installed versions of the running kernel's package; the newest is the default.
+    export STUB_KERNEL_VERSIONS="6.12.0-206.104.4.4.el9uek.aarch64"
+}
+
+# make_stock_kernel_host: a RHEL-style host running kernel-core.
+make_stock_kernel_host() {
+    make_preflight_host
+    export STUB_RUNNING_KERNEL_PACKAGE="kernel-core"
+    printf 'DEFAULTKERNEL=kernel-core\n' > "${TEST_ROOT_DIR}/etc/sysconfig/kernel"
+    printf 'GRUB_UPDATE_DEFAULT_KERNEL=true\n' >> "${TEST_ROOT_DIR}/etc/default/grub"
+}
+
+# run_preflight INSTANCE_COUNT -> scriptlet output on stdout, its exit code returned.
+# INSTANCE_COUNT is rpm's $1: 1 for a fresh install, 2 for an upgrade.
+run_preflight() {
+    local scriptlet_file="${TEST_ROOT_DIR}/prein.sh"
+    rpmspec -P --define "preflight_root ${TEST_ROOT_DIR}" "${SPEC_FILE}" 2>/dev/null \
+        | awk '/^%pre -p/ { in_pre = 1; next } /^%post$/ { in_pre = 0 } in_pre' \
+        > "${scriptlet_file}"
+    [[ -s "${scriptlet_file}" ]] || fail "could not extract %pre from the spec"
+    # Functions shadow the commands inside the child bash, as elsewhere.
+    rpm() {
+        if [[ "$1" == "-qf" ]]; then
+            [[ -n "${STUB_RUNNING_KERNEL_PACKAGE}" ]] || return 1
+            printf '%s\n' "${STUB_RUNNING_KERNEL_PACKAGE}"
+            return 0
+        fi
+        if [[ "$*" == *VERSION* && "${!#}" == "dnf-automatic-reboot" ]]; then
+            [[ -n "${STUB_INSTALLED_VERSION}" ]] || return 1
+            printf '%s\n' "${STUB_INSTALLED_VERSION}"
+            return 0
+        fi
+        if [[ "$*" == *VERSION* ]]; then
+            printf '%s\n' "${STUB_KERNEL_VERSIONS}"
+            return 0
+        fi
+        [[ " ${STUB_MISSING_PACKAGES} " != *" ${!#} "* ]]
+    }
+    grubby() { printf '%s\n' "${STUB_GRUBBY_DEFAULT}"; }
+    systemctl() { return 1; }
+    export -f rpm grubby systemctl
+    bash "${scriptlet_file}" "$1" 2>&1
+}
+
+test_preflight_prepared_host_passes() {
+    make_preflight_host
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "prepared EL9 BLS host: ${output}"
+}
+
+test_preflight_refuses_el10() {
+    make_preflight_host
+    printf 'PLATFORM_ID="platform:el10"\n' > "${TEST_ROOT_DIR}/etc/os-release"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "untested EL10 refused"
+    assert_contains "${output}" "platform:el10" "names the platform found"
+}
+
+# make_el8_host: shaped like the surveyed RHEL 8.10 EFI host.  The ESP holds
+# the full grub.cfg, and 20-grub.install does not read DEFAULTKERNEL.
+make_el8_host() {
+    make_preflight_host
+    printf 'PLATFORM_ID="platform:el8"\n' > "${TEST_ROOT_DIR}/etc/os-release"
+    export STUB_RUNNING_KERNEL_PACKAGE="kernel-core"
+    printf 'GRUB_ENABLE_BLSCFG=true\nGRUB_DEFAULT=saved\nGRUB_UPDATE_DEFAULT_KERNEL=true\n' \
+        > "${TEST_ROOT_DIR}/etc/default/grub"
+    mkdir -p "${TEST_ROOT_DIR}/boot/efi/EFI/redhat"
+    cp "${TEST_ROOT_DIR}/boot/grub2/grub.cfg" "${TEST_ROOT_DIR}/boot/efi/EFI/redhat/grub.cfg"
+}
+
+test_preflight_el8_host_passes() {
+    make_el8_host
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "EL8 without DEFAULTKERNEL: ${output}"
+}
+
+test_preflight_el8_checks_the_esp_grub_cfg() {
+    make_el8_host
+    # The ESP config is the one GRUB runs on EL8 EFI; /boot/grub2 still passes.
+    printf '%s\n' '   set default="0"' > "${TEST_ROOT_DIR}/boot/efi/EFI/redhat/grub.cfg"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "fixed default in the ESP config refused"
+    assert_contains "${output}" "grub2-mkconfig -o /boot/efi/EFI/redhat/grub.cfg" "names the file to regenerate"
+}
+
+test_preflight_el9_esp_stub_is_not_a_config() {
+    make_preflight_host
+    # EL9 EFI: the ESP file only loads /boot/grub2/grub.cfg.
+    mkdir -p "${TEST_ROOT_DIR}/boot/efi/EFI/redhat"
+    printf '%s\n' 'search --no-floppy --fs-uuid --set=dev 1234' 'set prefix=($dev)/grub2' \
+        'configfile $prefix/grub.cfg' > "${TEST_ROOT_DIR}/boot/efi/EFI/redhat/grub.cfg"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "stub is not checked for saved_entry: ${output}"
+}
+
+test_preflight_refuses_without_grub_cfg() {
+    make_preflight_host
+    rm -f "${TEST_ROOT_DIR}/boot/grub2/grub.cfg"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "no grub.cfg refused"
+    assert_contains "${output}" "no grub.cfg found" "says why"
+}
+
+test_preflight_refuses_without_systemd() {
+    make_preflight_host
+    rmdir "${TEST_ROOT_DIR}/run/systemd/system"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "container or chroot refused"
+    assert_contains "${output}" "not the running init" "says why"
+}
+
+test_preflight_refuses_without_bls() {
+    make_preflight_host
+    printf 'GRUB_ENABLE_BLSCFG=false\n' > "${TEST_ROOT_DIR}/etc/default/grub"
+    rm -f "${TEST_ROOT_DIR}"/boot/loader/entries/*.conf
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "legacy grub.cfg refused"
+    assert_contains "${output}" "GRUB_ENABLE_BLSCFG" "names the setting"
+    assert_contains "${output}" "no BLS entry" "names the missing entries"
+}
+
+test_preflight_refuses_unreadable_grub_default() {
+    make_preflight_host
+    # What grubby printed, with exit 0, when grubenv was unreadable.
+    export STUB_GRUBBY_DEFAULT="/boot"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "no usable default refused"
+    assert_contains "${output}" "grubby --set-default" "names the repair"
+}
+
+test_preflight_refuses_grub_cfg_not_booting_saved_entry() {
+    make_preflight_host
+    # grub2-mkconfig output for GRUB_DEFAULT=0: grubby's default is ignored.
+    printf '%s\n' '   set default="0"' > "${TEST_ROOT_DIR}/boot/grub2/grub.cfg"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "fixed default refused"
+    assert_contains "${output}" "does not boot saved_entry" "says why"
+}
+
+test_preflight_refuses_grub_default_not_saved() {
+    make_preflight_host
+    # grub.cfg still boots saved_entry, but the next grub2-mkconfig would not.
+    printf 'GRUB_ENABLE_BLSCFG=true\nGRUB_DEFAULT=0\n' > "${TEST_ROOT_DIR}/etc/default/grub"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "GRUB_DEFAULT=0 refused"
+    assert_contains "${output}" "GRUB_DEFAULT=saved is not set" "names the setting"
+}
+
+test_preflight_stock_kernel_with_default_settings_passes() {
+    make_stock_kernel_host
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "kernel-core with both settings: ${output}"
+}
+
+test_preflight_refuses_stock_kernel_without_update_default() {
+    make_stock_kernel_host
+    # %post only provisions UEK; here saved_entry would never advance.
+    printf 'GRUB_ENABLE_BLSCFG=true\nGRUB_DEFAULT=saved\n' > "${TEST_ROOT_DIR}/etc/default/grub"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "no GRUB_UPDATE_DEFAULT_KERNEL refused"
+    assert_contains "${output}" "GRUB_UPDATE_DEFAULT_KERNEL=true" "names the setting"
+}
+
+test_preflight_refuses_stock_kernel_with_wrong_default_kernel() {
+    make_stock_kernel_host
+    printf 'DEFAULTKERNEL=kernel\n' > "${TEST_ROOT_DIR}/etc/sysconfig/kernel"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "DEFAULTKERNEL naming another package refused"
+    assert_contains "${output}" "DEFAULTKERNEL=kernel-core  (found: 'kernel')" "names both values"
+}
+
+test_preflight_refuses_uek_without_kernel_default_settings() {
+    make_preflight_host
+    # A fresh OL9 UEK host: neither setting is present, and the installer
+    # refuses, naming them, rather than editing either file.
+    printf 'GRUB_ENABLE_BLSCFG=true\nGRUB_DEFAULT=saved\n' > "${TEST_ROOT_DIR}/etc/default/grub"
+    rm -f "${TEST_ROOT_DIR}/etc/sysconfig/kernel"
+    local grub_defaults_before output exit_code=0
+    grub_defaults_before=$(cat "${TEST_ROOT_DIR}/etc/default/grub")
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "UEK without the settings refused"
+    assert_contains "${output}" "GRUB_UPDATE_DEFAULT_KERNEL=true" "names the grub setting"
+    assert_contains "${output}" "DEFAULTKERNEL=kernel-uek-core" "names the kernel setting"
+    assert_equals "${grub_defaults_before}" "$(cat "${TEST_ROOT_DIR}/etc/default/grub")" \
+        "/etc/default/grub is not edited"
+    [[ -e "${TEST_ROOT_DIR}/etc/sysconfig/kernel" ]] && fail "/etc/sysconfig/kernel must not be created"
+    return 0
+}
+
+test_preflight_refuses_default_older_than_newest_kernel() {
+    make_preflight_host
+    # A newer kernel is installed, but the default was left on the old one.
+    export STUB_KERNEL_VERSIONS="6.12.0-206.104.4.4.el9uek.aarch64
+6.12.0-206.104.4.10.el9uek.aarch64"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "stale default refused, not repaired"
+    assert_contains "${output}" "grubby --set-default /boot/vmlinuz-6.12.0-206.104.4.10.el9uek.aarch64" \
+        "names the command, with the newest kernel"
+}
+
+test_preflight_refuses_unowned_running_kernel() {
+    make_preflight_host
+    export STUB_RUNNING_KERNEL_PACKAGE=""
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "hand-built kernel refused"
+    assert_contains "${output}" "no package owns" "says why"
+}
+
+test_preflight_savedefault_only_warns() {
+    make_preflight_host
+    printf 'GRUB_SAVEDEFAULT=true\n' >> "${TEST_ROOT_DIR}/etc/default/grub"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "an operator preference is not refused"
+    assert_contains "${output}" "WARNING: GRUB_SAVEDEFAULT=true" "but it is reported"
+}
+
+test_preflight_refuses_apply_updates_off() {
+    make_preflight_host
+    # The stock dnf-automatic value: downloads, installs nothing, exits 0.
+    printf 'reboot = never\napply_updates = no\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "apply_updates = no refused"
+    assert_contains "${output}" "apply_updates = yes" "names the setting to change"
+}
+
+test_preflight_refuses_apply_updates_unset() {
+    make_preflight_host
+    # dnf-automatic defaults a missing apply_updates to false.
+    printf 'reboot = never\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "missing apply_updates refused"
+    assert_contains "${output}" "apply_updates = <unset>" "says it is unset"
+}
+
+test_preflight_accepts_operator_automatic_conf() {
+    make_preflight_host
+    # An existing, hand-configured file as found on an OL9 host: checked as is.
+    printf '%s\n' '[commands]' 'upgrade_type = security' 'random_sleep = 0' \
+        'network_online_timeout = 60' 'download_updates = yes' 'apply_updates = True  # on' \
+        'reboot = never' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "hand-configured automatic.conf passes: ${output}"
+}
+
+test_preflight_refuses_missing_dependencies() {
+    make_preflight_host
+    # --nodeps without elfutils would disable the build-id check at runtime.
+    export STUB_MISSING_PACKAGES="dnf-automatic elfutils"
+    local output exit_code=0
+    output=$(run_preflight 1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "--nodeps install refused"
+    assert_contains "${output}" "dnf install dnf-automatic" "names each missing package"
+    assert_contains "${output}" "dnf install elfutils" "names each missing package"
+    assert_not_contains "${output}" "dnf install grubby" "installed packages not reported"
+}
+
+test_preflight_refuses_upgrade_from_pre_1_4() {
+    make_preflight_host
+    export STUB_INSTALLED_VERSION="1.2"
+    local output exit_code=0
+    output=$(run_preflight 2) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "1.2 upgrade refused"
+    assert_contains "${output}" "dnf remove dnf-automatic-reboot" "names the removal"
+}
+
+test_preflight_allows_upgrade_from_1_4() {
+    make_preflight_host
+    export STUB_INSTALLED_VERSION="1.4.0"
+    local output exit_code=0
+    output=$(run_preflight 2) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "1.4.0 upgrade allowed: ${output}"
+}
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 printf 'dnf-automatic-reboot test suite\n\n'
@@ -1079,9 +1405,35 @@ run_test "watchdog: kill option follows systemd version" test_watchdog_kill_opti
 run_test "watchdog: reused pid is not the run"        test_watchdog_reused_pid_is_not_the_run       needs-exec
 run_test "watchdog: systemd 239 kills with --kill-who" test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who needs-exec
 
+printf 'preflight\n'
+run_test "preflight: prepared host passes"           test_preflight_prepared_host_passes           needs-rpmspec
+run_test "preflight: refuses EL10"                   test_preflight_refuses_el10                   needs-rpmspec
+run_test "preflight: EL8 host passes"                test_preflight_el8_host_passes                needs-rpmspec
+run_test "preflight: EL8 checks the ESP grub.cfg"    test_preflight_el8_checks_the_esp_grub_cfg    needs-rpmspec
+run_test "preflight: EL9 ESP stub is not a config"   test_preflight_el9_esp_stub_is_not_a_config   needs-rpmspec
+run_test "preflight: refuses without grub.cfg"       test_preflight_refuses_without_grub_cfg       needs-rpmspec
+run_test "preflight: refuses without systemd"        test_preflight_refuses_without_systemd        needs-rpmspec
+run_test "preflight: refuses without BLS"            test_preflight_refuses_without_bls            needs-rpmspec
+run_test "preflight: refuses unreadable grub default" test_preflight_refuses_unreadable_grub_default needs-rpmspec
+run_test "preflight: refuses missing dependencies"   test_preflight_refuses_missing_dependencies   needs-rpmspec
+run_test "preflight: refuses grub.cfg not booting saved_entry" test_preflight_refuses_grub_cfg_not_booting_saved_entry needs-rpmspec
+run_test "preflight: refuses GRUB_DEFAULT not saved" test_preflight_refuses_grub_default_not_saved needs-rpmspec
+run_test "preflight: stock kernel with default settings passes" test_preflight_stock_kernel_with_default_settings_passes needs-rpmspec
+run_test "preflight: refuses stock kernel without update default" test_preflight_refuses_stock_kernel_without_update_default needs-rpmspec
+run_test "preflight: refuses stock kernel with wrong DEFAULTKERNEL" test_preflight_refuses_stock_kernel_with_wrong_default_kernel needs-rpmspec
+run_test "preflight: refuses UEK without kernel default settings" test_preflight_refuses_uek_without_kernel_default_settings needs-rpmspec
+run_test "preflight: refuses default older than newest kernel" test_preflight_refuses_default_older_than_newest_kernel needs-rpmspec
+run_test "preflight: refuses unowned running kernel" test_preflight_refuses_unowned_running_kernel needs-rpmspec
+run_test "preflight: refuses apply_updates off"      test_preflight_refuses_apply_updates_off      needs-rpmspec
+run_test "preflight: refuses apply_updates unset"    test_preflight_refuses_apply_updates_unset    needs-rpmspec
+run_test "preflight: accepts operator automatic.conf" test_preflight_accepts_operator_automatic_conf needs-rpmspec
+run_test "preflight: GRUB_SAVEDEFAULT only warns"    test_preflight_savedefault_only_warns         needs-rpmspec
+run_test "preflight: refuses upgrade from pre-1.4"   test_preflight_refuses_upgrade_from_pre_1_4   needs-rpmspec
+run_test "preflight: allows upgrade from 1.4"        test_preflight_allows_upgrade_from_1_4        needs-rpmspec
+
 printf '\n'
 if [[ "${TESTS_SKIPPED}" -gt 0 ]]; then
-    printf '%s skipped (temporary tree is noexec - run where /tmp allows exec):\n' "${TESTS_SKIPPED}"
+    printf '%s skipped:\n' "${TESTS_SKIPPED}"
     printf '  %s\n' "${SKIPPED_TEST_NAMES[@]}"
 fi
 if [[ "${TESTS_FAILED}" -eq 0 ]]; then
