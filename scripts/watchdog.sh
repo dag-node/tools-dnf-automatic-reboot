@@ -322,9 +322,6 @@ main() {
                     ;;
             esac
 
-        elif [[ "${run_phase}" == "failed" ]]; then
-            log "Phase=failed at soft timeout - leaving for operator; hard timeout will kill the run"
-
         else
             # phase=updating but dnf is idle: dnf finished but the script is hung
             # between dnf-automatic and needs-reboot.  Leave for hard timeout;

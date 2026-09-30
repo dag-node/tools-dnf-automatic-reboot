@@ -17,7 +17,7 @@
 #      running processes still map pre-update files.
 #
 # State file /run/dnf-automatic-reboot.state
-#   phase=         updating | checking | failed
+#   phase=         updating | checking
 #   start=         unix timestamp, for operators
 #   start_uptime=  seconds since boot; the watchdog times the run from this
 #                  because a host with no RTC steps its wall clock mid-run
@@ -435,7 +435,6 @@ main() {
 
     if [[ "${dnf_automatic_exit_code}" -ne 0 ]]; then
         log_err "dnf-automatic exited ${dnf_automatic_exit_code}"
-        write_state "failed"
         wall_msg "dnf-automatic-reboot: Update FAILED (exit ${dnf_automatic_exit_code})." \
                  "Manual inspection required."
         exit 1
