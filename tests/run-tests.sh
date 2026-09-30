@@ -824,7 +824,66 @@ stub_run_main() {
     }
     run_reboot_check() { return "${STUB_NEEDS_REBOOT_RC:-0}"; }
     schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
-    restart_stale_services() { printf 'restart_stale_services\n' >> "${STUB_LOG}"; }
+}
+
+# stub_service_restarts: timeout(1) runs dnf-automatic successfully, lists
+# STUB_STALE_SERVICES for needs-restarting -s, and exits with the
+# STUB_RESTART_RC_<unit stem> of each try-restart, 0 when unset.
+stub_service_restarts() {
+    timeout() {
+        local unit_name rc_variable
+        printf 'timeout %s\n' "$*" >> "${STUB_LOG}"
+        if [[ "$*" == *needs-restarting* ]]; then
+            printf '%s\n' "${STUB_STALE_SERVICES:-}"
+            return 0
+        fi
+        if [[ "$*" == *try-restart* ]]; then
+            unit_name="${*: -1}"
+            rc_variable="STUB_RESTART_RC_${unit_name%.service}"
+            return "${!rc_variable:-0}"
+        fi
+        return 0
+    }
+}
+
+test_run_pending_restart_fails_the_run() {
+    load_run_library
+    stub_run_main
+    stub_service_restarts
+    export STUB_STALE_SERVICES="sshd.service"
+    export STUB_RESTART_RC_sshd=124
+    local exit_code=0 output
+    output=$( main 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "a restart that did not finish fails the run"
+    assert_contains "${output}" "Updates installed; no reboot needed; restart still pending for sshd.service. Check: systemctl status sshd.service" \
+        "one summary names the pending restart and the command to check it"
+    assert_not_contains "${output}" "No stale services needed restarting" "never reported as nothing to do"
+}
+
+test_run_failed_restart_fails_the_run() {
+    load_run_library
+    stub_run_main
+    stub_service_restarts
+    export STUB_STALE_SERVICES="sshd.service
+nginx.service"
+    export STUB_RESTART_RC_nginx=1
+    local exit_code=0 output
+    output=$( main 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "a failed restart fails the run"
+    assert_contains "${output}" "restarted sshd.service; restart FAILED for nginx.service" "both outcomes named"
+}
+
+test_run_completion_summary_names_every_outcome() {
+    load_run_library
+    stub_run_main
+    stub_service_restarts
+    export STUB_STALE_SERVICES="sshd.service
+dbus.service"
+    local exit_code=0 output
+    output=$( main 2>&1 ) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "an excluded unit is by design, not a failure"
+    assert_contains "${output}" "Updates installed; no reboot needed; restarted sshd.service; excluded from restart, still on pre-update code: dbus.service" \
+        "one line for the whole run"
 }
 
 test_run_service_restarts_stay_supervised() {
@@ -1735,6 +1794,9 @@ printf 'run\n'
 run_test "run: refused inhibitor stops the update"   test_run_refused_inhibitor_stops_the_update
 run_test "run: update runs inside the inhibitor"     test_run_update_runs_inside_the_inhibitor
 run_test "run: helper failure fails the run"        test_run_helper_failure_fails_the_run
+run_test "run: pending restart fails the run"       test_run_pending_restart_fails_the_run
+run_test "run: failed restart fails the run"        test_run_failed_restart_fails_the_run
+run_test "run: completion summary names every outcome" test_run_completion_summary_names_every_outcome
 run_test "run: service restarts stay supervised"    test_run_service_restarts_stay_supervised
 
 printf 'repositories\n'

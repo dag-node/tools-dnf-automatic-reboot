@@ -217,6 +217,13 @@ RESTART_SERVICES_EXCLUDE=$(conf_get restart_services_exclude \
 NEEDS_RESTARTING_TIMEOUT_SEC=$(conf_get_int needs_restarting_timeout_sec 120)
 RESTART_SERVICE_TIMEOUT_SEC=$(conf_get_int restart_service_timeout_sec 300)
 
+# Outcome of restart_stale_services, read by report_completion.
+RESTARTED_SERVICE_NAMES=()
+FAILED_SERVICE_NAMES=()
+PENDING_SERVICE_NAMES=()
+EXCLUDED_SERVICE_NAMES=()
+SERVICE_RESTART_SUMMARY="stale services not checked"
+
 # ---------------------------------------------------------------------------
 # Cleanup handler - run by the EXIT trap
 # Removes state/lock files.
@@ -277,20 +284,34 @@ is_excluded_unit() {
     return 1
 }
 
+# restart_stale_services
+# Sets SERVICE_RESTART_SUMMARY to one clause naming every outcome, and the
+# RESTARTED_, FAILED_, PENDING_ and EXCLUDED_SERVICE_NAMES arrays.  Returns 1
+# when a restart failed or had not finished within restart_service_timeout_sec,
+# or when needs-restarting -s could not list the services: each leaves
+# pre-update code running that the run was meant to replace.  Excluded units
+# are left running by design and do not fail the run.
 restart_stale_services() {
     local stale_service_output stale_service_name restart_exit_code
-    local restarted_service_names=() skipped_service_names=()
+    local summary_clauses=()
+    RESTARTED_SERVICE_NAMES=()
+    FAILED_SERVICE_NAMES=()
+    PENDING_SERVICE_NAMES=()
+    EXCLUDED_SERVICE_NAMES=()
+    SERVICE_RESTART_SUMMARY=""
 
     if [[ "${RESTART_SERVICES}" != "yes" ]]; then
         log "restart_services=no - not restarting stale services"
+        SERVICE_RESTART_SUMMARY="stale services not checked (restart_services = no)"
         return 0
     fi
 
     stale_service_output=""
     if ! stale_service_output=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
             "${DNF_BIN}" -q -C needs-restarting -s 2>/dev/null); then
-        log_warn "needs-restarting -s failed - stale services not restarted this run"
-        return 0
+        log_err "needs-restarting -s failed - stale services not restarted this run"
+        SERVICE_RESTART_SUMMARY="stale services could not be listed (needs-restarting -s failed)"
+        return 1
     fi
 
     while IFS= read -r stale_service_name; do
@@ -299,7 +320,7 @@ restart_stale_services() {
         [[ "${stale_service_name}" == *.service ]] || continue
 
         if is_excluded_unit "${stale_service_name}"; then
-            skipped_service_names+=("${stale_service_name}")
+            EXCLUDED_SERVICE_NAMES+=("${stale_service_name}")
             continue
         fi
 
@@ -310,26 +331,47 @@ restart_stale_services() {
             "${SYSTEMCTL_BIN}" try-restart "${stale_service_name}" 2>/dev/null \
             || restart_exit_code=$?
         if [[ "${restart_exit_code}" -eq 0 ]]; then
-            restarted_service_names+=("${stale_service_name}")
+            RESTARTED_SERVICE_NAMES+=("${stale_service_name}")
         elif [[ "${restart_exit_code}" -eq 124 ]]; then
-            log_warn "restart of ${stale_service_name} did not finish within ${RESTART_SERVICE_TIMEOUT_SEC}s - the job continues in systemd; check it with: systemctl status ${stale_service_name}"
+            PENDING_SERVICE_NAMES+=("${stale_service_name}")
+            log_warn "restart of ${stale_service_name} did not finish within ${RESTART_SERVICE_TIMEOUT_SEC}s - the job continues in systemd"
         else
+            FAILED_SERVICE_NAMES+=("${stale_service_name}")
             log_warn "failed to restart ${stale_service_name} - it is still running pre-update code"
         fi
     done <<< "${stale_service_output}"
 
-    if [[ "${#restarted_service_names[@]}" -gt 0 ]]; then
-        log "Restarted stale services: $(printf '%s,' "${restarted_service_names[@]}" | sed 's/,$//')"
-        wall_msg "dnf-automatic-reboot: restarted updated services:" \
-                 "$(printf '%s ' "${restarted_service_names[@]}")"
-    else
-        log "No stale services needed restarting"
+    if [[ "${#RESTARTED_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        summary_clauses+=("restarted $(join_with ', ' "${RESTARTED_SERVICE_NAMES[@]}")")
     fi
+    if [[ "${#FAILED_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        summary_clauses+=("restart FAILED for $(join_with ', ' "${FAILED_SERVICE_NAMES[@]}")")
+    fi
+    if [[ "${#PENDING_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        summary_clauses+=("restart still pending for $(join_with ', ' "${PENDING_SERVICE_NAMES[@]}")")
+    fi
+    if [[ "${#EXCLUDED_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        summary_clauses+=("excluded from restart, still on pre-update code: $(join_with ', ' "${EXCLUDED_SERVICE_NAMES[@]}")")
+    fi
+    if [[ "${#summary_clauses[@]}" -eq 0 ]]; then
+        summary_clauses=("no service needed a restart")
+    fi
+    SERVICE_RESTART_SUMMARY=$(join_with '; ' "${summary_clauses[@]}")
 
-    if [[ "${#skipped_service_names[@]}" -gt 0 ]]; then
-        log_warn "Excluded from automatic restart, still running pre-update code: $(printf '%s,' "${skipped_service_names[@]}" | sed 's/,$//')"
+    if [[ "${#FAILED_SERVICE_NAMES[@]}" -gt 0 || "${#PENDING_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        return 1
     fi
     return 0
+}
+
+# join_with SEPARATOR ITEM... -> the items joined with SEPARATOR
+join_with() {
+    local separator="$1" joined_items="" item
+    shift
+    for item in "$@"; do
+        joined_items+="${joined_items:+${separator}}${item}"
+    done
+    printf '%s' "${joined_items}"
 }
 
 # ---------------------------------------------------------------------------
@@ -438,7 +480,7 @@ schedule_reboot() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
-    local dnf_automatic_exit_code=0 needs_reboot_exit_code=0
+    local dnf_automatic_exit_code=0 needs_reboot_exit_code=0 service_restart_exit_code=0
 
     trap cleanup EXIT
 
@@ -490,20 +532,42 @@ main() {
     case "${needs_reboot_exit_code}" in
         0)
             log "No reboot required"
-            restart_stale_services
-            wall_msg "dnf-automatic-reboot: Updates complete. No reboot required."
+            restart_stale_services || service_restart_exit_code=$?
+            report_completion "no reboot needed" "${service_restart_exit_code}"
             ;;
         1)
             schedule_reboot || exit 1
             ;;
         *)
             log_err "needs-reboot.sh exited ${needs_reboot_exit_code}: reboot state could not be established - not rebooting. Updates were applied; the host may still need a manual reboot."
-            wall_msg "dnf-automatic-reboot: ERROR - updates applied but the reboot decision could not be made." \
-                     "Manual inspection required."
-            restart_stale_services
-            exit 1
+            restart_stale_services || true
+            report_completion "reboot state UNDECIDABLE (needs-reboot.sh exited ${needs_reboot_exit_code}), not rebooting" 1
             ;;
     esac
+}
+
+# report_completion REBOOT_OUTCOME FAILED
+# Logs and broadcasts one line naming the update, reboot and service-restart
+# outcome of the run, with the command to inspect what is incomplete.  A
+# non-zero FAILED logs it at error level and exits 1, so OnFailure= reports
+# it.
+report_completion() {
+    local reboot_outcome="$1" run_failed="$2" completion_summary inspected_unit_names=()
+    completion_summary="Updates installed; ${reboot_outcome}; ${SERVICE_RESTART_SUMMARY}"
+    if [[ "${run_failed}" -eq 0 ]]; then
+        log "${completion_summary}"
+        wall_msg "dnf-automatic-reboot: ${completion_summary}."
+        return 0
+    fi
+    inspected_unit_names=("${FAILED_SERVICE_NAMES[@]}" "${PENDING_SERVICE_NAMES[@]}")
+    if [[ "${#inspected_unit_names[@]}" -gt 0 ]]; then
+        completion_summary+=". Check: systemctl status $(join_with ' ' "${inspected_unit_names[@]}")"
+    else
+        completion_summary+=". Check: journalctl -u dnf-automatic-reboot.service -e"
+    fi
+    log_err "${completion_summary}"
+    wall_msg "dnf-automatic-reboot: ${completion_summary}"
+    exit 1
 }
 
 # Sourcing defines the functions above without running the update.

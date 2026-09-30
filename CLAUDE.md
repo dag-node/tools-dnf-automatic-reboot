@@ -442,6 +442,13 @@ never be restarted from underneath a running system — `dbus`/`dbus-broker` bre
 client holding a bus connection, `systemd-logind` drops session tracking, and the two
 units of this package would kill the run. Extend that list, never shorten it.
 
+A restart that fails, one still unfinished at `restart_service_timeout_sec`, and a
+`needs-restarting -s` that cannot list the units each leave pre-update code running, so
+each fails the run. An excluded unit does not: it is left running by design. The run
+ends with one line naming the update, reboot and restart outcome, for example
+`Updates installed; no reboot needed; restart still pending for sshd.service. Check:
+systemctl status sshd.service`, logged and sent through `wall`.
+
 ## Unsigned repositories
 
 `run.sh` reports every enabled repository with an explicit `gpgcheck=0` at the
