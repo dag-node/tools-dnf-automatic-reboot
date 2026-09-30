@@ -1,245 +1,235 @@
 # dnf-automatic-reboot
 
-Unattended update and conditional reboot for Oracle Linux 9 / RHEL 9 on aarch64 (RPi4, UEK R8).
+Installs system updates every night and restarts the computer only when an
+update needs a restart to take effect.
 
-For operational reference (configuration, diagnostics, false-positive handling) see
-[doc/README](doc/README).
+## Who this is for
 
-## Project structure
+On most Enterprise Linux 9 computers, `dnf-automatic` restarts after updates
+by itself: set `reboot = when-needed` in `/etc/dnf/automatic.conf` and
+enable `dnf-automatic-install.timer`. Use that there, not this package.
 
-```
-dnf-automatic-reboot/
-  Makefile                          Build, install, uninstall, dist targets
-  dnf-automatic-reboot.spec         RPM spec file
-  conf/
-    automatic-reboot.conf       Runtime configuration (installed to /etc/dnf/)
-  scripts/
-    run.sh                          Main orchestration: inhibitor + dnf + reboot decision
-    watchdog.sh                     Independent watchdog: soft/hard timeout + stuck detection
-    needs-reboot.sh                 Reboot decision + false-positive filtering
-    notify-failure.sh               OnFailure= notifier (wall + log)
-  units/
-    dnf-automatic-reboot.service    Oneshot service wrapping run.sh
-    dnf-automatic-reboot.timer      Daily timer (03:00 +/- 10 min)
-    dnf-automatic-watchdog.service  Oneshot watchdog service
-    dnf-automatic-watchdog.timer    5-minute polling timer
-    dnf-automatic-reboot-notify@.service   Failure notifier, instantiated by OnFailure=
-    grub-boot-success.service       UEK-only boot_success marker (BLS fallback guard)
-  tmpfiles/
-    dnf-automatic-reboot.conf       Log and state path modes and SELinux labels
-  logrotate/
-    dnf-automatic-reboot            Log rotation drop-in
-  tests/
-    run-tests.sh                    Test suite (bash only, run by make check)
-  doc/
-    README                          Operational reference (installed to /usr/share/doc/)
-```
+This package is for computers where that built-in restart does not work
+reliably. The problem is seen on Oracle Linux 9 on `aarch64` boards that boot
+through U-Boot, such as the Raspberry Pi 4 and the Compute Module 5:
 
-## Tests
+- They have no clock battery, so the update tools misjudge which updates came
+  after the last restart and ask for a restart on every run.
+- A newly installed kernel is not chosen at the next boot, so a restart
+  brings back the old kernel and asks for another restart.
+
+The same restart problem was seen on Red Hat Enterprise Linux 8.
+
+This package filters out the false restart requests and restarts only when
+the restart applies an update. Before a kernel restart it checks that the new
+kernel is the one the computer will boot; if not, it does not restart and
+logs why.
+
+It installs on Enterprise Linux 8 and 9 (Red Hat Enterprise Linux, Oracle
+Linux, Rocky Linux, AlmaLinux) with the standard GRUB boot menu.
+
+## Quick start
 
 ```bash
-make check      # bash -n, shellcheck, ASCII check, then the suite
-make test       # suite only
+sudo dnf install dnf-automatic
+sudoedit /etc/dnf/automatic.conf
+sudo dnf install ./dnf-automatic-reboot-1.4.0-1.el9.noarch.rpm
+sudo systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
 ```
 
-`rpmbuild` runs `make check` from `%check`. The suite stubs every external
-command, needs no root, and touches nothing outside a temporary directory. A
-handful of tests must execute a stub as a real program and skip themselves when
-that directory is mounted `noexec`; run them from an exec-capable path with
-`TMPDIR=/some/exec/path make test`.
+The package is installed from its RPM file: the `.el9` file on Enterprise
+Linux 9, the `.el8` file on Enterprise Linux 8. The file comes from a CI run
+of this repository or from [Building from source](#building-from-source).
 
-## UEK kernel default (kernel not booted after update)
-
-On OL9 UEK hosts a freshly installed `kernel-uek-core` is not selected at the next
-boot, because `kernel-install` does not advance the GRUB `saved_entry` unless
-`DEFAULTKERNEL` and `GRUB_UPDATE_DEFAULT_KERNEL=true` are set. The RPM `%post`
-scriptlet fixes this once at install time (UEK hosts only; non-UEK kernels are
-never touched): it sets both keys, repairs the current default with `grubby`, and
-enables `grub-boot-success.service` so GRUB's indeterminate-boot fallback cannot
-revert to an old kernel. Tunable via the `[kernel]` section of
-`automatic-reboot.conf`. See [doc/README](doc/README).
-
-## Prerequisites
-
-### Build host
-
-```bash
-dnf install rpm-build systemd-rpm-macros
-```
-
-### Target system
-
-```bash
-dnf install dnf-automatic yum-utils elfutils grubby grub2-tools-minimal
-```
-
-`yum-utils` provides `needs-restarting`, which drives every reboot decision.
-`elfutils` provides `eu-readelf`, required for systemd build-id comparison.
-`grubby` and `grub2-tools-minimal` provide `grubby`/`grub2-set-bootflag`, used by
-the UEK GRUB-default fix (these are normally already present on OL9).
-
-## Before installing
-
-The RPM `%pre` scriptlet validates these two conditions and aborts with a diagnostic
-message if either is not met. Complete them before running `dnf install`.
-
-### 1. Set `reboot = never` in `/etc/dnf/automatic.conf`
-
-`dnf-automatic-reboot` owns all reboot decisions. `dnf-automatic` must not reboot
-independently:
+The first two commands install `dnf-automatic` and open its settings file,
+in which two lines must read:
 
 ```ini
-reboot = never
 apply_updates = yes
+reboot = never
 ```
 
-### 2. Disable the stock dnf-automatic timers
+`apply_updates = yes` makes `dnf-automatic` install updates, not only
+download them; `reboot = never` leaves the restart decision to this package.
+If `dnf-automatic` is already set up, keep your other settings as they are.
+This package reads the file and does not change it.
 
-This package provides its own schedule. Running both would apply updates twice:
+The third command installs this package. It first checks that the computer
+is one it can restart safely; if not, it stops before installing any files
+and prints what to fix, as explained under
+[If the installer refuses](#if-the-installer-refuses).
+The last command turns on the nightly run and the watchdog that looks after it.
 
-```bash
-systemctl disable --now dnf-automatic.timer dnf-automatic-install.timer 2>/dev/null || true
-```
+## What happens every night
 
-## Building the RPM
+Between 03:00 and 03:10 the computer:
 
-```bash
-mkdir -p ~/rpmbuild/{BUILD,RPMS,SRPMS,SOURCES,SPECS}   # once
+1. Blocks shutdown and restart, so an update is never cut off halfway.
+2. Installs the available updates with `dnf-automatic`.
+3. Checks whether any update needs a restart: a new kernel, or a core
+   component such as `glibc` or `systemd`.
+4. If one does, warns everyone logged in and restarts one minute later.
+   If none does, restarts only the background services whose programs were
+   updated, and the computer keeps running.
 
-make dist
-rpmbuild -ba dnf-automatic-reboot.spec \
-  --define "_sourcedir $(pwd)" \
-  --define "_specdir $(pwd)"
-```
+Updates that `dnf` knows about but refuses to install, and repositories that
+install packages without checking their signatures, are reported in the log.
 
-`make dist` runs `make check` first, then packages `SCRIPTS`, `UNITS`, `CONF`,
-`TMPFILES`, `LOGROTATE`, `TESTS` and `DOC` from the Makefile into
-`dnf-automatic-reboot-$(VERSION).tar.gz`. `rpmbuild -ba` builds directly from the spec
-and tarball in the working tree via `_sourcedir`/`_specdir` — no copying into
-`~/rpmbuild/SOURCES` needed. The finished package lands at
-`~/rpmbuild/RPMS/noarch/dnf-automatic-reboot-$(VERSION)-1.*.noarch.rpm`.
+A separate watchdog checks every five minutes. If an update run is still going
+after three hours, the watchdog stops it and alerts you; it does not restart
+the computer while packages may be half-installed.
 
-## Installing
+When something goes wrong, logged-in users get a message on their terminal and
+the details go to `/var/log/dnf-automatic-reboot.log`.
 
-```bash
-dnf install ~/rpmbuild/RPMS/noarch/dnf-automatic-reboot-*.noarch.rpm
-```
-
-The `%pre` scriptlet checks that `dnf-automatic` is installed, both stock timers are
-disabled, and `automatic.conf` has `reboot = never`. It aborts with a clear message
-and leaves no files installed if any check fails.
-
-## Post-install setup
-
-### 1. Configure chrony for reliable clock at boot
-
-Critical on hosts with no battery-backed RTC. `needs-restarting -r` decides purely
-on `rpm INSTALLTIME > boot time`, and takes that boot time from systemd's
-`UnitsLoadStartTimestamp`, which is recorded before chrony corrects the clock. On
-an RTC-less host that value stays permanently in the past, so every package it
-watches is flagged forever. This is the single root cause of all the false
-positives this package works around.
-
-```bash
-grep -q 'makestep 1 -1' /etc/chrony.conf || echo 'makestep 1 -1' >> /etc/chrony.conf
-systemctl restart chronyd
-systemctl enable --now chrony-wait.service   # makes time-sync.target a real gate
-```
-
-`rtcsync` is only meaningful with an RTC present; leave it commented out otherwise.
-
-> **Fitting an RTC removes the problem class.** With a DS3231/DS1307 on i2c the
-> boot clock is correct, nothing is spuriously flagged, and `filter_packages` plus
-> restart-state learning become unnecessary. Configure the overlay in
-> `/boot/efi/config.txt` (`dtoverlay=i2c-rtc,ds3231`), run `hwclock --systohc`
-> after the first NTP sync, and disable any fake-hwclock service that conflicts.
-
-### 2. Fix NTS certificate failures (FUTURE crypto policy)
-
-Skip unless chronyd logs `TLS handshake failed: certificate uses insecure algorithm`:
-
-```bash
-update-crypto-policies --set DEFAULT
-systemctl restart chronyd
-```
-
-### 3. Enable this package
-
-```bash
-systemctl enable --now dnf-automatic-reboot.timer
-systemctl enable --now dnf-automatic-watchdog.timer
-```
-
-### 4. Verify
+## Check that it works
 
 ```bash
 systemctl list-timers dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
-systemd-inhibit --list
 ```
 
-## Testing without waiting for the timer
+This lists when each timer runs next. After the first night, read what
+happened:
 
 ```bash
-# Run a full update cycle immediately — will apply updates and reboot if needed
-systemctl start dnf-automatic-reboot.service
-journalctl -u dnf-automatic-reboot.service -f
-
-# Test reboot detection in isolation (no update, no reboot)
-/usr/libexec/dnf-automatic-reboot/needs-reboot.sh; echo "exit: $?"
-
-# Test watchdog (exits immediately when no state file is present)
-/usr/libexec/dnf-automatic-reboot/watchdog.sh
+sudo tail -n 30 /var/log/dnf-automatic-reboot.log
 ```
 
-If the service fails at startup, the journal will report the specific conflict — a
-re-enabled timer or a changed `reboot` setting in `automatic.conf`:
+To run an update now, which installs updates and restarts the computer if
+one needs it:
 
 ```bash
-journalctl -u dnf-automatic-reboot.service -e
+sudo systemctl start dnf-automatic-reboot.service
 ```
+
+To only ask whether a restart is needed right now, without updating or
+restarting: `sudo /usr/libexec/dnf-automatic-reboot/needs-reboot.sh; echo $?`.
+It prints `0` for no, `1` for yes, and `2` when it cannot tell.
+
+## If the installer refuses
+
+The installer lists every problem it finds, then stops before installing any
+files. Fix each one and run `sudo dnf install dnf-automatic-reboot` again.
+
+| The message says | What to do |
+|---|---|
+| `... not platform:el8 or platform:el9` | This computer runs a Linux version the package does not support. |
+| `systemd is not the running init` | Install on the computer itself, not inside a container. |
+| `<package> is not installed` | `sudo dnf install <package>` |
+| `GRUB_ENABLE_BLSCFG=true is not set` or `holds no BLS entry` | The computer does not use the standard GRUB boot menu, which this package needs. |
+| `grubby --default-kernel gave ...` | `sudo grubby --set-default /boot/vmlinuz-$(uname -r)` |
+| `does not boot saved_entry` or `GRUB_DEFAULT=saved is not set` | Set `GRUB_DEFAULT=saved` in `/etc/default/grub`, then run the `grub2-mkconfig` command the message shows, with `sudo` |
+| `kernel updates will not advance the GRUB default` | Add each line the message shows to the file it names. On Oracle Linux 9 with UEK these are `GRUB_UPDATE_DEFAULT_KERNEL=true` in `/etc/default/grub` and `DEFAULTKERNEL=kernel-uek-core` in `/etc/sysconfig/kernel`. |
+| `the GRUB default is ..., not the newest installed` | If the newest kernel should run, run the `grubby --set-default` command the message shows, with `sudo`. The installer does not change the default itself, since that changes which kernel the next boot runs. |
+| `upgrading from a version before 1.4.0` | See [Upgrading from an earlier version](#upgrading-from-an-earlier-version). |
+| `dnf-automatic.timer is still enabled` | `sudo systemctl disable --now dnf-automatic.timer dnf-automatic-install.timer` |
+| `/etc/dnf/automatic.conf has 'reboot = ...'` | Set `reboot = never` in `/etc/dnf/automatic.conf`; this package decides when to restart. |
+| `/etc/dnf/automatic.conf has 'apply_updates = ...'` | Set `apply_updates = yes` in `/etc/dnf/automatic.conf`. |
+
+The nightly run checks the `reboot` and `apply_updates` lines again each
+time it starts. When either one no longer reads as in
+[Quick start](#quick-start), the run stops, logged-in users get a message,
+and the log names the line to fix.
+
+A `WARNING` about `GRUB_SAVEDEFAULT=true` does not stop the install. It means
+that choosing an older kernel from the boot menu once makes it the default;
+after that, restarts for new kernels are held back, and the log says so, until
+`sudo grubby --set-default` points at the newest kernel again.
+
+## Changing the settings
+
+Settings are in `/etc/dnf/automatic-reboot.conf`; each one is explained in the
+file. The ones people change most:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `reboot_delay_sec` | `60` | Seconds between the warning and the restart |
+| `always_reboot` | `no` | `yes` restarts after every update, needed or not |
+| `restart_services` | `yes` | `no` leaves updated background services running the old program |
+| `wall_messages` | `yes` | `no` stops the messages to logged-in users |
+
+To run at another time, override the timer:
+
+```bash
+sudo systemctl edit dnf-automatic-reboot.timer
+```
+
+and enter, for example for 01:30:
+
+```ini
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 01:30:00
+```
+
+The empty `OnCalendar=` line clears the 03:00 default, so the new time
+replaces it.
+
+## Computers without a clock battery
+
+A Raspberry Pi has no clock that keeps time while it is off, so it starts with
+the wrong time until it reaches a time server. That makes the update tools
+believe some updates are newer than the last restart even after a restart,
+and this package filters out those false alarms.
+
+The installer makes updates wait until the clock is set, by turning on
+`chrony-wait.service`. Two changes make the clock correct sooner. First, let
+chrony jump the clock at start instead of adjusting it slowly:
+
+```bash
+echo 'makestep 1 -1' | sudo tee -a /etc/chrony.conf && sudo systemctl restart chronyd
+```
+
+Second, and better, fit a real-time clock module such as a DS3231: with the
+correct time at boot, those false alarms do not occur.
+
+## Upgrading from an earlier version
+
+Versions before 1.4.0 cannot be upgraded in place. Remove the old version,
+then install as in [Quick start](#quick-start):
+
+```bash
+sudo dnf remove dnf-automatic-reboot
+```
+
+Your settings file is kept as `/etc/dnf/automatic-reboot.conf.rpmsave`; copy
+any changes you made back into the new `/etc/dnf/automatic-reboot.conf`. The
+log and what the old version had learned about false alarms are deleted, so
+the first night after the upgrade may restart the computer once more than
+needed.
 
 ## Uninstalling
 
 ```bash
-systemctl disable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
-dnf remove dnf-automatic-reboot
-
-# Log file is intentionally preserved; remove manually if not needed:
-rm -f /var/log/dnf-automatic-reboot.log
+sudo dnf remove dnf-automatic-reboot
 ```
 
-## Known issues and platform notes
+This stops and removes the timers, the program, its log and its learned
+state. A settings file you changed is kept as
+`/etc/dnf/automatic-reboot.conf.rpmsave`.
 
-| Issue | Platform | Status |
-|---|---|---|
-| Repository with `gpgcheck=0` enabled | All | Reported by `run.sh` at the start of every run (reported, not fatal) |
-| Repository `priority=` masks security errata from other channels | All | Reported by `run.sh` after every update; remove `priority=` from distribution repos, keep it only on third-party ones |
-| `needs-restarting` always flags `kernel-uek` / `kernel-uek-core` | OL9 aarch64 UEK | Filtered by `needs-reboot.sh` via version cross-check |
-| `needs-restarting` flags `systemd` after update even post-reboot | All | Filtered by `needs-reboot.sh` via `eu-readelf` build-id comparison |
-| `needs-restarting` flags other core libraries (e.g. `glibc`) even with no live process using a stale version | All | Learned automatically by `needs-reboot.sh`: confirmed only after surviving a real reboot still flagged at the same version, proven via kernel boot ID; see [doc/README](doc/README) |
-| `systemd-time-wait-sync.service` absent on UEK R8 | OL9 UEK R8 | Fixed — `%post` enables `chrony-wait.service`; see [below](#time-sync-on-uek-r8) |
-| NTS sources fail under FUTURE crypto policy | OL9 FUTURE policy | Fix: `update-crypto-policies --set DEFAULT` |
+## More information
 
-### time-sync on UEK R8
+- [doc/README](doc/README), installed as
+  `/usr/share/doc/dnf-automatic-reboot/README`: every setting, the log, and
+  how restart decisions are made.
+- Source and issues: <https://github.com/dag-node/tools-dnf-automatic-reboot>
 
-`systemd-time-wait-sync.service` is not shipped on UEK R8, and nothing else is
-ordered `Before=time-sync.target`, so the service unit's `Requires=time-sync.target`
-was satisfied trivially and gated nothing.
-
-`chrony` already ships `chrony-wait.service` — `chronyc waitsync`, ordered
-`Before=time-sync.target` — disabled by default. The RPM `%post` enables it when
-`[time] enable_chrony_wait = yes`, which makes the ordering real. No custom unit
-is needed.
-
-Note this gates the update run, not the boot-time value `needs-restarting` reads;
-only an RTC fixes that. The `eu-readelf` build-id path in `needs-reboot.sh` is
-immune to clock skew regardless.
-
-## Bumping the version
+## Building from source
 
 ```bash
-# Edit Makefile: VERSION = x.y
-# Edit dnf-automatic-reboot.spec: Version: x.y, add %changelog entry
+make check
 make dist
-# Then follow Building the RPM above
+rpmbuild -ba dnf-automatic-reboot.spec --define "_sourcedir $(pwd)" --define "_specdir $(pwd)"
+sudo dnf install ~/rpmbuild/RPMS/noarch/dnf-automatic-reboot-*.noarch.rpm
 ```
+
+`make check` runs the syntax checks, `shellcheck` and the test suite, which
+does not need root and stubs every system command; `make dist` runs it too
+before writing the source tarball. Tests that execute a stub skip themselves
+where the temporary directory is mounted `noexec`;
+`TMPDIR=<exec-capable dir> make test` runs them. [CLAUDE.md](CLAUDE.md)
+describes the design and the conventions for changes.
+
+Licensed under GPL-2.0-or-later; the RPM spec file is MIT. See
+[REUSE.toml](REUSE.toml).

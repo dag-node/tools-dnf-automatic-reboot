@@ -1,7 +1,7 @@
 dnf-automatic-reboot
 ====================
 
-Unattended update + conditional reboot for Oracle Linux 9 / RHEL 9 (aarch64).
+Unattended update + conditional reboot for EL8 and EL9 (RHEL, Oracle Linux).
 Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
 
   - Holds a systemd shutdown inhibitor while updates are in progress so an
@@ -55,11 +55,6 @@ Files installed
   /usr/lib/systemd/system/dnf-automatic-reboot-notify@.service
       Instantiated by OnFailure= with the failed unit name, so a failed run
       is never visible only to somebody who thinks to read the journal.
-
-  /usr/lib/systemd/system/grub-boot-success.service
-      UEK-only.  Runs grub2-set-bootflag boot_success each boot so GRUB's
-      indeterminate-boot fallback cannot revert saved_entry to an old kernel.
-      Enabled by %post on UEK hosts; inert elsewhere (ConditionKernelVersion).
 
   /usr/lib/tmpfiles.d/dnf-automatic-reboot.conf
       Creates the log file and state directory with the intended mode and
@@ -300,24 +295,21 @@ UEK kernel default (kernel not booted after update)
   saved_entry unless DEFAULTKERNEL and GRUB_UPDATE_DEFAULT_KERNEL are set, and
   neither is by default.
 
-  The RPM %post scriptlet fixes this once, at install time, on UEK hosts only
-  (it acts only when rpm -qf /lib/modules/$(uname -r)/vmlinuz is the package
-  named by kernel_default_package).  It is idempotent and never touches non-UEK
-  kernels.  After install no per-update action is needed: kernel-install then
-  advances saved_entry on every future kernel update on its own.
+  The installer does not change either setting.  It refuses a host where
+  kernel updates would not become the default, and names what to set:
+      /etc/default/grub:      GRUB_UPDATE_DEFAULT_KERNEL=true
+      /etc/sysconfig/kernel:  DEFAULTKERNEL=kernel-uek-core   (EL9; the running
+                              kernel's package on any other host)
+      grubby --set-default /boot/vmlinuz-<newest installed kernel>
+  Once set, kernel-install advances saved_entry on every future kernel update
+  on its own.
 
-  Control it in /etc/dnf/automatic-reboot.conf:
-      [kernel]
-      manage_kernel_default  = yes
-      kernel_default_package = kernel-uek-core
-
-  Verify the provisioning took effect:
+  Check the settings:
       grep DEFAULTKERNEL /etc/sysconfig/kernel
       grep GRUB_UPDATE_DEFAULT_KERNEL /etc/default/grub
       grubby --default-kernel
       rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-uek-core | sort -V | tail -1
-      systemctl is-enabled grub-boot-success.service     # UEK: enabled
-      grub2-editenv /boot/grub2/grubenv list             # saved_entry, boot_success
+      grub2-editenv /boot/grub2/grubenv list             # saved_entry
 
 
 Adding to false_positives filter
