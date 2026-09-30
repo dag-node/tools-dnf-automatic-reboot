@@ -289,7 +289,7 @@ Watchdog decisions by phase:
 The independent check can hang like the one it replaces, so it runs under `timeout`
 at three times `needs_restarting_timeout_sec` and counts as undecidable (code 2) when
 it does not finish. `dnf-automatic-watchdog.service` sets `TimeoutStartSec=15min`: a
-oneshot has no start timeout by default, and a watchdog that never exits keeps the
+oneshot has no start timeout by default, and a watchdog that does not exit keeps the
 timer from starting the next cycle.
 
 Killing always targets the whole service cgroup via `systemctl kill --kill-whom=all`

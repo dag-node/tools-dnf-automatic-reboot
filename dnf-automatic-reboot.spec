@@ -458,7 +458,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 * Wed Sep 30 2026 DagNode <packages@dagnode.com> - 1.4.0-1
 - LICENSE: The project license is now GPL-2.0-or-later. Releases through 1.3 were licensed MIT,
   and anyone who received them keeps those terms on those versions. The spec file stays MIT;
-  REUSE.toml declares the copyright and license of every file.
+  REUSE.toml declares the copyright of every file and the license of every file without its own
+  header. The source archive carries REUSE.toml and both license texts.
 - CHANGE: Versions follow vX.Y.Z.
 - CHANGE: Installation no longer edits /etc/sysconfig/kernel or /etc/default/grub, and no
   longer runs grubby --set-default, on UEK hosts. The installer refuses a host without
@@ -493,10 +494,15 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 - SECURITY: Compare build-ids for every process running a binary, not one per binary. PID 1
   re-execs onto the new systemd while each systemd --user manager keeps the old image; checking
   PID 1 alone could call a genuine systemd update a false positive and skip the reboot.
+- SECURITY: A process still running a systemd binary whose build-id cannot be read keeps the
+  reboot, even when every other process matches. One matching process could call the update a
+  false positive for a process nobody had checked.
 - NEW: Enterprise Linux 8 support (RHEL 8, Oracle Linux 8, Rocky Linux 8, AlmaLinux 8). The
   package requires systemd 239 instead of 252, and the watchdog stops a stuck run with the
   systemctl kill option each systemd version accepts. On EL8 EFI hosts the install checks the
   grub.cfg on the EFI partition, which is the one GRUB runs there.
+- NEW: restart_service_timeout_sec (default 300) bounds each restart of a stale service. A
+  restart that does not finish in time is logged and left to systemd, and the run goes on.
 - FIX: Security advisories that dnf will not install are reported on Red Hat Enterprise Linux,
   Rocky Linux and AlmaLinux, whose advisory ids have the form RHSA-2020:3011, for EPEL
   advisories such as FEDORA-EPEL-2024-bf31852fe0, and for Oracle Linux advisories with a
@@ -517,6 +523,25 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   exits 0 when it cannot read grubenv, which the check would have taken for a stale default.
   Anything other than a /boot/vmlinuz-* path now counts as undetermined, and
   kernel_reboot_attempt_limit remains the backstop.
+- FIX: A dnf error during the reboot check no longer reboots the host. dnf exits 1 for errors
+  such as a missing cache, the same code needs-restarting uses for "reboot required"; only an
+  exit 1 that names a package is a reboot requirement now. Anything else is retried with a
+  metadata refresh, then fails the run without rebooting.
+- FIX: Updates start only once logind has granted the shutdown inhibitor lock. dnf-automatic
+  runs under systemd-inhibit, and a refused lock fails the run before anything is installed.
+- FIX: A reboot check that exits with any status other than 0 or 1, such as a missing helper,
+  fails the run instead of reporting "No reboot required". The watchdog fails its unit the same
+  way, so OnFailure= reports it.
+- FIX: The watchdog's own reboot check is killed after three times needs_restarting_timeout_sec,
+  and the watchdog unit after 15 minutes. A hung check could keep the watchdog running, so the
+  hard timeout was never reached.
+- FIX: The watchdog supervises a run until it exits, stale-service restarts included. A hung
+  restart could hold the run open and block every later update run.
+- FIX: kernel_reboot_attempt_limit counts at most one attempt per boot. Every check counted
+  before, so running the reboot check by hand, or the watchdog's check, used up the limit and
+  withheld the next genuine kernel reboot.
+- FIX: The reboot check no longer removes /dev/null when it cannot create a temporary file; it
+  fails without rebooting.
 
 * Fri Jul 31 2026 DagNode <packages@dagnode.com> - 1.3-1
 - CHANGE: Scripts move from /usr/local/lib to /usr/libexec; update anything that calls them by

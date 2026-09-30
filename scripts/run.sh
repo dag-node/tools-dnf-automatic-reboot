@@ -218,7 +218,7 @@ NEEDS_RESTARTING_TIMEOUT_SEC=$(conf_get_int needs_restarting_timeout_sec 120)
 RESTART_SERVICE_TIMEOUT_SEC=$(conf_get_int restart_service_timeout_sec 300)
 
 # ---------------------------------------------------------------------------
-# Cleanup handler - always runs on exit
+# Cleanup handler - run by the EXIT trap
 # Removes state/lock files.
 # ---------------------------------------------------------------------------
 cleanup() {
@@ -485,8 +485,8 @@ main() {
         needs_reboot_exit_code=1
     fi
 
-    # The state file stays until cleanup at exit: the service restarts below
-    # can block, and the watchdog supervises the run only while it exists.
+    # The state file stays until cleanup at exit: restart_stale_services can
+    # block, and the watchdog supervises the run only while the file exists.
     case "${needs_reboot_exit_code}" in
         0)
             log "No reboot required"

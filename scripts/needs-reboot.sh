@@ -284,7 +284,7 @@ verify_build_id() {
             running_build_id=$(eu-readelf -n "${PROC_DIRECTORY}/${process_id}/exe" 2>/dev/null \
                                | awk '/Build ID/ {print $NF}') || true
             if [[ -z "${running_build_id}" || -z "${on_disk_build_id}" ]]; then
-                # A process that exited after the /proc walk runs no code.
+                # A process that exited after the /proc walk does not run any code.
                 # One still running on this binary blocks the verdict, even
                 # when every other process matches.
                 if ! process_runs_binary "${process_id}" "${binary_path}"; then
@@ -392,8 +392,8 @@ needs_restarting_gave_result() {
 run_needs_restarting() {
     local stderr_capture_file stderr_line exit_code=0
 
-    # No fallback path: the file is removed below, and a fixed path such as
-    # /dev/null would be removed with it.
+    # No fallback path: this function removes the file when needs-restarting
+    # returns, and a fixed path such as /dev/null would be removed with it.
     if ! stderr_capture_file=$(mktemp); then
         log_err "cannot create a temporary file for needs-restarting stderr"
         return 2

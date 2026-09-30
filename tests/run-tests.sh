@@ -532,8 +532,8 @@ ${TEST_ROOT_DIR}/proc/2345/exe	bbbb"
 test_build_id_unreadable_process_keeps_the_package() {
     load_needs_reboot_library
     PROCESS_MAP_BUILT=1
-    # PID 1 matches; journald is still running but its build-id cannot be
-    # read.  One match must not vouch for a process nobody could check.
+    # PID 1 matches; journald is still running but eu-readelf does not print
+    # its build-id.  One match must not vouch for a process nobody could check.
     PROCESS_BINARY_TO_PIDS=( ["/usr/lib/systemd/systemd"]=$'1\n' ["/usr/lib/systemd/systemd-journald"]=$'742\n' )
     PROCESS_BINARY_TO_PACKAGE=( ["/usr/lib/systemd/systemd"]="systemd" ["/usr/lib/systemd/systemd-journald"]="systemd" )
     mkdir -p "${TEST_ROOT_DIR}/proc/742"
@@ -548,8 +548,8 @@ ${TEST_ROOT_DIR}/proc/1/exe	aaaa
 test_build_id_exited_process_is_not_unreadable() {
     load_needs_reboot_library
     PROCESS_MAP_BUILT=1
-    # PID 742 exited between the /proc walk and the build-id read: it runs no
-    # code, so it neither confirms nor blocks the verdict on PID 1.
+    # PID 742 exited between the /proc walk and the build-id read: it does not
+    # run any code, so it neither confirms nor blocks the verdict on PID 1.
     PROCESS_BINARY_TO_PIDS=( ["/usr/lib/systemd/systemd"]=$'1\n' ["/usr/lib/systemd/systemd-userwork"]=$'742\n' )
     PROCESS_BINARY_TO_PACKAGE=( ["/usr/lib/systemd/systemd"]="systemd" ["/usr/lib/systemd/systemd-userwork"]="systemd" )
     export STUB_BUILD_IDS="/usr/lib/systemd/systemd	aaaa
@@ -1228,7 +1228,7 @@ test_watchdog_helper_failure_is_not_no_reboot() {
 
 test_watchdog_unit_has_a_start_timeout() {
     # A oneshot's start timeout is disabled by default; a hung watchdog would
-    # never exit and the timer would never start the next cycle.
+    # not exit, and the timer would not start the next cycle.
     local start_timeout
     start_timeout=$(sed -n 's/^TimeoutStartSec=//p' "${REPO_ROOT}/units/dnf-automatic-watchdog.service")
     [[ -n "${start_timeout}" && "${start_timeout}" != "infinity" ]] \
