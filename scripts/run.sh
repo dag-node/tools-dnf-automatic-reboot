@@ -74,8 +74,8 @@ log_err() {
 
 wall_msg() {
     local wall_messages_enabled
-    wall_messages_enabled=$(grep -E "^\s*wall_messages\s*=" "${CONFIG_FILE}" 2>/dev/null \
-                            | tail -1 | sed 's/^[^=]*=\s*//' | tr -d ' ') || true
+    wall_messages_enabled=$(conf_get wall_messages yes)
+    wall_messages_enabled="${wall_messages_enabled//[[:space:]]/}"
     [[ "${wall_messages_enabled:-yes}" == "no" ]] && return 0
     wall "$*" 2>/dev/null || true
 }

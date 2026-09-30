@@ -788,6 +788,13 @@ test_services_template_units_are_excluded_by_glob() {
     return 0
 }
 
+test_wall_messages_trailing_comment_is_not_part_of_the_value() {
+    load_run_library
+    printf 'wall_messages = no  # quiet\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    wall_msg "dnf-automatic-reboot: test message"
+    assert_not_contains "$(cat "${STUB_LOG}")" "wall " "wall_messages = no with a comment disables wall"
+}
+
 test_services_disabled_by_config() {
     load_run_library
     RESTART_SERVICES=no
@@ -983,6 +990,7 @@ printf 'services\n'
 run_test "services: excluded units are not restarted" test_services_excluded_units_are_not_restarted needs-exec
 run_test "services: disabled by config"              test_services_disabled_by_config
 run_test "services: template units excluded by glob" test_services_template_units_are_excluded_by_glob
+run_test "services: wall_messages comment is ignored" test_wall_messages_trailing_comment_is_not_part_of_the_value
 
 printf 'watchdog\n'
 run_test "watchdog: no state file is a noop"         test_watchdog_no_state_file_is_a_noop
