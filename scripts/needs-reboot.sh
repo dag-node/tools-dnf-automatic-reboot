@@ -246,7 +246,18 @@ build_process_binary_map() {
 # while journald, udevd and logind can still be running the old image.
 #
 # Returns: 0 = false positive confirmed  1 = cannot verify  2 = genuine update
+# A process whose build-id cannot be read while it still runs the binary is
+# "cannot verify", whatever the other processes show.
 # ---------------------------------------------------------------------------
+
+# process_runs_binary PID BINARY_PATH - succeeds while PID still runs
+# BINARY_PATH, the replaced image included.
+process_runs_binary() {
+    local process_id="$1" binary_path="$2" current_binary_path
+    current_binary_path=$(readlink "${PROC_DIRECTORY}/${process_id}/exe" 2>/dev/null) || return 1
+    [[ "${current_binary_path% (deleted)}" == "${binary_path}" ]]
+}
+
 verify_build_id() {
     local package_name="$1"
     local binary_path process_id running_build_id on_disk_build_id
@@ -263,6 +274,13 @@ verify_build_id() {
             running_build_id=$(eu-readelf -n "${PROC_DIRECTORY}/${process_id}/exe" 2>/dev/null \
                                | awk '/Build ID/ {print $NF}') || true
             if [[ -z "${running_build_id}" || -z "${on_disk_build_id}" ]]; then
+                # A process that exited after the /proc walk runs no code.
+                # One still running on this binary blocks the verdict, even
+                # when every other process matches.
+                if ! process_runs_binary "${process_id}" "${binary_path}"; then
+                    log "${package_name}: pid ${process_id} of ${binary_path} exited before its build-id was read"
+                    continue
+                fi
                 log_warn "${package_name}: could not read build-ids for ${binary_path} (pid ${process_id})"
                 unreadable_build_id=1
                 continue
@@ -275,12 +293,12 @@ verify_build_id() {
         done <<< "${PROCESS_BINARY_TO_PIDS[${binary_path}]:-}"
     done
 
+    if [[ "${unreadable_build_id}" -eq 1 ]]; then
+        log_warn "${package_name}: a running process could not be verified - keeping the package"
+        return 1
+    fi
     if [[ "${verified_process_count}" -eq 0 ]]; then
-        if [[ "${unreadable_build_id}" -eq 1 ]]; then
-            log_warn "${package_name}: no readable build-id for any running process"
-        else
-            log_warn "${package_name}: no running process owned by this package"
-        fi
+        log_warn "${package_name}: no running process owned by this package"
         return 1
     fi
 

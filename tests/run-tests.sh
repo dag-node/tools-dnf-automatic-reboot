@@ -529,6 +529,36 @@ ${TEST_ROOT_DIR}/proc/2345/exe	bbbb"
     assert_exit_code 2 "$?" "a stale user manager must make systemd genuine"
 }
 
+test_build_id_unreadable_process_keeps_the_package() {
+    load_needs_reboot_library
+    PROCESS_MAP_BUILT=1
+    # PID 1 matches; journald is still running but its build-id cannot be
+    # read.  One match must not vouch for a process nobody could check.
+    PROCESS_BINARY_TO_PIDS=( ["/usr/lib/systemd/systemd"]=$'1\n' ["/usr/lib/systemd/systemd-journald"]=$'742\n' )
+    PROCESS_BINARY_TO_PACKAGE=( ["/usr/lib/systemd/systemd"]="systemd" ["/usr/lib/systemd/systemd-journald"]="systemd" )
+    mkdir -p "${TEST_ROOT_DIR}/proc/742"
+    ln -s /usr/lib/systemd/systemd-journald "${TEST_ROOT_DIR}/proc/742/exe"
+    export STUB_BUILD_IDS="/usr/lib/systemd/systemd	aaaa
+${TEST_ROOT_DIR}/proc/1/exe	aaaa
+/usr/lib/systemd/systemd-journald	bbbb"
+    verify_build_id systemd >/dev/null 2>&1
+    assert_exit_code 1 "$?" "an unreadable running process is unverifiable, not a false positive"
+}
+
+test_build_id_exited_process_is_not_unreadable() {
+    load_needs_reboot_library
+    PROCESS_MAP_BUILT=1
+    # PID 742 exited between the /proc walk and the build-id read: it runs no
+    # code, so it neither confirms nor blocks the verdict on PID 1.
+    PROCESS_BINARY_TO_PIDS=( ["/usr/lib/systemd/systemd"]=$'1\n' ["/usr/lib/systemd/systemd-userwork"]=$'742\n' )
+    PROCESS_BINARY_TO_PACKAGE=( ["/usr/lib/systemd/systemd"]="systemd" ["/usr/lib/systemd/systemd-userwork"]="systemd" )
+    export STUB_BUILD_IDS="/usr/lib/systemd/systemd	aaaa
+${TEST_ROOT_DIR}/proc/1/exe	aaaa
+/usr/lib/systemd/systemd-userwork	bbbb"
+    verify_build_id systemd >/dev/null 2>&1
+    assert_exit_code 0 "$?" "a process that has exited is not running stale code"
+}
+
 test_build_id_no_owned_process_is_unverifiable() {
     load_needs_reboot_library
     PROCESS_MAP_BUILT=1
@@ -1362,6 +1392,8 @@ run_test "buildid: all processes match"              test_build_id_all_processes
 run_test "buildid: mismatch on later process wins"   test_build_id_mismatch_on_later_process_wins
 run_test "buildid: stale process sharing a binary is found" test_build_id_stale_process_sharing_a_binary_is_found
 run_test "buildid: no owned process is unverifiable" test_build_id_no_owned_process_is_unverifiable
+run_test "buildid: unreadable process keeps the package" test_build_id_unreadable_process_keeps_the_package
+run_test "buildid: exited process is not unreadable"  test_build_id_exited_process_is_not_unreadable
 
 printf 'state\n'
 run_test "state: round trip"                         test_state_round_trip
