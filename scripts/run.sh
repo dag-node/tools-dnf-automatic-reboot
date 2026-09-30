@@ -288,7 +288,7 @@ is_excluded_unit() {
 # Sets SERVICE_RESTART_SUMMARY to one clause naming every outcome, and the
 # RESTARTED_, FAILED_, PENDING_ and EXCLUDED_SERVICE_NAMES arrays.  Returns 1
 # when a restart failed or had not finished within restart_service_timeout_sec,
-# or when needs-restarting -s could not list the services: each leaves
+# or when `dnf needs-restarting -s` failed to list the services: each leaves
 # pre-update code running that the run was meant to replace.  Excluded units
 # are left running by design and do not fail the run.
 restart_stale_services() {

@@ -578,7 +578,8 @@ ${TEST_ROOT_DIR}/proc/1/exe	aaaa
 test_build_id_zombie_process_is_exited() {
     load_needs_reboot_library
     PROCESS_MAP_BUILT=1
-    # A zombie keeps its /proc entry but runs no code; its exe link is gone.
+    # A zombie keeps its /proc entry but does not run any code; its exe link
+    # is gone.
     PROCESS_BINARY_TO_PIDS=( ["/usr/lib/systemd/systemd"]=$'1\n' ["/usr/lib/systemd/systemd-userwork"]=$'742\n' )
     PROCESS_BINARY_TO_PACKAGE=( ["/usr/lib/systemd/systemd"]="systemd" ["/usr/lib/systemd/systemd-userwork"]="systemd" )
     mkdir -p "${TEST_ROOT_DIR}/proc/742"

@@ -161,7 +161,8 @@ unit_main_pid() {
 # recorded_pid_identity PID
 # Returns: 0 = PID is alive and is the unit's MainPID: the run
 #          1 = PID is dead, or MainPID is another process: not the run
-#          2 = PID is alive but systemctl reports no numeric MainPID: unknown
+#          2 = PID is alive but systemctl show does not print a numeric
+#              MainPID: unknown
 # run.sh is the unit's ExecStart, so its PID is MainPID while it runs; a live
 # PID that differs was reused by an unrelated process after the run died.
 recorded_pid_identity() {
@@ -194,8 +195,8 @@ recorded_run_is_unchanged() {
 
 # kill_service_cgroup PHASE START_UPTIME PID
 # Kills the unit only after recorded_run_is_unchanged confirms it still runs
-# the recorded run, and otherwise returns that function's 1 or 2, killing
-# nothing.  The unit is signalled a moment after the check; no systemctl
+# the recorded run.  Otherwise it returns that function's 1 or 2 without
+# signalling any process.  The unit is signalled a moment after the check; no systemctl
 # option ties the kill to one invocation of the unit.
 kill_service_cgroup() {
     local recorded_phase="$1" recorded_start_uptime="$2" recorded_pid="$3"

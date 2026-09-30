@@ -263,7 +263,7 @@ build_process_binary_map() {
 # process_runs_binary PID BINARY_PATH
 # Returns: 0 = PID still runs BINARY_PATH, the replaced image included
 #          1 = PID has exited, is a zombie, or now runs another binary
-#          2 = PID exists but its executable link cannot be read
+#          2 = PID exists but readlink fails on its executable link
 process_runs_binary() {
     local process_id="$1" binary_path="$2" current_binary_path process_status=""
     if current_binary_path=$(readlink "${PROC_DIRECTORY}/${process_id}/exe" 2>/dev/null); then
