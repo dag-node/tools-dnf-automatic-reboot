@@ -246,7 +246,9 @@ than 0, 1 and 2, such as 127 from a missing helper, is handled as code 2: only 0
 
 ### State file `/run/dnf-automatic-reboot.state`
 
-Written by `run.sh`, consumed by `watchdog.sh`.
+Written by `run.sh`, consumed by `watchdog.sh`. It exists from before `dnf-automatic`
+starts until `run.sh` exits; `checking` covers the reboot decision and the service
+restarts after it.
 
 ```
 phase=updating|checking
@@ -421,8 +423,8 @@ with no reboot flag raised.
 
 `run.sh` closes this with a `needs-restarting -s` pass, which walks `/proc/*/smaps`
 and names the affected systemd units. Units are restarted with `systemctl try-restart`
-so a unit that is not running is left alone, and the pass is skipped entirely when a
-reboot is already scheduled. `restart_services_exclude` holds the units that must
+so a unit that is not running is left alone, each under `restart_service_timeout_sec`,
+and the pass is skipped entirely when a reboot is already scheduled. `restart_services_exclude` holds the units that must
 never be restarted from underneath a running system — `dbus`/`dbus-broker` break every
 client holding a bus connection, `systemd-logind` drops session tracking, and the two
 units of this package would kill the run. Extend that list, never shorten it.

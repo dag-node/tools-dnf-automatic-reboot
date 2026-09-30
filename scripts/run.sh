@@ -215,6 +215,7 @@ RESTART_SERVICES=$(conf_get restart_services yes)
 RESTART_SERVICES_EXCLUDE=$(conf_get restart_services_exclude \
     "dbus.service,dbus-broker.service,systemd-logind.service,user@*.service,getty@*.service,serial-getty@*.service,autovt@*.service,dnf-automatic-reboot.service,dnf-automatic-watchdog.service")
 NEEDS_RESTARTING_TIMEOUT_SEC=$(conf_get_int needs_restarting_timeout_sec 120)
+RESTART_SERVICE_TIMEOUT_SEC=$(conf_get_int restart_service_timeout_sec 300)
 
 # ---------------------------------------------------------------------------
 # Cleanup handler - always runs on exit
@@ -277,7 +278,7 @@ is_excluded_unit() {
 }
 
 restart_stale_services() {
-    local stale_service_output stale_service_name
+    local stale_service_output stale_service_name restart_exit_code
     local restarted_service_names=() skipped_service_names=()
 
     if [[ "${RESTART_SERVICES}" != "yes" ]]; then
@@ -302,8 +303,16 @@ restart_stale_services() {
             continue
         fi
 
-        if "${SYSTEMCTL_BIN}" try-restart "${stale_service_name}" 2>/dev/null; then
+        # Bounded: a unit that hangs in stop or start must not hold the run.
+        # Stopping the systemctl client leaves the restart job to systemd.
+        restart_exit_code=0
+        timeout "${RESTART_SERVICE_TIMEOUT_SEC}s" \
+            "${SYSTEMCTL_BIN}" try-restart "${stale_service_name}" 2>/dev/null \
+            || restart_exit_code=$?
+        if [[ "${restart_exit_code}" -eq 0 ]]; then
             restarted_service_names+=("${stale_service_name}")
+        elif [[ "${restart_exit_code}" -eq 124 ]]; then
+            log_warn "restart of ${stale_service_name} did not finish within ${RESTART_SERVICE_TIMEOUT_SEC}s - the job continues in systemd; check it with: systemctl status ${stale_service_name}"
         else
             log_warn "failed to restart ${stale_service_name} - it is still running pre-update code"
         fi
@@ -476,9 +485,8 @@ main() {
         needs_reboot_exit_code=1
     fi
 
-    rm -f "${STATE_FILE}" "${LOCK_FILE}"
-    trap - EXIT   # prevent double-cleanup after this point
-
+    # The state file stays until cleanup at exit: the service restarts below
+    # can block, and the watchdog supervises the run only while it exists.
     case "${needs_reboot_exit_code}" in
         0)
             log "No reboot required"

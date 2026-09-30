@@ -776,6 +776,39 @@ stub_run_main() {
     restart_stale_services() { printf 'restart_stale_services\n' >> "${STUB_LOG}"; }
 }
 
+test_run_service_restarts_stay_supervised() {
+    load_run_library
+    stub_run_main
+    # A try-restart can block; the watchdog only sees a run whose state file
+    # exists, so the file must outlive the restarts.
+    restart_stale_services() {
+        printf 'restarting with state: %s\n' \
+            "$(grep '^phase=' "${STATE_FILE}" 2>/dev/null || printf 'none')" >> "${STUB_LOG}"
+    }
+    ( main ) >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "restarting with state: phase=checking" \
+        "the watchdog still supervises the restarts"
+    [[ -f "${STATE_FILE}" ]] && fail "the state file must be removed when the run exits"
+    return 0
+}
+
+test_services_restart_is_bounded() {
+    load_run_library
+    timeout() {
+        printf 'timeout %s\n' "$*" >> "${STUB_LOG}"
+        if [[ "$*" == *needs-restarting* ]]; then
+            printf 'sshd.service\n'
+            return 0
+        fi
+        return 124
+    }
+    local output
+    output=$(restart_stale_services 2>&1)
+    assert_contains "$(cat "${STUB_LOG}")" "timeout 300s ${TEST_ROOT_DIR}/usr/bin/systemctl try-restart sshd.service" \
+        "each restart runs under the configured bound"
+    assert_contains "${output}" "did not finish within 300s" "an expired restart is reported"
+}
+
 test_run_helper_failure_fails_the_run() {
     load_run_library
     stub_run_main
@@ -1575,6 +1608,7 @@ printf 'run\n'
 run_test "run: refused inhibitor stops the update"   test_run_refused_inhibitor_stops_the_update
 run_test "run: update runs inside the inhibitor"     test_run_update_runs_inside_the_inhibitor
 run_test "run: helper failure fails the run"        test_run_helper_failure_fails_the_run
+run_test "run: service restarts stay supervised"    test_run_service_restarts_stay_supervised
 
 printf 'repositories\n'
 run_test "repositories: unsigned enabled repo is reported"  test_repositories_unsigned_enabled_is_reported
@@ -1598,6 +1632,7 @@ run_test "conflicts: pass on prepared host"         test_conflicts_pass_on_prepa
 printf 'services\n'
 run_test "services: excluded units are not restarted" test_services_excluded_units_are_not_restarted needs-exec
 run_test "services: disabled by config"              test_services_disabled_by_config
+run_test "services: restart is bounded"              test_services_restart_is_bounded
 run_test "services: template units excluded by glob" test_services_template_units_are_excluded_by_glob
 run_test "services: wall_messages comment is ignored" test_wall_messages_trailing_comment_is_not_part_of_the_value
 
