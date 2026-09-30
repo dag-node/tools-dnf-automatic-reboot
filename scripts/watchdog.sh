@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # watchdog.sh
 # ---------------------------------------------------------------------------
 # Independent watchdog for dnf-automatic-reboot.

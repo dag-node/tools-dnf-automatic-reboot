@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # needs-reboot.sh
 # ---------------------------------------------------------------------------
 # Determines whether a reboot is required after package updates.

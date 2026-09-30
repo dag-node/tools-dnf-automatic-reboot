@@ -1,9 +1,10 @@
+# SPDX-License-Identifier: MIT
 Name:           dnf-automatic-reboot
 Version:        1.3
 Release:        1%{?dist}
 Summary:        Unattended update and conditional reboot for OL9/RHEL9 aarch64
 
-License:        MIT
+License:        GPL-2.0-or-later
 URL:            https://github.com/dag-node/tools-dnf-automatic-reboot
 Source0:        %{name}-%{version}.tar.gz
 

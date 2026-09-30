@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 NAME    = dnf-automatic-reboot
 VERSION = 1.3
 TARBALL = $(NAME)-$(VERSION).tar.gz

@@ -1,0 +1,39 @@
+# REUSE (https://reuse.software) annotations for paths that carry no SPDX header of their own.
+#
+# Every source file states its own licence in a one-line `SPDX-License-Identifier` header. The
+# copyright holder is declared here instead of in each file, so it is single-sourced: a file added
+# later inherits it without a header line of its own, and the year is one line to update rather
+# than a tree-wide sweep. `precedence = "aggregate"` means a file's own header wins where it has one and
+# these annotations only fill the gaps.
+#
+# The project is GPL-2.0-or-later. The RPM spec is MIT, as in every DagNode project: it is
+# packaging machinery, not the program, and its header says so.
+#
+# The paths without a header are those where one would be noise rather than information: prose,
+# licence texts, dotfiles, and the files installed verbatim onto hosts -- the config, systemd
+# units, tmpfiles.d and logrotate.d drop-ins -- where a licence comment would be clutter.
+
+version = 1
+SPDX-PackageName = "dnf-automatic-reboot"
+SPDX-PackageDownloadLocation = "https://github.com/dag-node/tools-dnf-automatic-reboot"
+
+# Catch-all: the maintainer's own work.
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Ondřej Nedomlel <tools@dagnode.com>"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+# The root LICENSE is the GPL-2.0 text itself, kept at the top level for GitHub's licence
+# detection; LICENSES/ holds the REUSE-standard copies.
+[[annotations]]
+path = ["LICENSE", "LICENSES/GPL-2.0-or-later.txt"]
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Ondřej Nedomlel <tools@dagnode.com>"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+[[annotations]]
+path = "LICENSES/MIT.txt"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Ondřej Nedomlel <tools@dagnode.com>"
+SPDX-License-Identifier = "MIT"

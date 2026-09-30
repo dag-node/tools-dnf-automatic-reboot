@@ -34,6 +34,13 @@ logrotate/dnf-automatic-reboot       Log rotation drop-in
 doc/README                      Operational reference (installed to /usr/share/doc/)
 ```
 
+**Licensing.** Every script, test and the Makefile carries
+`# SPDX-License-Identifier: GPL-2.0-or-later` on the line after the shebang; the spec
+carries `# SPDX-License-Identifier: MIT`, as in every DagNode project. The copyright
+holder lives only in `REUSE.toml`, so no header needs it and shipped files stay ASCII.
+Files installed verbatim onto hosts (config, units, drop-ins) take no header; the
+`REUSE.toml` catch-all covers them.
+
 ## Installed paths (on target)
 
 ```

@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # notify-failure.sh
 # ---------------------------------------------------------------------------
 # Failure notifier, started by OnFailure= from the service units.

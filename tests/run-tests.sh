@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # run-tests.sh
 # ---------------------------------------------------------------------------
 # Test suite for dnf-automatic-reboot.  No external test framework: bash and
