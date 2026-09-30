@@ -144,6 +144,10 @@ if [[ "$1" == "--version" ]]; then
     printf 'systemd %s (stub)\n' "${STUB_SYSTEMD_VERSION:-252}"
     exit 0
 fi
+if [[ "$1" == "show" ]]; then
+    printf '%s\n' "${STUB_MAIN_PID:-}"
+    exit 0
+fi
 printf 'systemctl %s\n' "$*" >> "${STUB_LOG}"
 [[ "${STUB_SYSTEMCTL_FAIL:-}" == "yes" ]] && exit 1
 exit 0
@@ -936,6 +940,23 @@ test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who() {
     assert_contains "$(cat "${STUB_LOG}")" "kill --kill-who=all" "EL8 spelling used on systemd 239"
 }
 
+test_watchdog_reused_pid_is_not_the_run() {
+    sleep 60 &
+    local background_pid=$!
+    # The run died and its PID now belongs to an unrelated process; systemd
+    # reports the unit inactive (MainPID 0).  Past the hard timeout the
+    # watchdog must not kill that process or reboot.
+    export STUB_MAIN_PID=0
+    write_watchdog_state checking 200 "${background_pid}"
+    bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
+    local process_survived=no
+    kill -0 "${background_pid}" 2>/dev/null && process_survived=yes
+    kill "${background_pid}" 2>/dev/null
+    assert_equals "yes" "${process_survived}" "the unrelated process is left running"
+    assert_not_contains "$(cat "${STUB_LOG}")" "reboot" "no reboot for a run that is gone"
+    assert_not_contains "$(cat "${STUB_LOG}")" "kill" "no cgroup kill for a run that is gone"
+}
+
 test_watchdog_prefers_orderly_reboot() {
     sleep 60 &
     local background_pid=$!
@@ -1032,6 +1053,7 @@ run_test "watchdog: hard timeout while updating can be forced"   test_watchdog_h
 run_test "watchdog: hard timeout while checking reboots"         test_watchdog_hard_timeout_while_checking_reboots         needs-exec
 run_test "watchdog: prefers orderly reboot"          test_watchdog_prefers_orderly_reboot          needs-exec
 run_test "watchdog: kill option follows systemd version" test_watchdog_kill_option_follows_systemd_version
+run_test "watchdog: reused pid is not the run"        test_watchdog_reused_pid_is_not_the_run       needs-exec
 run_test "watchdog: systemd 239 kills with --kill-who" test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who needs-exec
 
 printf '\n'

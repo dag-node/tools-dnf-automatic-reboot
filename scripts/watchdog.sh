@@ -126,8 +126,22 @@ systemctl_kill_target_option() {
     fi
 }
 
+# recorded_pid_is_the_run PID - succeeds when PID is alive and is the service
+# unit's main process.  run.sh is the unit's ExecStart, so its PID is MainPID
+# while it runs; a live PID that differs was reused by an unrelated process
+# after the run died.  When systemctl does not report a numeric MainPID the
+# result is the kill -0 check alone, so a stuck run is still acted on.
+recorded_pid_is_the_run() {
+    local recorded_pid="$1" main_pid
+    kill -0 "${recorded_pid}" 2>/dev/null || return 1
+    main_pid=$("${SYSTEMCTL_BIN}" show --property=MainPID --value "${MAIN_SERVICE_UNIT}" 2>/dev/null) || main_pid=""
+    [[ "${main_pid}" =~ ^[0-9]+$ ]] || return 0
+    [[ "${main_pid}" == "${recorded_pid}" ]]
+}
+
 kill_service_cgroup() {
-    local recorded_pid="$1" systemd_version kill_target_option
+    local recorded_pid="$1" systemd_version kill_target_option recorded_pid_was_the_run=0
+    recorded_pid_is_the_run "${recorded_pid}" && recorded_pid_was_the_run=1
     systemd_version=$("${SYSTEMCTL_BIN}" --version 2>/dev/null \
                       | sed -n '1s/^systemd \([0-9]\+\).*/\1/p') || true
     kill_target_option=$(systemctl_kill_target_option "${systemd_version}")
@@ -135,7 +149,9 @@ kill_service_cgroup() {
         log_err "systemctl kill ${kill_target_option} ${MAIN_SERVICE_UNIT} failed - processes of the run may survive"
     fi
     sleep 2
-    if kill -0 "${recorded_pid}" 2>/dev/null; then
+    # Only a PID confirmed as the run before the cgroup kill is signalled
+    # directly; any other live PID with that number belongs to someone else.
+    if [[ "${recorded_pid_was_the_run}" -eq 1 ]] && kill -0 "${recorded_pid}" 2>/dev/null; then
         log_warn "PID ${recorded_pid} survived the cgroup kill - signalling it directly"
         kill -KILL "${recorded_pid}" 2>/dev/null || true
         sleep 1
@@ -228,8 +244,8 @@ main() {
     # ---------------------------------------------------------------------------
     # Scenario 2: dead PID with state file present
     # ---------------------------------------------------------------------------
-    if ! kill -0 "${service_pid}" 2>/dev/null; then
-        log_warn "service PID ${service_pid} is dead but state file exists - updates may be incomplete, NOT rebooting"
+    if ! recorded_pid_is_the_run "${service_pid}"; then
+        log_warn "service PID ${service_pid} is dead or not the unit's main process but state file exists - updates may be incomplete, NOT rebooting"
         wall_msg "dnf-automatic-reboot: WARNING - update process (PID ${service_pid})" \
                  "died unexpectedly in phase=${run_phase}." \
                  "Manual inspection required before rebooting."
