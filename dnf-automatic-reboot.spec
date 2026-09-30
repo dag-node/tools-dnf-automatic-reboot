@@ -496,13 +496,20 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   PID 1 alone could call a genuine systemd update a false positive and skip the reboot.
 - SECURITY: A process still running a systemd binary whose build-id cannot be read keeps the
   reboot, even when every other process matches. One matching process could call the update a
-  false positive for a process nobody had checked.
+  false positive for a process nobody had checked. A process counts as gone only when it has
+  left /proc, is a zombie, or runs another binary.
 - NEW: Enterprise Linux 8 support (RHEL 8, Oracle Linux 8, Rocky Linux 8, AlmaLinux 8). The
   package requires systemd 239 instead of 252, and the watchdog stops a stuck run with the
   systemctl kill option each systemd version accepts. On EL8 EFI hosts the install checks the
   grub.cfg on the EFI partition, which is the one GRUB runs there.
 - NEW: restart_service_timeout_sec (default 300) bounds each restart of a stale service. A
-  restart that does not finish in time is logged and left to systemd, and the run goes on.
+  restart that does not finish in time is left to systemd, and the run goes on.
+- NEW: Each run that installs updates ends with one line, logged and sent to logged-in users,
+  naming the reboot outcome and every service restarted, failed, still pending or excluded, and
+  the command to check what is incomplete.
+- NEW: A reboot is scheduled as dnf-automatic-reboot-scheduled-reboot.timer. The message gives
+  its time and 'systemctl stop dnf-automatic-reboot-scheduled-reboot.timer' to cancel it, and a
+  reboot that fails to start is reported through the failure notifier.
 - FIX: Security advisories that dnf will not install are reported on Red Hat Enterprise Linux,
   Rocky Linux and AlmaLinux, whose advisory ids have the form RHSA-2020:3011, for EPEL
   advisories such as FEDORA-EPEL-2024-bf31852fe0, and for Oracle Linux advisories with a
@@ -542,6 +549,13 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   withheld the next genuine kernel reboot.
 - FIX: The reboot check no longer removes /dev/null when it cannot create a temporary file; it
   fails without rebooting.
+- FIX: The watchdog re-checks the run right before stopping it. A run that ended during the
+  watchdog's own reboot check, and the next run that started meanwhile, could otherwise be
+  killed mid-update and the host rebooted. A process whose identity systemd cannot confirm is
+  left alone.
+- FIX: A stale-service restart that fails or does not finish fails the run. The run reported
+  "No stale services needed restarting" and success instead.
+- FIX: The watchdog fails its unit when it cannot schedule a reboot, so OnFailure= reports it.
 
 * Fri Jul 31 2026 DagNode <packages@dagnode.com> - 1.3-1
 - CHANGE: Scripts move from /usr/local/lib to /usr/libexec; update anything that calls them by
