@@ -323,10 +323,14 @@ design. One row per tracked package; a new EVR supersedes the old row:
 ```
 
 `kernel-reboot-attempts` — consecutive reboots scheduled for a kernel version that
-has not become the running one. Cleared as soon as it does:
+has not become the running one. Cleared as soon as it does. `boot_id` names the boot
+that counted the last attempt: every check in that boot belongs to the same attempt,
+so a check run by hand, the watchdog's check or a repeated run does not use up the
+limit; only a boot that comes up on the old kernel counts the next one. With an
+unreadable `boot_id` every check counts:
 
 ```
-<name>\t<target_version>\t<attempt_count>
+<name>\t<target_version>\t<attempt_count>\t<boot_id>
 ```
 
 ## Root cause of every false positive: a wrong clock at boot

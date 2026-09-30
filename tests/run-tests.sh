@@ -685,6 +685,27 @@ test_classify_schedules_genuine_kernel_reboot() {
         "attempt recorded"
 }
 
+test_classify_repeated_checks_in_one_boot_count_once() {
+    load_needs_reboot_library
+    export STUB_UNAME_R="6.12.0-204.92.4.3.1.el9uek.aarch64"
+    export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.4.el9uek.aarch64"
+    export STUB_GRUBBY_DEFAULT="/boot/vmlinuz-6.12.0-204.92.4.4.el9uek.aarch64"
+    FLAGGED_PACKAGE_NAMES=(kernel-uek)
+    # The helper run by hand, the watchdog's check and the timer run all
+    # classify without a reboot in between.  Only reboots may use the budget.
+    local check_number
+    for check_number in 1 2 3 4; do
+        classify_flagged_packages >/dev/null 2>&1
+    done
+    assert_equals "1" "${#REBOOT_TRIGGER_PACKAGES[@]}" "the fourth check in one boot still reboots"
+    assert_equals "1" "$(read_kernel_reboot_attempts kernel-uek '6.12.0-204.92.4.4.el9uek.aarch64')" \
+        "one boot counts one attempt"
+    printf 'ffffffff-0000-1111-2222-333333333333\n' > "${BOOT_ID_FILE}"
+    classify_flagged_packages >/dev/null 2>&1
+    assert_equals "2" "$(read_kernel_reboot_attempts kernel-uek '6.12.0-204.92.4.4.el9uek.aarch64')" \
+        "a boot still on the old kernel counts the next attempt"
+}
+
 test_classify_keeps_package_when_verifier_missing() {
     load_needs_reboot_library
     # Removing elfutils must not silently drop systemd from the decision.
@@ -1597,6 +1618,7 @@ printf 'classify\n'
 run_test "classify: withholds on stale grub default" test_classify_withholds_on_stale_grub_default
 run_test "classify: withholds at attempt limit"      test_classify_withholds_at_attempt_limit
 run_test "classify: schedules genuine kernel reboot" test_classify_schedules_genuine_kernel_reboot
+run_test "classify: repeated checks in one boot count once" test_classify_repeated_checks_in_one_boot_count_once
 run_test "classify: keeps package when verifier missing" test_classify_keeps_package_when_verifier_missing
 
 printf 'decision\n'

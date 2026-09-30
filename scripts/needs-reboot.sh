@@ -140,10 +140,20 @@ read_kernel_reboot_attempts() {
         "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || printf '0'
 }
 
-# write_kernel_reboot_attempts PACKAGE_NAME TARGET_VERSION ATTEMPT_COUNT
+# read_kernel_reboot_attempt_boot_id PACKAGE_NAME TARGET_VERSION
+# Prints the boot_id of the boot that counted the last attempt, empty when
+# none is recorded.
+read_kernel_reboot_attempt_boot_id() {
+    local package_name="$1" target_version="$2"
+    awk -F'\t' -v name="${package_name}" -v target="${target_version}" \
+        '$1 == name && $2 == target { boot_id = $4 } END { print boot_id }' \
+        "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || true
+}
+
+# write_kernel_reboot_attempts PACKAGE_NAME TARGET_VERSION ATTEMPT_COUNT [BOOT_ID]
 # An ATTEMPT_COUNT of 0 clears the package's row.
 write_kernel_reboot_attempts() {
-    local package_name="$1" target_version="$2" attempt_count="$3"
+    local package_name="$1" target_version="$2" attempt_count="$3" boot_id="${4:-}"
     mkdir -p "${STATE_DIRECTORY}" 2>/dev/null || true
     (
         flock -w 10 9 || exit 0
@@ -155,7 +165,7 @@ write_kernel_reboot_attempts() {
         {
             awk -F'\t' -v name="${package_name}" '$1 != name' "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || true
             if [[ "${attempt_count}" -gt 0 ]]; then
-                printf '%s\t%s\t%s\n' "${package_name}" "${target_version}" "${attempt_count}"
+                printf '%s\t%s\t%s\t%s\n' "${package_name}" "${target_version}" "${attempt_count}" "${boot_id}"
             fi
         } > "${temporary_file}" 2>/dev/null || { rm -f "${temporary_file}"; exit 0; }
         chmod 0640 "${temporary_file}" 2>/dev/null || true
@@ -421,7 +431,10 @@ run_needs_restarting() {
 classify_flagged_packages() {
     local flagged_package_name target_kernel_version
     local grub_default_check_result build_id_check_result kernel_reboot_attempts
+    local attempt_boot_id current_boot_id
     local build_id_verifier_available=1
+
+    current_boot_id=$(cat "${BOOT_ID_FILE}" 2>/dev/null) || current_boot_id=""
 
     if ! command -v eu-readelf >/dev/null 2>&1; then
         # elfutils is a hard dependency; if it is gone the build-id path cannot
@@ -464,16 +477,28 @@ classify_flagged_packages() {
                 fi
             fi
 
+            # One attempt per boot: every check in a boot that still runs the
+            # old kernel - by hand, from the watchdog, or a repeated run -
+            # belongs to the same attempt, so only reboots use the budget.
             if [[ "${KERNEL_REBOOT_ATTEMPT_LIMIT}" -gt 0 ]]; then
                 kernel_reboot_attempts=$(read_kernel_reboot_attempts \
                     "${flagged_package_name}" "${target_kernel_version}")
-                if [[ "${kernel_reboot_attempts}" -ge "${KERNEL_REBOOT_ATTEMPT_LIMIT}" ]]; then
-                    log_err "${flagged_package_name}: ${kernel_reboot_attempts} consecutive reboots already scheduled for ${target_kernel_version} without it becoming the running kernel - giving up, manual intervention required"
-                    REBOOT_WITHHELD=1
-                    continue
+                attempt_boot_id=$(read_kernel_reboot_attempt_boot_id \
+                    "${flagged_package_name}" "${target_kernel_version}")
+                if [[ -n "${current_boot_id}" && "${attempt_boot_id}" == "${current_boot_id}" ]]; then
+                    log "${flagged_package_name}: attempt ${kernel_reboot_attempts} of ${KERNEL_REBOOT_ATTEMPT_LIMIT} for ${target_kernel_version} is already counted in this boot"
+                else
+                    if [[ "${kernel_reboot_attempts}" -ge "${KERNEL_REBOOT_ATTEMPT_LIMIT}" ]]; then
+                        log_err "${flagged_package_name}: ${kernel_reboot_attempts} consecutive reboots for ${target_kernel_version} did not make it the running kernel - giving up, manual intervention required"
+                        REBOOT_WITHHELD=1
+                        continue
+                    fi
+                    if [[ -z "${current_boot_id}" ]]; then
+                        log_warn "could not read boot_id - counting this check as a reboot attempt"
+                    fi
+                    write_kernel_reboot_attempts "${flagged_package_name}" \
+                        "${target_kernel_version}" $(( kernel_reboot_attempts + 1 )) "${current_boot_id}"
                 fi
-                write_kernel_reboot_attempts "${flagged_package_name}" \
-                    "${target_kernel_version}" $(( kernel_reboot_attempts + 1 ))
             fi
 
             REBOOT_TRIGGER_PACKAGES+=("${flagged_package_name}")
