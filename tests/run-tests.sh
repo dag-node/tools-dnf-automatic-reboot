@@ -559,6 +559,36 @@ ${TEST_ROOT_DIR}/proc/1/exe	aaaa
     assert_exit_code 0 "$?" "a process that has exited is not running stale code"
 }
 
+test_build_id_unreadable_link_of_live_process_keeps_the_package() {
+    load_needs_reboot_library
+    PROCESS_MAP_BUILT=1
+    # PID 742 is still in /proc, but neither its build-id nor its executable
+    # link can be read.  That is no evidence it exited.
+    PROCESS_BINARY_TO_PIDS=( ["/usr/lib/systemd/systemd"]=$'1\n' ["/usr/lib/systemd/systemd-journald"]=$'742\n' )
+    PROCESS_BINARY_TO_PACKAGE=( ["/usr/lib/systemd/systemd"]="systemd" ["/usr/lib/systemd/systemd-journald"]="systemd" )
+    mkdir -p "${TEST_ROOT_DIR}/proc/742"
+    printf '742 (systemd-journal) S 1 742 742 0 -1\n' > "${TEST_ROOT_DIR}/proc/742/stat"
+    export STUB_BUILD_IDS="/usr/lib/systemd/systemd	aaaa
+${TEST_ROOT_DIR}/proc/1/exe	aaaa
+/usr/lib/systemd/systemd-journald	bbbb"
+    verify_build_id systemd >/dev/null 2>&1
+    assert_exit_code 1 "$?" "an unreadable link on a live process is unverifiable"
+}
+
+test_build_id_zombie_process_is_exited() {
+    load_needs_reboot_library
+    PROCESS_MAP_BUILT=1
+    # A zombie keeps its /proc entry but runs no code; its exe link is gone.
+    PROCESS_BINARY_TO_PIDS=( ["/usr/lib/systemd/systemd"]=$'1\n' ["/usr/lib/systemd/systemd-userwork"]=$'742\n' )
+    PROCESS_BINARY_TO_PACKAGE=( ["/usr/lib/systemd/systemd"]="systemd" ["/usr/lib/systemd/systemd-userwork"]="systemd" )
+    mkdir -p "${TEST_ROOT_DIR}/proc/742"
+    printf '742 (systemd-userwor) Z 1 742 742 0 -1\n' > "${TEST_ROOT_DIR}/proc/742/stat"
+    export STUB_BUILD_IDS="/usr/lib/systemd/systemd	aaaa
+${TEST_ROOT_DIR}/proc/1/exe	aaaa"
+    verify_build_id systemd >/dev/null 2>&1
+    assert_exit_code 0 "$?" "a zombie is not running stale code"
+}
+
 test_build_id_no_owned_process_is_unverifiable() {
     load_needs_reboot_library
     PROCESS_MAP_BUILT=1
@@ -1674,6 +1704,8 @@ run_test "buildid: stale process sharing a binary is found" test_build_id_stale_
 run_test "buildid: no owned process is unverifiable" test_build_id_no_owned_process_is_unverifiable
 run_test "buildid: unreadable process keeps the package" test_build_id_unreadable_process_keeps_the_package
 run_test "buildid: exited process is not unreadable"  test_build_id_exited_process_is_not_unreadable
+run_test "buildid: unreadable link of live process keeps the package" test_build_id_unreadable_link_of_live_process_keeps_the_package
+run_test "buildid: zombie process is exited"          test_build_id_zombie_process_is_exited
 
 printf 'state\n'
 run_test "state: round trip"                         test_state_round_trip

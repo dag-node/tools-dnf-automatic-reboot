@@ -218,7 +218,8 @@ its flag is spurious. Every "cannot tell" outcome keeps the package:
 | Build-ids match on all owned processes | False positive, drop |
 | Build-id mismatch on any owned process | Genuine, keep |
 | No owned running process, or unreadable build-id on any running process | Keep |
-| Owned process exited before its build-id was read | Ignore that process |
+| Owned process gone from `/proc`, a zombie, or running another binary when its build-id could not be read | Ignore that process |
+| Owned process still in `/proc` with an unreadable executable link | Keep |
 | `eu-readelf` missing | Keep affected packages; kernel and learning paths still run |
 | Running kernel == newest installed | False positive, drop |
 | Anything else about the kernel | Keep |

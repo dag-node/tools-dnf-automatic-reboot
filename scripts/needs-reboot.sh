@@ -260,17 +260,27 @@ build_process_binary_map() {
 # "cannot verify", whatever the other processes show.
 # ---------------------------------------------------------------------------
 
-# process_runs_binary PID BINARY_PATH - succeeds while PID still runs
-# BINARY_PATH, the replaced image included.
+# process_runs_binary PID BINARY_PATH
+# Returns: 0 = PID still runs BINARY_PATH, the replaced image included
+#          1 = PID has exited, is a zombie, or now runs another binary
+#          2 = PID exists but its executable link cannot be read
 process_runs_binary() {
-    local process_id="$1" binary_path="$2" current_binary_path
-    current_binary_path=$(readlink "${PROC_DIRECTORY}/${process_id}/exe" 2>/dev/null) || return 1
-    [[ "${current_binary_path% (deleted)}" == "${binary_path}" ]]
+    local process_id="$1" binary_path="$2" current_binary_path process_status=""
+    if current_binary_path=$(readlink "${PROC_DIRECTORY}/${process_id}/exe" 2>/dev/null); then
+        [[ "${current_binary_path% (deleted)}" == "${binary_path}" ]] || return 1
+        return 0
+    fi
+    [[ -d "${PROC_DIRECTORY}/${process_id}" ]] || return 1
+    # Field 3 of /proc/PID/stat, after the parenthesised command name.
+    process_status=$(cat "${PROC_DIRECTORY}/${process_id}/stat" 2>/dev/null) || return 2
+    process_status="${process_status##*) }"
+    [[ "${process_status%% *}" == "Z" ]] && return 1
+    return 2
 }
 
 verify_build_id() {
     local package_name="$1"
-    local binary_path process_id running_build_id on_disk_build_id
+    local binary_path process_id running_build_id on_disk_build_id process_runs_binary_result
     local verified_process_count=0 unreadable_build_id=0
 
     build_process_binary_map
@@ -287,7 +297,9 @@ verify_build_id() {
                 # A process that exited after the /proc walk does not run any code.
                 # One still running on this binary blocks the verdict, even
                 # when every other process matches.
-                if ! process_runs_binary "${process_id}" "${binary_path}"; then
+                process_runs_binary_result=0
+                process_runs_binary "${process_id}" "${binary_path}" || process_runs_binary_result=$?
+                if [[ "${process_runs_binary_result}" -eq 1 ]]; then
                     log "${package_name}: pid ${process_id} of ${binary_path} exited before its build-id was read"
                     continue
                 fi
