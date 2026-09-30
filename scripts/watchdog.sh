@@ -45,6 +45,7 @@ readonly TEST_ROOT="${DNF_AUTOMATIC_REBOOT_TEST_ROOT:-}"
 readonly CONFIG_FILE="${TEST_ROOT}/etc/dnf/automatic-reboot.conf"
 readonly STATE_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.state"
 readonly LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.lock"
+readonly UPTIME_FILE="${TEST_ROOT}/proc/uptime"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
 readonly SYSTEMD_RUN_BIN="${TEST_ROOT}/usr/bin/systemd-run"
@@ -172,21 +173,32 @@ fi
 # Parse state file
 # ---------------------------------------------------------------------------
 run_phase=""
-start_timestamp=0
+start_uptime_seconds=""
 service_pid=0
 
-run_phase=$(grep       '^phase=' "${STATE_FILE}" | cut -d= -f2) || true
-start_timestamp=$(grep '^start=' "${STATE_FILE}" | cut -d= -f2) || true
-service_pid=$(grep       '^pid=' "${STATE_FILE}" | cut -d= -f2) || true
+run_phase=$(grep            '^phase=' "${STATE_FILE}" | cut -d= -f2) || true
+start_uptime_seconds=$(grep '^start_uptime=' "${STATE_FILE}" | cut -d= -f2) || true
+service_pid=$(grep            '^pid=' "${STATE_FILE}" | cut -d= -f2) || true
 
-if [[ ! "${start_timestamp}" =~ ^[0-9]+$ || ! "${service_pid}" =~ ^[0-9]+$ ]]; then
+if [[ ! "${start_uptime_seconds}" =~ ^[0-9]+$ || ! "${service_pid}" =~ ^[0-9]+$ ]]; then
     log "Malformed state file - removing"
     rm -f "${STATE_FILE}" "${LOCK_FILE}"
     exit 0
 fi
 
-current_timestamp=$(date +%s)
-elapsed_min=$(( (current_timestamp - start_timestamp) / 60 ))
+# Elapsed time is measured on CLOCK_BOOTTIME.  With no RTC, a run started
+# before chrony synchronises sees the wall clock step forward by however long
+# the host was off, which read as wall-clock time would trip the hard timeout
+# and kill an rpm transaction minutes after it began.  /run does not survive
+# a reboot, so a recorded uptime always belongs to the current boot.
+current_uptime_seconds=""
+read -r current_uptime_seconds _ < "${UPTIME_FILE}" 2>/dev/null || true
+current_uptime_seconds="${current_uptime_seconds%%.*}"
+if [[ ! "${current_uptime_seconds}" =~ ^[0-9]+$ ]]; then
+    log_err "cannot read ${UPTIME_FILE} - run not supervised this cycle"
+    exit 1
+fi
+elapsed_min=$(( (current_uptime_seconds - start_uptime_seconds) / 60 ))
 
 log "phase=${run_phase} elapsed=${elapsed_min}min pid=${service_pid}"
 

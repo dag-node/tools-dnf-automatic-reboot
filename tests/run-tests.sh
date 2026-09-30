@@ -746,11 +746,49 @@ test_services_disabled_by_config() {
 # ---------------------------------------------------------------------------
 # watchdog: never reboot a host whose rpm transaction may be half-applied
 # ---------------------------------------------------------------------------
+# Uptime of the fake host, in seconds; the watchdog reads it from proc/uptime.
+readonly TEST_UPTIME_SECONDS=100000
+
+# write_watchdog_state PHASE AGE_MINUTES PID [WALL_CLOCK_AGE_MINUTES]
+# The run is AGE_MINUTES old on the boot clock.  WALL_CLOCK_AGE_MINUTES, which
+# defaults to the same, is how old it looks by the wall clock.
 write_watchdog_state() {
     local run_phase="$1" age_minutes="$2" recorded_pid="$3"
-    printf 'phase=%s\nstart=%s\npid=%s\n' \
-        "${run_phase}" "$(( $(date +%s) - age_minutes * 60 ))" "${recorded_pid}" \
+    local wall_clock_age_minutes="${4:-$2}"
+    printf '%s.42 0.00\n' "${TEST_UPTIME_SECONDS}" > "${TEST_ROOT_DIR}/proc/uptime"
+    printf 'phase=%s\nstart=%s\nstart_uptime=%s\npid=%s\n' \
+        "${run_phase}" "$(( $(date +%s) - wall_clock_age_minutes * 60 ))" \
+        "$(( TEST_UPTIME_SECONDS - age_minutes * 60 ))" "${recorded_pid}" \
         > "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state"
+}
+
+test_watchdog_ignores_wall_clock_step() {
+    sleep 60 &
+    local background_pid=$! watchdog_output
+    # No RTC: the run started before chrony stepped the clock forward three
+    # days.  By the wall clock it is far past the hard timeout; it is actually
+    # two minutes old and its rpm transaction must be left alone.
+    write_watchdog_state updating 2 "${background_pid}" $(( 3 * 24 * 60 ))
+    watchdog_output=$(bash "${REPO_ROOT}/scripts/watchdog.sh" 2>&1)
+    kill "${background_pid}" 2>/dev/null
+    assert_contains "${watchdog_output}" "elapsed=2min" "elapsed time comes from the boot clock"
+    assert_not_contains "$(cat "${STUB_LOG}")" "kill" "a young run is never killed"
+}
+
+test_watchdog_state_without_uptime_is_malformed() {
+    sleep 60 &
+    local background_pid=$!
+    # Only a pre-1.4 run.sh wrote this shape, and %pre refuses to install over
+    # one.  Nothing may be timed from the wall clock.
+    printf 'phase=updating\nstart=%s\npid=%s\n' \
+        "$(( $(date +%s) - 200 * 60 ))" "${background_pid}" \
+        > "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state"
+    bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
+    kill "${background_pid}" 2>/dev/null
+    assert_not_contains "$(cat "${STUB_LOG}")" "kill" "a wall-clock age never kills a run"
+    [[ -f "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state" ]] \
+        && fail "a state file without start_uptime should have been removed"
+    return 0
 }
 
 test_watchdog_no_state_file_is_a_noop() {
@@ -891,6 +929,8 @@ run_test "services: disabled by config"              test_services_disabled_by_c
 printf 'watchdog\n'
 run_test "watchdog: no state file is a noop"         test_watchdog_no_state_file_is_a_noop
 run_test "watchdog: dead pid does not reboot"        test_watchdog_dead_pid_does_not_reboot
+run_test "watchdog: ignores wall clock step"         test_watchdog_ignores_wall_clock_step
+run_test "watchdog: state without uptime is malformed" test_watchdog_state_without_uptime_is_malformed
 run_test "watchdog: hard timeout while updating does not reboot" test_watchdog_hard_timeout_while_updating_does_not_reboot needs-exec
 run_test "watchdog: hard timeout while updating can be forced"   test_watchdog_hard_timeout_while_updating_can_be_forced   needs-exec
 run_test "watchdog: hard timeout while checking reboots"         test_watchdog_hard_timeout_while_checking_reboots         needs-exec

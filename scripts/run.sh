@@ -17,9 +17,11 @@
 #      running processes still map pre-update files.
 #
 # State file /run/dnf-automatic-reboot.state
-#   phase=  updating | checking | failed
-#   start=  unix timestamp
-#   pid=    PID of this script
+#   phase=         updating | checking | failed
+#   start=         unix timestamp, for operators
+#   start_uptime=  seconds since boot; the watchdog times the run from this
+#                  because a host with no RTC steps its wall clock mid-run
+#   pid=           PID of this script
 #
 # Sourcing this file defines its functions without running the update, so
 # tests/run-tests.sh can exercise them directly.
@@ -42,6 +44,7 @@ readonly DNF_CONFIG_FILE="${TEST_ROOT}/etc/dnf/dnf.conf"
 readonly REPOSITORY_CONFIG_DIRECTORY="${TEST_ROOT}/etc/yum.repos.d"
 readonly STATE_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.state"
 readonly LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.lock"
+readonly UPTIME_FILE="${TEST_ROOT}/proc/uptime"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
 readonly DNF_BIN="${TEST_ROOT}/usr/bin/dnf"
@@ -219,8 +222,17 @@ cleanup() {
 # ---------------------------------------------------------------------------
 write_state() {
     local run_phase="$1"
-    printf 'phase=%s\nstart=%s\npid=%s\n' "${run_phase}" "${START_TIMESTAMP}" "${SERVICE_PID}" \
+    printf 'phase=%s\nstart=%s\nstart_uptime=%s\npid=%s\n' \
+        "${run_phase}" "${START_TIMESTAMP}" "${START_UPTIME_SECONDS}" "${SERVICE_PID}" \
         > "${STATE_FILE}"
+}
+
+# uptime_seconds -> whole seconds since boot, empty when unreadable.
+# CLOCK_BOOTTIME, which chrony stepping the wall clock does not move.
+uptime_seconds() {
+    local uptime_value=""
+    read -r uptime_value _ < "${UPTIME_FILE}" 2>/dev/null || true
+    printf '%s' "${uptime_value%%.*}"
 }
 
 # ---------------------------------------------------------------------------
@@ -370,6 +382,7 @@ main() {
     trap cleanup EXIT
 
     START_TIMESTAMP=$(date +%s)
+    START_UPTIME_SECONDS=$(uptime_seconds)
     log "Starting (pid=${SERVICE_PID})"
     check_conflicts
     warn_on_unsigned_repositories
