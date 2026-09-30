@@ -398,6 +398,11 @@ run_dnf_automatic_under_inhibitor() {
         timeout --kill-after="${KILL_GRACE_SEC}s" "${DNF_TIMEOUT_MIN}m" "${DNF_AUTOMATIC_BIN}"
 }
 
+# run_reboot_check -> needs-reboot.sh's exit code.
+run_reboot_check() {
+    "${LIBRARY_DIRECTORY}/needs-reboot.sh"
+}
+
 # ---------------------------------------------------------------------------
 # Schedule a reboot through a transient systemd timer.
 # ---------------------------------------------------------------------------
@@ -461,9 +466,10 @@ main() {
     write_state "checking"
 
     # Decide whether a reboot is required.  Exit 0 = no reboot, 1 = reboot
-    # needed, 2 = undecidable (no reboot, but the run is failed so the
-    # condition is surfaced rather than silently ignored).
-    "${LIBRARY_DIRECTORY}/needs-reboot.sh" || needs_reboot_exit_code=$?
+    # needed; 2 = undecidable, and any other status is a helper failure.
+    # Neither reboots, and both fail the run so the condition is surfaced
+    # rather than silently ignored.
+    run_reboot_check || needs_reboot_exit_code=$?
 
     if [[ "${ALWAYS_REBOOT}" == "yes" && "${needs_reboot_exit_code}" -eq 0 ]]; then
         log "always_reboot=yes in config - scheduling reboot regardless"
@@ -474,20 +480,20 @@ main() {
     trap - EXIT   # prevent double-cleanup after this point
 
     case "${needs_reboot_exit_code}" in
+        0)
+            log "No reboot required"
+            restart_stale_services
+            wall_msg "dnf-automatic-reboot: Updates complete. No reboot required."
+            ;;
         1)
             schedule_reboot || exit 1
             ;;
-        2)
-            log_err "Reboot state could not be established - not rebooting. Updates were applied; the host may still need a manual reboot."
+        *)
+            log_err "needs-reboot.sh exited ${needs_reboot_exit_code}: reboot state could not be established - not rebooting. Updates were applied; the host may still need a manual reboot."
             wall_msg "dnf-automatic-reboot: ERROR - updates applied but the reboot decision could not be made." \
                      "Manual inspection required."
             restart_stale_services
             exit 1
-            ;;
-        *)
-            log "No reboot required"
-            restart_stale_services
-            wall_msg "dnf-automatic-reboot: Updates complete. No reboot required."
             ;;
     esac
 }

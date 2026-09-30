@@ -239,8 +239,10 @@ handles, such as a missing cache. Only exit 1 with at least one `  * <name>` lin
 reboot requirement; exit 1 without one is retried once with a metadata refresh, then
 reported as code 2.
 
-Code 2 does not reboot, to avoid a loop. `run.sh` escalates it to a non-zero exit so
-`OnFailure=` fires and the fail-open is never silent.
+Code 2 does not reboot, to avoid a loop. `run.sh` and `watchdog.sh` escalate it to a
+non-zero exit so `OnFailure=` fires and the fail-open is never silent. Any status other
+than 0, 1 and 2, such as 127 from a missing helper, is handled as code 2: only 0 means
+"no reboot needed".
 
 ### State file `/run/dnf-automatic-reboot.state`
 

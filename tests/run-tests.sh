@@ -771,6 +771,21 @@ stub_run_main() {
         printf 'timeout %s\n' "$*" >> "${STUB_LOG}"
         return "${STUB_DNF_AUTOMATIC_RC:-0}"
     }
+    run_reboot_check() { return "${STUB_NEEDS_REBOOT_RC:-0}"; }
+    schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
+    restart_stale_services() { printf 'restart_stale_services\n' >> "${STUB_LOG}"; }
+}
+
+test_run_helper_failure_fails_the_run() {
+    load_run_library
+    stub_run_main
+    # A missing or broken helper exits 126 or 127; that is no verdict.
+    export STUB_NEEDS_REBOOT_RC=127
+    local exit_code=0 output
+    output=$( main 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "an unexpected helper status fails the run"
+    assert_not_contains "${output}" "No reboot required" "not reported as a clean result"
+    assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "and does not reboot"
 }
 
 test_run_refused_inhibitor_stops_the_update() {
@@ -1136,6 +1151,25 @@ test_watchdog_hung_reboot_check_is_undecidable() {
     assert_exit_code 2 "$?" "a check that did not finish is undecidable, never a reboot"
     assert_contains "$(cat "${STUB_LOG}")" "360s ${TEST_ROOT_DIR}/usr/libexec/dnf-automatic-reboot/needs-reboot.sh" \
         "bounded at three needs-restarting timeouts"
+}
+
+test_watchdog_helper_failure_is_not_no_reboot() {
+    sleep 60 &
+    local background_pid=$! exit_code=0 output
+    load_watchdog_library
+    # Past the soft timeout in phase=checking with dnf idle: the watchdog runs
+    # its own check.  Everything that reaches the host is stubbed.
+    write_watchdog_state checking 70 "${background_pid}"
+    pgrep() { return 1; }
+    ss() { :; }
+    kill_service_cgroup() { printf 'kill_service_cgroup\n' >> "${STUB_LOG}"; }
+    schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
+    run_independent_reboot_check() { return 127; }
+    output=$( main 2>&1 ) || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "an unexpected helper status fails the watchdog"
+    assert_not_contains "${output}" "no reboot needed" "not reported as a clean result"
+    assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "and does not reboot"
 }
 
 test_watchdog_unit_has_a_start_timeout() {
@@ -1540,6 +1574,7 @@ run_test "decision: temporary file failure removes nothing" test_decision_tempor
 printf 'run\n'
 run_test "run: refused inhibitor stops the update"   test_run_refused_inhibitor_stops_the_update
 run_test "run: update runs inside the inhibitor"     test_run_update_runs_inside_the_inhibitor
+run_test "run: helper failure fails the run"        test_run_helper_failure_fails_the_run
 
 printf 'repositories\n'
 run_test "repositories: unsigned enabled repo is reported"  test_repositories_unsigned_enabled_is_reported
@@ -1578,6 +1613,7 @@ run_test "watchdog: hard timeout while checking reboots"         test_watchdog_h
 run_test "watchdog: prefers orderly reboot"          test_watchdog_prefers_orderly_reboot          needs-exec
 run_test "watchdog: kill option follows systemd version" test_watchdog_kill_option_follows_systemd_version
 run_test "watchdog: hung reboot check is undecidable" test_watchdog_hung_reboot_check_is_undecidable
+run_test "watchdog: helper failure is not no-reboot" test_watchdog_helper_failure_is_not_no_reboot
 run_test "watchdog: unit has a start timeout"        test_watchdog_unit_has_a_start_timeout
 run_test "watchdog: reused pid is not the run"        test_watchdog_reused_pid_is_not_the_run       needs-exec
 run_test "watchdog: systemd 239 kills with --kill-who" test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who needs-exec

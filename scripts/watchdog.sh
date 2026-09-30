@@ -335,16 +335,17 @@ main() {
             rm -f "${STATE_FILE}" "${LOCK_FILE}"
 
             case "${needs_reboot_exit_code}" in
+                0)
+                    log "Watchdog: no reboot needed - stuck run killed"
+                    ;;
                 1)
                     schedule_reboot || true
                     ;;
-                2)
-                    log_err "Watchdog: reboot state could not be established - killed the stuck run, not rebooting"
+                *)
+                    log_err "Watchdog: needs-reboot.sh exited ${needs_reboot_exit_code}: reboot state could not be established - killed the stuck run, not rebooting"
                     wall_msg "dnf-automatic-reboot: Watchdog killed a stuck check but could not" \
                              "determine whether a reboot is needed. Manual inspection required."
-                    ;;
-                *)
-                    log "Watchdog: no reboot needed - stuck run killed"
+                    exit 1
                     ;;
             esac
 
