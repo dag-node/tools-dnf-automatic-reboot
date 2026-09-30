@@ -173,6 +173,13 @@ themselves where the temporary tree is mounted `noexec`.
 `TMPDIR=<exec-capable dir> make test` runs them. The suite does not need root
 and writes only inside its temporary tree.
 
+`.github/workflows/ci.yml` runs `make lint` with a pinned ShellCheck on the runner,
+then `.github/scripts/build-in-container.sh` in `rockylinux:8` and `rockylinux:9`:
+`make dist` (the suite, including the `needs-exec` tests), `rpmbuild -ba` with a
+`0.<run>.git<sha>` snapshot Release, a normal install that the `%pre` gate must refuse,
+and a scriptlet-free install that must resolve every dependency and pass `rpm -V`. It
+uploads the RPMs as artifacts; it does not sign or publish anything.
+
 New tests belong on decisions that are dangerous to get wrong — parsing that
 could invent a package name, verification that could skip a needed reboot, a
 watchdog path that could reboot a host mid-transaction — not on line coverage.

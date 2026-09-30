@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+name: CI
+
+# Lints, builds and tests the package in the EL8 and EL9 toolchains and uploads
+# the RPMs as workflow artifacts.  Nothing is signed or published: builds carry a
+# snapshot Release (0.<run>.git<sha>) that a later 1.4.0-1 upgrades in place.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The EL containers do not ship ShellCheck, and make lint skips it where it is
+  # missing, so it runs here at a pinned version.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install ShellCheck 0.10.0
+        run: |
+          curl -fsSL https://github.com/koalaman/shellcheck/releases/download/v0.10.0/shellcheck-v0.10.0.linux.x86_64.tar.xz | tar -xJ
+          sudo install shellcheck-v0.10.0/shellcheck /usr/local/bin/shellcheck
+
+      - name: make lint
+        run: make lint
+
+      - name: Lint the CI scripts
+        run: shellcheck -S warning .github/scripts/*.sh
+
+  build-test:
+    name: build-test (el${{ matrix.el }})
+    # Pinned, as in the other DagNode pipelines: the podman/crun pair on the
+    # floating latest image can reject the OCI spec at container create.
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        el: ["8", "9"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The runner's podman defaults to a crun too old for the runtime spec it
+      # generates; the same runner ships a current runc, made the default here.
+      - name: Ensure podman, force the runc runtime, and report it
+        run: |
+          command -v podman >/dev/null || { sudo apt-get update && sudo apt-get install -y podman; }
+          sudo mkdir -p /etc/containers/containers.conf.d
+          printf '[engine]\nruntime = "runc"\n' | sudo tee /etc/containers/containers.conf.d/10-runc.conf
+          sudo podman version || true
+          sudo podman info --format 'runtime={{.Host.OCIRuntime.Name}} {{.Host.OCIRuntime.Version}}' 2>/dev/null || true
+
+      - name: Compute the snapshot Release
+        id: release
+        run: echo "rpm_release=0.${{ github.run_number }}.git$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build, test and install-check in rockylinux:${{ matrix.el }}
+        env:
+          EL: ${{ matrix.el }}
+          RPM_RELEASE: ${{ steps.release.outputs.rpm_release }}
+        run: |
+          sudo podman run --rm -v "${PWD}:/src" -w /src -e EL -e RPM_RELEASE \
+            "quay.io/rockylinux/rockylinux:${EL}" bash /src/.github/scripts/build-in-container.sh
+
+      - name: Upload the RPMs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dnf-automatic-reboot-el${{ matrix.el }}-${{ steps.release.outputs.rpm_release }}
+          path: |
+            rpmbuild/RPMS/noarch/*.rpm
+            rpmbuild/SRPMS/*.rpm
+          if-no-files-found: error
+          retention-days: 30
