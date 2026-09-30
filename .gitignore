@@ -3,3 +3,4 @@
 *.rpm
 *.tar.gz
 .rpmbuild/
+/rpmbuild/

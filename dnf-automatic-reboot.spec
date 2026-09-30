@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 Name:           dnf-automatic-reboot
 Version:        1.4.0
-Release:        1%{?dist}
+# Plain "1" for a release; CI passes --define "rpm_release 0.<run>.git<sha>"
+# for a snapshot build.  The leading "0." makes rpm rank the release above
+# every snapshot that preceded it, so a trial build upgrades to it in place.
+Release:        %{!?rpm_release:1}%{?rpm_release}%{?dist}
 Summary:        Unattended update and conditional reboot for EL8 and EL9
 
 License:        GPL-2.0-or-later
