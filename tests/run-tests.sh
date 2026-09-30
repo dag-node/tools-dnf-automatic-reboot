@@ -773,6 +773,21 @@ test_advisories_disabled_by_config() {
     assert_equals "" "$(warn_on_unapplied_security_advisories 2>&1)" "silent when disabled"
 }
 
+test_services_template_units_are_excluded_by_glob() {
+    load_run_library
+    # Restarting these ends a user's services and sessions, or logs out a
+    # console; needs-restarting -s reports them like any other unit.
+    local unit_name
+    for unit_name in user@1000.service getty@tty1.service serial-getty@ttyS0.service \
+                     autovt@tty2.service dbus-broker.service dnf-automatic-reboot.service; do
+        is_excluded_unit "${unit_name}" || fail "${unit_name} must be excluded by the default list"
+    done
+    for unit_name in sshd.service nginx.service user-runtime-dir@1000.service; do
+        is_excluded_unit "${unit_name}" && fail "${unit_name} must not be excluded"
+    done
+    return 0
+}
+
 test_services_disabled_by_config() {
     load_run_library
     RESTART_SERVICES=no
@@ -967,6 +982,7 @@ run_test "advisories: disabled by config"                 test_advisories_disabl
 printf 'services\n'
 run_test "services: excluded units are not restarted" test_services_excluded_units_are_not_restarted needs-exec
 run_test "services: disabled by config"              test_services_disabled_by_config
+run_test "services: template units excluded by glob" test_services_template_units_are_excluded_by_glob
 
 printf 'watchdog\n'
 run_test "watchdog: no state file is a noop"         test_watchdog_no_state_file_is_a_noop

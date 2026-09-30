@@ -199,7 +199,7 @@ WARN_UNSIGNED_REPOSITORIES=$(conf_get warn_unsigned_repositories yes)
 WARN_UNAPPLIED_ADVISORIES=$(conf_get warn_unapplied_advisories yes)
 RESTART_SERVICES=$(conf_get restart_services yes)
 RESTART_SERVICES_EXCLUDE=$(conf_get restart_services_exclude \
-    "dbus.service,dbus-broker.service,systemd-logind.service,dnf-automatic-reboot.service,dnf-automatic-watchdog.service")
+    "dbus.service,dbus-broker.service,systemd-logind.service,user@*.service,getty@*.service,serial-getty@*.service,autovt@*.service,dnf-automatic-reboot.service,dnf-automatic-watchdog.service")
 NEEDS_RESTARTING_TIMEOUT_SEC=$(conf_get_int needs_restarting_timeout_sec 120)
 
 # ---------------------------------------------------------------------------
@@ -246,19 +246,34 @@ uptime_seconds() {
 #
 # Only reached when no reboot is scheduled - a reboot supersedes it.
 # ---------------------------------------------------------------------------
+# is_excluded_unit UNIT_NAME - succeeds when UNIT_NAME matches an entry of
+# restart_services_exclude.  An entry is a unit name or a bash glob such as
+# user@*.service, which covers every instance of a template unit.
+is_excluded_unit() {
+    local unit_name="$1" excluded_unit_pattern previous_ifs
+    local excluded_unit_patterns=()
+    previous_ifs="${IFS}"
+    IFS=',' read -ra excluded_unit_patterns <<< "${RESTART_SERVICES_EXCLUDE}"
+    IFS="${previous_ifs}"
+    for excluded_unit_pattern in "${excluded_unit_patterns[@]:-}"; do
+        excluded_unit_pattern="${excluded_unit_pattern//[[:space:]]/}"
+        [[ -n "${excluded_unit_pattern}" ]] || continue
+        # shellcheck disable=SC2053  # the entry is a glob by design
+        if [[ "${unit_name}" == ${excluded_unit_pattern} ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 restart_stale_services() {
-    local stale_service_output stale_service_name excluded_unit_name
+    local stale_service_output stale_service_name
     local restarted_service_names=() skipped_service_names=()
-    local previous_ifs excluded_unit_names
 
     if [[ "${RESTART_SERVICES}" != "yes" ]]; then
         log "restart_services=no - not restarting stale services"
         return 0
     fi
-
-    previous_ifs="${IFS}"
-    IFS=',' read -ra excluded_unit_names <<< "${RESTART_SERVICES_EXCLUDE}"
-    IFS="${previous_ifs}"
 
     stale_service_output=""
     if ! stale_service_output=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
@@ -272,13 +287,10 @@ restart_stale_services() {
         [[ -n "${stale_service_name}" ]] || continue
         [[ "${stale_service_name}" == *.service ]] || continue
 
-        for excluded_unit_name in "${excluded_unit_names[@]:-}"; do
-            excluded_unit_name="${excluded_unit_name//[[:space:]]/}"
-            if [[ -n "${excluded_unit_name}" && "${excluded_unit_name}" == "${stale_service_name}" ]]; then
-                skipped_service_names+=("${stale_service_name}")
-                continue 2
-            fi
-        done
+        if is_excluded_unit "${stale_service_name}"; then
+            skipped_service_names+=("${stale_service_name}")
+            continue
+        fi
 
         if "${SYSTEMCTL_BIN}" try-restart "${stale_service_name}" 2>/dev/null; then
             restarted_service_names+=("${stale_service_name}")
