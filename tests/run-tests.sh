@@ -359,7 +359,6 @@ test_config_every_key_resolves() {
                       dnf_timeout_min kill_grace_sec restart_services \
                       restart_services_exclude watchdog_soft_timeout_min \
                       watchdog_hard_timeout_min force_reboot_on_hard_timeout \
-                      manage_kernel_default kernel_default_package \
                       enable_chrony_wait wall_messages; do
         resolved_value=$(conf_get "${config_key}" "MISSING")
         if [[ "${resolved_value}" == "MISSING" ]]; then

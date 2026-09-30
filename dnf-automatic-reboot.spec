@@ -25,10 +25,11 @@ Requires:       systemd >= 239
 Requires:       util-linux
 # eu-readelf for systemd build-id comparison (false-positive detection)
 Requires:       elfutils
-# grubby + grub2-set-bootflag for the UEK GRUB BLS default fix (UEK hosts only;
-# the %%post logic degrades gracefully if either is somehow absent)
+# grubby reads and sets the GRUB BLS default: needs-reboot.sh verifies it
+# before a kernel reboot, %%post repairs it on UEK, and %%pre refuses a host
+# where it does not answer - hence also Requires(pre).
 Requires:       grubby
-Requires:       grub2-tools-minimal
+Requires(pre):  grubby
 # logrotate consumes the drop-in in %%{_sysconfdir}/logrotate.d; without it
 # /var/log/dnf-automatic-reboot.log grows without bound
 Requires:       logrotate
@@ -92,7 +93,6 @@ install -m 0644 units/dnf-automatic-reboot.timer            %{buildroot}%{_unitd
 install -m 0644 units/dnf-automatic-watchdog.service        %{buildroot}%{_unitdir}/
 install -m 0644 units/dnf-automatic-watchdog.timer          %{buildroot}%{_unitdir}/
 install -m 0644 units/dnf-automatic-reboot-notify@.service %{buildroot}%{_unitdir}/
-install -m 0644 units/grub-boot-success.service             %{buildroot}%{_unitdir}/
 
 # Config file - noreplace preserves local edits on upgrade
 install -d -m 0755 %{buildroot}%{_sysconfdir}/dnf
@@ -378,9 +378,8 @@ arc_conf_get() {
 # makes the ordering mean anything.
 #
 # Enabling another package's unit cannot be expressed as a preset of ours, so
-# this is a second deliberate exception to the macro-only scriptlet rule (see
-# grub-boot-success.service below for the first).  Never disabled on erase:
-# a synchronised clock is not this package's to take away.
+# this is the one deliberate exception to the macro-only scriptlet rule.  Never
+# disabled on erase: a synchronised clock is not this package's to take away.
 # ---------------------------------------------------------------------------
 ARC_CHRONY_WAIT=$(arc_conf_get enable_chrony_wait yes)
 if [ "${ARC_CHRONY_WAIT}" = "yes" ] \
@@ -389,79 +388,6 @@ if [ "${ARC_CHRONY_WAIT}" = "yes" ] \
     if systemctl --no-reload enable chrony-wait.service >/dev/null 2>&1; then
         echo "dnf-automatic-reboot: enabled chrony-wait.service - time-sync.target now waits for real clock sync"
     fi
-fi
-
-# ---------------------------------------------------------------------------
-# UEK GRUB BLS default provisioning (one-time, idempotent; no-op off UEK).
-# On OL9 UEK hosts kernel-install does not advance the GRUB saved_entry by
-# default, so a newly installed kernel-uek-core is not booted after reboot.
-# Configure DEFAULTKERNEL + GRUB_UPDATE_DEFAULT_KERNEL so every future kernel
-# update advances saved_entry automatically, repair the current backlog with
-# grubby, and enable the boot-success safeguard.  Gated on the running kernel
-# package so non-UEK kernels are never touched.  Behaviour is controlled by
-# the [kernel] section of /etc/dnf/automatic-reboot.conf (read below).
-# ---------------------------------------------------------------------------
-ARC_MANAGE=$(arc_conf_get manage_kernel_default yes)
-ARC_KPKG=$(arc_conf_get kernel_default_package kernel-uek-core)
-
-ARC_RUNPKG=""
-ARC_VMLINUZ="/lib/modules/$(uname -r)/vmlinuz"
-if [ -e "${ARC_VMLINUZ}" ]; then
-    ARC_RUNPKG=$(rpm -qf "${ARC_VMLINUZ}" --qf '%%{NAME}\n' 2>/dev/null | head -1) || true
-fi
-
-if [ "${ARC_MANAGE}" = "yes" ] && [ "${ARC_RUNPKG}" = "${ARC_KPKG}" ]; then
-    echo "dnf-automatic-reboot: configuring GRUB BLS default for ${ARC_KPKG}"
-
-    # 1. DEFAULTKERNEL in /etc/sysconfig/kernel
-    SK=/etc/sysconfig/kernel
-    if [ -f "${SK}" ] && grep -qE "^DEFAULTKERNEL=${ARC_KPKG}\$" "${SK}"; then
-        :
-    elif [ -f "${SK}" ] && grep -qE '^DEFAULTKERNEL=' "${SK}"; then
-        sed -i "s/^DEFAULTKERNEL=.*/DEFAULTKERNEL=${ARC_KPKG}/" "${SK}"
-    elif [ -f "${SK}" ]; then
-        printf 'DEFAULTKERNEL=%s\n' "${ARC_KPKG}" >> "${SK}"
-    else
-        printf 'DEFAULTKERNEL=%s\n' "${ARC_KPKG}" > "${SK}"
-        chmod 0644 "${SK}"
-    fi
-
-    # 2. GRUB_UPDATE_DEFAULT_KERNEL in /etc/default/grub
-    DG=/etc/default/grub
-    if [ -f "${DG}" ] && grep -qE '^GRUB_UPDATE_DEFAULT_KERNEL=' "${DG}"; then
-        if ! grep -qE '^GRUB_UPDATE_DEFAULT_KERNEL="?true"?[[:space:]]*$' "${DG}"; then
-            sed -i 's/^GRUB_UPDATE_DEFAULT_KERNEL=.*/GRUB_UPDATE_DEFAULT_KERNEL="true"/' "${DG}"
-        fi
-    else
-        printf 'GRUB_UPDATE_DEFAULT_KERNEL="true"\n' >> "${DG}"
-    fi
-
-    # 3. Backlog repair: point the default at the newest installed kernel
-    if command -v grubby >/dev/null 2>&1; then
-        ARC_EVR=$(rpm -q "${ARC_KPKG}" --qf '%%{VERSION}-%%{RELEASE}.%%{ARCH}\n' 2>/dev/null \
-                  | sort -V | tail -1) || true
-        if [ -n "${ARC_EVR}" ] && [ -e "/boot/vmlinuz-${ARC_EVR}" ]; then
-            ARC_CUR=$(grubby --default-kernel 2>/dev/null) || true
-            if [ "${ARC_CUR}" != "/boot/vmlinuz-${ARC_EVR}" ]; then
-                if grubby --set-default "/boot/vmlinuz-${ARC_EVR}" >/dev/null 2>&1; then
-                    echo "dnf-automatic-reboot: GRUB default set to /boot/vmlinuz-${ARC_EVR}"
-                fi
-            fi
-        fi
-    fi
-
-    # /etc/sysconfig/kernel may have been created; restore its SELinux label
-    if [ -x /sbin/restorecon ]; then
-        restorecon "${SK}" >/dev/null 2>&1 || true
-    fi
-
-    # 4. Enable the boot-success safeguard on UEK only.  Conditional (per-host)
-    #    enablement cannot be expressed via systemd presets, so this is a
-    #    deliberate, narrow exception to the macro-only scriptlet rule.  The
-    #    unit also carries ConditionKernelVersion=*uek* so it stays inert even
-    #    if it is ever enabled on a non-UEK host.
-    systemctl --no-reload enable grub-boot-success.service >/dev/null 2>&1 || true
-    systemctl start grub-boot-success.service >/dev/null 2>&1 || true
 fi
 
 echo ""
@@ -477,15 +403,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %systemd_preun dnf-automatic-reboot.timer
 %systemd_preun dnf-automatic-watchdog.service
 %systemd_preun dnf-automatic-watchdog.timer
-
-# grub-boot-success.service is enabled directly (not via preset) on UEK hosts,
-# so disable it directly on final uninstall.  No-op if it was never enabled.
 # chrony-wait.service is deliberately left enabled: it belongs to chrony and a
 # synchronised clock is not this package's to remove.
-if [ $1 -eq 0 ]; then
-    systemctl --no-reload disable grub-boot-success.service >/dev/null 2>&1 || true
-    systemctl stop grub-boot-success.service >/dev/null 2>&1 || true
-fi
 
 %postun
 %systemd_postun_with_restart dnf-automatic-reboot.timer
@@ -511,9 +430,6 @@ fi
 %{_unitdir}/dnf-automatic-watchdog.timer
 # Failure notifier, instantiated by OnFailure= with the failed unit name
 %{_unitdir}/dnf-automatic-reboot-notify@.service
-# Boot-success safeguard - shipped on all hosts (noarch) but only enabled on
-# UEK by %%post; ConditionKernelVersion=*uek* keeps it inert elsewhere.
-%{_unitdir}/grub-boot-success.service
 
 # Config - preserved across upgrades; root:root 640 (no world read for safety)
 %config(noreplace) %attr(0640, root, root) %{_sysconfdir}/dnf/automatic-reboot.conf
