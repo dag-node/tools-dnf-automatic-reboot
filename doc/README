@@ -52,7 +52,7 @@ Files installed
   /usr/lib/systemd/system/dnf-automatic-watchdog.timer
       Watchdog service + 5-minute polling timer.
 
-  /usr/lib/systemd/system/dnf-automatic-reboot-failure@.service
+  /usr/lib/systemd/system/dnf-automatic-reboot-notify@.service
       Instantiated by OnFailure= with the failed unit name, so a failed run
       is never visible only to somebody who thinks to read the journal.
 

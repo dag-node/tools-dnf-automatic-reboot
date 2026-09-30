@@ -91,7 +91,7 @@ install -m 0644 units/dnf-automatic-reboot.service          %{buildroot}%{_unitd
 install -m 0644 units/dnf-automatic-reboot.timer            %{buildroot}%{_unitdir}/
 install -m 0644 units/dnf-automatic-watchdog.service        %{buildroot}%{_unitdir}/
 install -m 0644 units/dnf-automatic-watchdog.timer          %{buildroot}%{_unitdir}/
-install -m 0644 units/dnf-automatic-reboot-failure@.service %{buildroot}%{_unitdir}/
+install -m 0644 units/dnf-automatic-reboot-notify@.service %{buildroot}%{_unitdir}/
 install -m 0644 units/grub-boot-success.service             %{buildroot}%{_unitdir}/
 
 # Config file - noreplace preserves local edits on upgrade
@@ -510,7 +510,7 @@ fi
 %{_unitdir}/dnf-automatic-watchdog.service
 %{_unitdir}/dnf-automatic-watchdog.timer
 # Failure notifier, instantiated by OnFailure= with the failed unit name
-%{_unitdir}/dnf-automatic-reboot-failure@.service
+%{_unitdir}/dnf-automatic-reboot-notify@.service
 # Boot-success safeguard - shipped on all hosts (noarch) but only enabled on
 # UEK by %%post; ConditionKernelVersion=*uek* keeps it inert elsewhere.
 %{_unitdir}/grub-boot-success.service

@@ -23,7 +23,7 @@ dnf-automatic-reboot/
     dnf-automatic-reboot.timer      Daily timer (03:00 +/- 10 min)
     dnf-automatic-watchdog.service  Oneshot watchdog service
     dnf-automatic-watchdog.timer    5-minute polling timer
-    dnf-automatic-reboot-failure@.service   Failure notifier, instantiated by OnFailure=
+    dnf-automatic-reboot-notify@.service   Failure notifier, instantiated by OnFailure=
     grub-boot-success.service       UEK-only boot_success marker (BLS fallback guard)
   tmpfiles/
     dnf-automatic-reboot.conf       Log and state path modes and SELinux labels

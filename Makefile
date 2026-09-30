@@ -21,7 +21,7 @@ UNITS   = units/dnf-automatic-reboot.service \
           units/dnf-automatic-reboot.timer \
           units/dnf-automatic-watchdog.service \
           units/dnf-automatic-watchdog.timer \
-          units/dnf-automatic-reboot-failure@.service \
+          units/dnf-automatic-reboot-notify@.service \
           units/grub-boot-success.service
 CONF      = conf/automatic-reboot.conf
 TMPFILES  = tmpfiles/$(NAME).conf
@@ -78,7 +78,7 @@ uninstall:
 	rm -f  $(DESTDIR)$(UNITDIR)/dnf-automatic-reboot.timer
 	rm -f  $(DESTDIR)$(UNITDIR)/dnf-automatic-watchdog.service
 	rm -f  $(DESTDIR)$(UNITDIR)/dnf-automatic-watchdog.timer
-	rm -f  $(DESTDIR)$(UNITDIR)/dnf-automatic-reboot-failure@.service
+	rm -f  $(DESTDIR)$(UNITDIR)/dnf-automatic-reboot-notify@.service
 	rm -f  $(DESTDIR)$(UNITDIR)/grub-boot-success.service
 	rm -f  $(DESTDIR)$(TMPFILESDIR)/$(NAME).conf
 	rm -f  $(DESTDIR)$(LOGROTATEDIR)/$(NAME)

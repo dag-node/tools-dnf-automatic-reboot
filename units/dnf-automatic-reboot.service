@@ -17,7 +17,7 @@ Requires=time-sync.target
 # Prevent a second instance starting if one is already running.
 ConditionPathExists=!/run/dnf-automatic-reboot.lock
 # A failed run is otherwise visible only in the journal; %n names the unit.
-OnFailure=dnf-automatic-reboot-failure@%n.service
+OnFailure=dnf-automatic-reboot-notify@%n.service
 
 [Service]
 Type=oneshot

@@ -3,7 +3,7 @@ Description=dnf-automatic-reboot watchdog check
 Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
 # Intentionally has no After= dependency on the main service so it runs
 # independently even when the main service is hung.
-OnFailure=dnf-automatic-reboot-failure@%n.service
+OnFailure=dnf-automatic-reboot-notify@%n.service
 
 [Service]
 Type=oneshot

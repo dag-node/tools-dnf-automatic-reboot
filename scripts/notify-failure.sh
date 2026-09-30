@@ -10,7 +10,7 @@
 # no operator-facing signal at all.
 #
 # Argument 1 is the name of the unit that failed, passed as %I from the
-# templated dnf-automatic-reboot-failure@.service.
+# templated dnf-automatic-reboot-notify@.service.
 #
 # Configuration: /etc/dnf/automatic-reboot.conf
 # Log:           /var/log/dnf-automatic-reboot.log
