@@ -320,11 +320,14 @@ warn_on_unapplied_security_advisories() {
 
     [[ "${WARN_UNAPPLIED_ADVISORIES}" == "yes" ]] || return 0
 
-    # Advisory IDs are matched by shape (PREFIX-YEAR-NUMBER), not by excluding
-    # header text, so nothing unexpected in the output becomes an "advisory".
+    # Advisory IDs are matched by shape, PREFIX-YEAR-NUMBER or PREFIX-YEAR:NUMBER
+    # with an optional `-REVISION`, the prefix one or more dash-joined words and
+    # the number alphanumeric (Oracle ELSA-2026-26533 and ELSA-2026-60226-0,
+    # Red Hat RHSA-2020:3011, EPEL FEDORA-EPEL-2024-bf31852fe0), not by excluding
+    # header text, so a line of any other shape is not reported as an advisory.
     pending_advisory_ids=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
         "${DNF_BIN}" -q -C updateinfo list --updates --security 2>/dev/null \
-        | awk 'NF >= 3 && $1 ~ /^[A-Za-z]+-[0-9]+-[0-9]+$/ { print $1 }' \
+        | awk 'NF >= 3 && $1 ~ /^[A-Za-z]+(-[A-Za-z]+)*-[0-9]+[-:][0-9A-Za-z]+(-[0-9]+)?$/ { print $1 }' \
         | sort -u | paste -sd, -) || true
 
     [[ -n "${pending_advisory_ids}" ]] || return 0

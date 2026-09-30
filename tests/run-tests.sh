@@ -707,6 +707,35 @@ ELSA-2025-15874 Moderate/Sec.  python3-cryptography-36.0.1-5.el9_6.aarch64"
     assert_contains "${reported}" "will not install" "reported at error level"
 }
 
+test_advisories_red_hat_colon_ids_are_matched() {
+    load_run_library
+    # Red Hat's id shape, as listed on a RHEL 8 host.  A dash-only pattern
+    # matched none of these, so the warning never fired on RHEL.
+    export STUB_SECURITY_ADVISORIES="RHSA-2020:3011              Moderate/Sec.  NetworkManager-1:1.22.8-5.el8_2.x86_64"
+    export STUB_CHECK_UPDATE_RC=0
+    assert_contains "$(warn_on_unapplied_security_advisories 2>&1)" "RHSA-2020:3011" \
+        "a colon-separated advisory id is reported"
+}
+
+test_advisories_oracle_revision_suffix_is_matched() {
+    load_run_library
+    # Oracle's id with a revision suffix, as listed on an OL9 host.
+    export STUB_SECURITY_ADVISORIES="ELSA-2026-60226-0 Moderate/Sec.  attr-2.6.0-1.el9_8.aarch64"
+    export STUB_CHECK_UPDATE_RC=0
+    assert_contains "$(warn_on_unapplied_security_advisories 2>&1)" "ELSA-2026-60226-0" \
+        "an advisory id with a revision suffix is reported"
+}
+
+test_advisories_epel_ids_are_matched() {
+    load_run_library
+    # EPEL's id form: dash-joined prefix, hexadecimal number; listed with the
+    # leading spaces an updateinfo line for a pending advisory carries.
+    export STUB_SECURITY_ADVISORIES="  FEDORA-EPEL-2024-bf31852fe0 Moderate/Sec.  w3m-0.5.3-63.git20230121.el8.x86_64"
+    export STUB_CHECK_UPDATE_RC=0
+    assert_contains "$(warn_on_unapplied_security_advisories 2>&1)" "FEDORA-EPEL-2024-bf31852fe0" \
+        "an EPEL advisory id is reported"
+}
+
 test_advisories_still_pending_is_only_a_warning() {
     load_run_library
     export STUB_SECURITY_ADVISORIES="ELSA-2026-26533 Important/Sec. dracut-057-115.el9_8.aarch64"
@@ -927,6 +956,9 @@ run_test "repositories: all signed is silent"               test_repositories_al
 
 printf 'advisories\n'
 run_test "advisories: unappliable advisory is an error"   test_advisories_unappliable_is_an_error        needs-exec
+run_test "advisories: red hat colon ids are matched"      test_advisories_red_hat_colon_ids_are_matched  needs-exec
+run_test "advisories: oracle revision suffix is matched" test_advisories_oracle_revision_suffix_is_matched needs-exec
+run_test "advisories: epel ids are matched"               test_advisories_epel_ids_are_matched          needs-exec
 run_test "advisories: still pending is only a warning"    test_advisories_still_pending_is_only_a_warning needs-exec
 run_test "advisories: none is silent"                     test_advisories_none_is_silent                 needs-exec
 run_test "advisories: ignores non-advisory lines"         test_advisories_ignores_non_advisory_lines     needs-exec
