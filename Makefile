@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 NAME    = dnf-automatic-reboot
-VERSION = 1.3
+VERSION = 1.4.0
 TARBALL = $(NAME)-$(VERSION).tar.gz
 
 # /usr/libexec, not /usr/local/lib: /usr/local is reserved for the local
