@@ -48,7 +48,8 @@ readonly STATE_DIRECTORY="${TEST_ROOT}/var/lib/dnf-automatic-reboot"
 readonly RESTART_STATE_FILE="${STATE_DIRECTORY}/restart-state"
 readonly KERNEL_REBOOT_ATTEMPT_FILE="${STATE_DIRECTORY}/kernel-reboot-attempts"
 readonly STATE_LOCK_FILE="${STATE_DIRECTORY}/.state.lock"
-readonly BOOT_ID_FILE="${TEST_ROOT}/proc/sys/kernel/random/boot_id"
+readonly PROC_DIRECTORY="${TEST_ROOT}/proc"
+readonly BOOT_ID_FILE="${PROC_DIRECTORY}/sys/kernel/random/boot_id"
 readonly DNF_BIN="${TEST_ROOT}/usr/bin/dnf"
 
 # ---------------------------------------------------------------------------
@@ -205,28 +206,31 @@ parse_flagged_package_names() {
 # ---------------------------------------------------------------------------
 # Process/binary ownership map, built once and only when needed.
 #
-# Deduplicating /proc/*/exe targets before querying rpm keeps this to one
-# rpm -qf per distinct binary instead of one per process.
+# Every PID is kept per binary: one binary can run as several processes on
+# different images - PID 1 re-execs onto the new systemd while each
+# `systemd --user` manager keeps the old one - so a single sample per binary
+# can clear a package that still has stale code resident.  Only the rpm
+# query is deduplicated, to one `rpm -qf` per distinct binary.
 # ---------------------------------------------------------------------------
 # -g so the arrays stay script-global even when this file is sourced from
 # inside a function, as tests/run-tests.sh does.
-declare -gA PROCESS_BINARY_TO_PID=()
+# PROCESS_BINARY_TO_PIDS values are newline-separated PID lists.
+declare -gA PROCESS_BINARY_TO_PIDS=()
 declare -gA PROCESS_BINARY_TO_PACKAGE=()
 PROCESS_MAP_BUILT=0
 
 build_process_binary_map() {
     [[ "${PROCESS_MAP_BUILT}" -eq 1 ]] && return 0
     local process_exe_link process_id binary_path owning_package_name
-    for process_exe_link in /proc/[0-9]*/exe; do
-        process_id="${process_exe_link#/proc/}"
+    for process_exe_link in "${PROC_DIRECTORY}"/[0-9]*/exe; do
+        process_id="${process_exe_link#"${PROC_DIRECTORY}/"}"
         process_id="${process_id%/exe}"
         binary_path=$(readlink "${process_exe_link}" 2>/dev/null) || continue
         binary_path="${binary_path% (deleted)}"
         [[ -f "${binary_path}" ]] || continue
-        [[ -n "${PROCESS_BINARY_TO_PID[${binary_path}]:-}" ]] && continue
-        PROCESS_BINARY_TO_PID["${binary_path}"]="${process_id}"
+        PROCESS_BINARY_TO_PIDS["${binary_path}"]+="${process_id}"$'\n'
     done
-    for binary_path in "${!PROCESS_BINARY_TO_PID[@]}"; do
+    for binary_path in "${!PROCESS_BINARY_TO_PIDS[@]}"; do
         owning_package_name=$(rpm -qf "${binary_path}" --qf '%{NAME}' 2>/dev/null) || owning_package_name=""
         PROCESS_BINARY_TO_PACKAGE["${binary_path}"]="${owning_package_name}"
     done
@@ -252,21 +256,23 @@ verify_build_id() {
 
     for binary_path in "${!PROCESS_BINARY_TO_PACKAGE[@]}"; do
         [[ "${PROCESS_BINARY_TO_PACKAGE[${binary_path}]}" == "${package_name}" ]] || continue
-        process_id="${PROCESS_BINARY_TO_PID[${binary_path}]}"
-        running_build_id=$(eu-readelf -n "/proc/${process_id}/exe" 2>/dev/null \
-                           | awk '/Build ID/ {print $NF}') || true
         on_disk_build_id=$(eu-readelf -n "${binary_path}" 2>/dev/null \
                            | awk '/Build ID/ {print $NF}') || true
-        if [[ -z "${running_build_id}" || -z "${on_disk_build_id}" ]]; then
-            log_warn "${package_name}: could not read build-ids for ${binary_path} (pid ${process_id})"
-            unreadable_build_id=1
-            continue
-        fi
-        verified_process_count=$(( verified_process_count + 1 ))
-        if [[ "${running_build_id}" != "${on_disk_build_id}" ]]; then
-            log "${package_name} genuine: build-id mismatch on ${binary_path} (pid ${process_id})"
-            return 2
-        fi
+        while IFS= read -r process_id; do
+            [[ -n "${process_id}" ]] || continue
+            running_build_id=$(eu-readelf -n "${PROC_DIRECTORY}/${process_id}/exe" 2>/dev/null \
+                               | awk '/Build ID/ {print $NF}') || true
+            if [[ -z "${running_build_id}" || -z "${on_disk_build_id}" ]]; then
+                log_warn "${package_name}: could not read build-ids for ${binary_path} (pid ${process_id})"
+                unreadable_build_id=1
+                continue
+            fi
+            verified_process_count=$(( verified_process_count + 1 ))
+            if [[ "${running_build_id}" != "${on_disk_build_id}" ]]; then
+                log "${package_name} genuine: build-id mismatch on ${binary_path} (pid ${process_id})"
+                return 2
+            fi
+        done <<< "${PROCESS_BINARY_TO_PIDS[${binary_path}]:-}"
     done
 
     if [[ "${verified_process_count}" -eq 0 ]]; then

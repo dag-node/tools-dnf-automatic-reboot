@@ -452,10 +452,10 @@ test_grub_unavailable_is_undetermined() {
 test_build_id_all_processes_match() {
     load_needs_reboot_library
     PROCESS_MAP_BUILT=1
-    PROCESS_BINARY_TO_PID=( ["/usr/lib/systemd/systemd"]=1 )
+    PROCESS_BINARY_TO_PIDS=( ["/usr/lib/systemd/systemd"]=$'1\n' )
     PROCESS_BINARY_TO_PACKAGE=( ["/usr/lib/systemd/systemd"]="systemd" )
     export STUB_BUILD_IDS="/usr/lib/systemd/systemd	aaaa
-/proc/1/exe	aaaa"
+${TEST_ROOT_DIR}/proc/1/exe	aaaa"
     verify_build_id systemd >/dev/null 2>&1
     assert_exit_code 0 "$?" "matching build-ids are a false positive"
 }
@@ -465,20 +465,39 @@ test_build_id_mismatch_on_later_process_wins() {
     PROCESS_MAP_BUILT=1
     # PID 1 re-execs itself on upgrade and always matches; journald does not.
     # Stopping at the first match would call this a false positive.
-    PROCESS_BINARY_TO_PID=( ["/usr/lib/systemd/systemd"]=1 ["/usr/lib/systemd/systemd-journald"]=742 )
+    PROCESS_BINARY_TO_PIDS=( ["/usr/lib/systemd/systemd"]=$'1\n' ["/usr/lib/systemd/systemd-journald"]=$'742\n' )
     PROCESS_BINARY_TO_PACKAGE=( ["/usr/lib/systemd/systemd"]="systemd" ["/usr/lib/systemd/systemd-journald"]="systemd" )
     export STUB_BUILD_IDS="/usr/lib/systemd/systemd	aaaa
-/proc/1/exe	aaaa
+${TEST_ROOT_DIR}/proc/1/exe	aaaa
 /usr/lib/systemd/systemd-journald	bbbb
-/proc/742/exe	cccc"
+${TEST_ROOT_DIR}/proc/742/exe	cccc"
     verify_build_id systemd >/dev/null 2>&1
     assert_exit_code 2 "$?" "a stale journald must make the package genuine"
+}
+
+test_build_id_stale_process_sharing_a_binary_is_found() {
+    load_needs_reboot_library
+    export STUB_RPM_OWNER="systemd"
+    # Built from a fake /proc rather than injected, so the map itself is under
+    # test.  PID 1 re-exec'd onto the new systemd; the `systemd --user` manager
+    # at PID 2345 runs the same path, still on the replaced image.  Keeping one
+    # PID per binary saw only PID 1 and called the package a false positive.
+    local systemd_binary="${TEST_ROOT_DIR}/usr/lib/systemd/systemd"
+    mkdir -p "${TEST_ROOT_DIR}/usr/lib/systemd" "${TEST_ROOT_DIR}/proc/1" "${TEST_ROOT_DIR}/proc/2345"
+    : > "${systemd_binary}"
+    ln -s "${systemd_binary}" "${TEST_ROOT_DIR}/proc/1/exe"
+    ln -s "${systemd_binary} (deleted)" "${TEST_ROOT_DIR}/proc/2345/exe"
+    export STUB_BUILD_IDS="${systemd_binary}	aaaa
+${TEST_ROOT_DIR}/proc/1/exe	aaaa
+${TEST_ROOT_DIR}/proc/2345/exe	bbbb"
+    verify_build_id systemd >/dev/null 2>&1
+    assert_exit_code 2 "$?" "a stale user manager must make systemd genuine"
 }
 
 test_build_id_no_owned_process_is_unverifiable() {
     load_needs_reboot_library
     PROCESS_MAP_BUILT=1
-    PROCESS_BINARY_TO_PID=()
+    PROCESS_BINARY_TO_PIDS=()
     PROCESS_BINARY_TO_PACKAGE=()
     verify_build_id systemd >/dev/null 2>&1
     assert_exit_code 1 "$?" "no owned process is unverifiable, not a false positive"
@@ -832,6 +851,7 @@ run_test "grub: missing grubby is undetermined"      test_grub_unavailable_is_un
 printf 'buildid\n'
 run_test "buildid: all processes match"              test_build_id_all_processes_match
 run_test "buildid: mismatch on later process wins"   test_build_id_mismatch_on_later_process_wins
+run_test "buildid: stale process sharing a binary is found" test_build_id_stale_process_sharing_a_binary_is_found
 run_test "buildid: no owned process is unverifiable" test_build_id_no_owned_process_is_unverifiable
 
 printf 'state\n'
