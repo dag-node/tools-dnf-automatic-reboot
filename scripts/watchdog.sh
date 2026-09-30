@@ -104,6 +104,7 @@ SOFT_TIMEOUT_MIN=$(conf_get_int watchdog_soft_timeout_min 60)
 HARD_TIMEOUT_MIN=$(conf_get_int watchdog_hard_timeout_min 180)
 REBOOT_DELAY_SEC=$(conf_get_int reboot_delay_sec 60)
 FORCE_REBOOT_ON_HARD_TIMEOUT=$(conf_get force_reboot_on_hard_timeout no)
+KILL_CONFIRM_SEC=$(conf_get_int watchdog_kill_confirm_sec 30)
 NEEDS_RESTARTING_TIMEOUT_SEC=$(conf_get_int needs_restarting_timeout_sec 120)
 
 # ---------------------------------------------------------------------------
@@ -195,14 +196,32 @@ recorded_run_is_unchanged() {
     recorded_pid_identity "${expected_pid}"
 }
 
+# unit_active_state -> the service unit's ActiveState, empty when systemctl
+# does not answer.
+unit_active_state() {
+    "${SYSTEMCTL_BIN}" show --property=ActiveState --value "${MAIN_SERVICE_UNIT}" 2>/dev/null || true
+}
+
+# signal_unit_processes KILL_TARGET_OPTION - SIGKILL to every process of the
+# unit's cgroup.
+signal_unit_processes() {
+    "${SYSTEMCTL_BIN}" kill "$1" --signal=SIGKILL "${MAIN_SERVICE_UNIT}" 2>/dev/null
+}
+
 # kill_service_cgroup PHASE START_UPTIME PID
-# Kills the unit only after recorded_run_is_unchanged confirms it still runs
-# the recorded run.  Otherwise it returns that function's 1 or 2 without
-# signalling any process.  The unit is signalled a moment after the check; no systemctl
-# option ties the kill to one invocation of the unit.
+# Returns: 0 = the recorded run was killed and systemd reports the unit
+#              inactive or failed
+#          1 = the run ended or was replaced; no process signalled
+#          2 = the run's identity cannot be established; no process signalled
+#          3 = the kill failed, or the unit was still active
+#              KILL_CONFIRM_SEC seconds after it: recovery failed
+# The kill targets the unit's cgroup only; the recorded PID is never
+# signalled on its own, since by then its number may belong to another
+# process.  The unit is signalled a moment after the identity check; no
+# systemctl option ties the kill to one invocation of the unit.
 kill_service_cgroup() {
     local recorded_phase="$1" recorded_start_uptime="$2" recorded_pid="$3"
-    local systemd_version kill_target_option run_check_result=0
+    local systemd_version kill_target_option run_check_result=0 active_state="" waited_seconds=0
     recorded_run_is_unchanged "${recorded_phase}" "${recorded_start_uptime}" "${recorded_pid}" \
         || run_check_result=$?
     if [[ "${run_check_result}" -eq 1 ]]; then
@@ -215,18 +234,24 @@ kill_service_cgroup() {
     systemd_version=$("${SYSTEMCTL_BIN}" --version 2>/dev/null \
                       | sed -n '1s/^systemd \([0-9]\+\).*/\1/p') || true
     kill_target_option=$(systemctl_kill_target_option "${systemd_version}")
-    if ! "${SYSTEMCTL_BIN}" kill "${kill_target_option}" --signal=SIGKILL "${MAIN_SERVICE_UNIT}" 2>/dev/null; then
-        log_err "systemctl kill ${kill_target_option} ${MAIN_SERVICE_UNIT} failed - processes of the run may survive"
+    if ! signal_unit_processes "${kill_target_option}"; then
+        log_err "systemctl kill ${kill_target_option} ${MAIN_SERVICE_UNIT} failed - the run may still be running, recovery failed"
+        return 3
     fi
-    sleep 2
-    # The PID was confirmed as the run before the cgroup kill, so a survivor
-    # with that number is the run, not a reused PID.
-    if kill -0 "${recorded_pid}" 2>/dev/null; then
-        log_warn "PID ${recorded_pid} survived the cgroup kill - signalling it directly"
-        kill -KILL "${recorded_pid}" 2>/dev/null || true
+    # A oneshot is activating while its processes run; inactive or failed
+    # means systemd saw the main process die and stopped the rest.
+    while true; do
+        active_state=$(unit_active_state)
+        [[ "${active_state}" == "inactive" || "${active_state}" == "failed" ]] && break
+        if [[ "${waited_seconds}" -ge "${KILL_CONFIRM_SEC}" ]]; then
+            log_err "${MAIN_SERVICE_UNIT} is still '${active_state:-unknown}' ${KILL_CONFIRM_SEC}s after SIGKILL - recovery failed"
+            return 3
+        fi
         sleep 1
-    fi
+        waited_seconds=$(( waited_seconds + 1 ))
+    done
     "${SYSTEMCTL_BIN}" reset-failed "${MAIN_SERVICE_UNIT}" 2>/dev/null || true
+    return 0
 }
 
 # ---------------------------------------------------------------------------

@@ -157,8 +157,14 @@ if [[ "$1" == "--version" ]]; then
     printf 'systemd %s (stub)\n' "${STUB_SYSTEMD_VERSION:-252}"
     exit 0
 fi
+# show: ActiveState is STUB_ACTIVE_STATE, failed by default, as after a kill;
+# MainPID is STUB_MAIN_PID.
 if [[ "$1" == "show" ]]; then
-    printf '%s\n' "${STUB_MAIN_PID:-}"
+    if [[ "$*" == *ActiveState* ]]; then
+        printf '%s\n' "${STUB_ACTIVE_STATE:-failed}"
+    else
+        printf '%s\n' "${STUB_MAIN_PID:-}"
+    fi
     exit 0
 fi
 printf 'systemctl %s\n' "$*" >> "${STUB_LOG}"
@@ -1333,6 +1339,60 @@ stub_watchdog_host() {
     schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
 }
 
+# stub_watchdog_kill_path: like stub_watchdog_host, but keeps the real
+# kill_service_cgroup.  The cgroup kill succeeds unless STUB_KILL_FAILS=yes;
+# systemd reports the unit
+# STUB_ACTIVE_STATE, failed by default.
+stub_watchdog_kill_path() {
+    pgrep() { return 1; }
+    ss() { :; }
+    unit_main_pid() { printf '%s' "${STUB_MAIN_PID:-}"; }
+    unit_active_state() { printf '%s' "${STUB_ACTIVE_STATE:-failed}"; }
+    signal_unit_processes() {
+        printf 'signal_unit_processes\n' >> "${STUB_LOG}"
+        [[ "${STUB_KILL_FAILS:-}" == "yes" ]] && return 1
+        return 0
+    }
+    reboot_now() { printf 'reboot_now\n' >> "${STUB_LOG}"; }
+    schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
+}
+
+test_watchdog_failed_kill_keeps_supervision() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state checking 200 "${background_pid}"
+    stub_watchdog_kill_path
+    export STUB_KILL_FAILS=yes
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "a failed kill fails the watchdog"
+    assert_not_contains "$(cat "${STUB_LOG}")" "reboot_now" "no reboot over a run that may still be updating"
+    [[ -f "${STATE_FILE}" ]] || fail "the state file must survive a failed kill"
+    return 0
+}
+
+test_watchdog_unconfirmed_kill_signals_no_pid() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state checking 200 "${background_pid}"
+    stub_watchdog_kill_path
+    export STUB_ACTIVE_STATE=activating
+    KILL_CONFIRM_SEC=1
+    # The unit is still active after the kill.  Its recorded PID number may
+    # belong to another process by now, so it is never signalled on its own.
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    local process_survived=no
+    kill -0 "${background_pid}" 2>/dev/null && process_survived=yes
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "an unconfirmed kill fails the watchdog"
+    assert_equals "yes" "${process_survived}" "the PID is not signalled directly"
+    assert_not_contains "$(cat "${STUB_LOG}")" "reboot_now" "and nothing is rebooted"
+    [[ -f "${STATE_FILE}" ]] || fail "the state file must survive an unconfirmed kill"
+    return 0
+}
+
 test_watchdog_replaced_run_is_not_killed() {
     sleep 60 &
     local original_pid=$! replacement_pid exit_code=0 output
@@ -1865,6 +1925,8 @@ run_test "watchdog: kill option follows systemd version" test_watchdog_kill_opti
 run_test "watchdog: hung reboot check is undecidable" test_watchdog_hung_reboot_check_is_undecidable
 run_test "watchdog: helper failure is not no-reboot" test_watchdog_helper_failure_is_not_no_reboot
 run_test "watchdog: replaced run is not killed"      test_watchdog_replaced_run_is_not_killed
+run_test "watchdog: failed kill keeps supervision"   test_watchdog_failed_kill_keeps_supervision
+run_test "watchdog: unconfirmed kill signals no pid" test_watchdog_unconfirmed_kill_signals_no_pid
 run_test "watchdog: unknown identity is not acted on" test_watchdog_unknown_identity_is_not_acted_on
 run_test "watchdog: dispatch failure fails the watchdog" test_watchdog_dispatch_failure_fails_the_watchdog
 run_test "watchdog: unit has a start timeout"        test_watchdog_unit_has_a_start_timeout

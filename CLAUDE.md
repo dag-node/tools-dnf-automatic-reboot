@@ -284,9 +284,16 @@ The independent check takes minutes, in which the stuck run can end and the next
 start updating; a kill on the old decision would stop that run mid-transaction and
 reboot. A changed `phase`, `start_uptime` or `pid`, or a `pid` that is no longer
 `MainPID`, abandons the recovery and leaves the state file alone (exit 0); a live `pid`
-with no numeric `MainPID` abandons it with exit 1. `systemctl kill` names the unit,
-not one invocation of it, so a run starting in the moment between that re-check and the
-kill is not excluded.
+with no numeric `MainPID` abandons it with exit 1.
+
+`systemctl kill` names the unit, not one invocation of it, so a run starting in the
+moment between that re-check and the kill is not excluded.
+
+After the kill, the watchdog waits up to `watchdog_kill_confirm_sec` for systemd to report
+the unit `inactive` or `failed`. A failed `systemctl kill`, or a unit still active then,
+is a failed recovery: the state file stays, the watchdog does not reboot, and it fails its
+unit. `kill_recorded_run` signals the cgroup only, not the recorded PID: by then that
+number may belong to another process.
 
 Watchdog decisions by phase:
 
