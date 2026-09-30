@@ -73,10 +73,15 @@ run_test() {
     fi
 
     TESTS_RUN=$(( TESTS_RUN + 1 ))
+    # wall is stubbed and exported before the test starts, so a script the test
+    # runs as a child bash process inherits the stub too.  Unexported, the stub
+    # stays in this shell and the child broadcasts to every terminal on the host.
     test_output=$(
         set +e
         PATH="${TEST_ROOT_DIR}/stubbin:${PATH}"
         export PATH
+        wall() { printf 'wall %s\n' "$*" >> "${STUB_LOG}"; }
+        export -f wall
         "${test_function}" 2>&1
     ) || test_exit_code=$?
 
@@ -260,7 +265,6 @@ install_command_stubs() {
         return 0
     }
 
-    wall() { printf 'wall %s\n' "$*" >> "${STUB_LOG}"; }
 }
 
 # Source the real needs-reboot.sh for its functions, then relax the shell
@@ -873,7 +877,7 @@ test_watchdog_ignores_wall_clock_step() {
     watchdog_output=$(bash "${REPO_ROOT}/scripts/watchdog.sh" 2>&1)
     kill "${background_pid}" 2>/dev/null
     assert_contains "${watchdog_output}" "elapsed=2min" "elapsed time comes from the boot clock"
-    assert_not_contains "$(cat "${STUB_LOG}")" "kill" "a young run is never killed"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemctl kill" "a young run is never killed"
 }
 
 test_watchdog_state_without_uptime_is_malformed() {
@@ -886,7 +890,7 @@ test_watchdog_state_without_uptime_is_malformed() {
         > "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
-    assert_not_contains "$(cat "${STUB_LOG}")" "kill" "a wall-clock age never kills a run"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemctl kill" "a wall-clock age never kills a run"
     [[ -f "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state" ]] \
         && fail "a state file without start_uptime should have been removed"
     return 0
@@ -904,10 +908,20 @@ test_watchdog_dead_pid_does_not_reboot() {
     # use a pid that cannot exist instead.
     write_watchdog_state updating 200 4194304
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot" "a crashed run must not reboot"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemctl reboot" "a crashed run must not reboot"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run" "a crashed run must not schedule a reboot"
     [[ -f "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state" ]] \
         && fail "stale state file should have been removed"
     return 0
+}
+
+test_watchdog_warning_reaches_the_stub_not_the_host() {
+    # The watchdog runs as a child process; its wall warning for a dead run
+    # must land in the stub log, which proves it never reached the real wall.
+    write_watchdog_state updating 200 4194304
+    bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "wall dnf-automatic-reboot: WARNING" \
+        "the child process used the exported wall stub"
 }
 
 test_watchdog_hard_timeout_while_updating_does_not_reboot() {
@@ -979,8 +993,9 @@ test_watchdog_reused_pid_is_not_the_run() {
     kill -0 "${background_pid}" 2>/dev/null && process_survived=yes
     kill "${background_pid}" 2>/dev/null
     assert_equals "yes" "${process_survived}" "the unrelated process is left running"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot" "no reboot for a run that is gone"
-    assert_not_contains "$(cat "${STUB_LOG}")" "kill" "no cgroup kill for a run that is gone"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemctl reboot" "no reboot for a run that is gone"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run" "no scheduled reboot for a run that is gone"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemctl kill" "no cgroup kill for a run that is gone"
 }
 
 test_watchdog_prefers_orderly_reboot() {
@@ -1394,6 +1409,7 @@ run_test "services: wall_messages comment is ignored" test_wall_messages_trailin
 printf 'watchdog\n'
 run_test "watchdog: no state file is a noop"         test_watchdog_no_state_file_is_a_noop
 run_test "watchdog: dead pid does not reboot"        test_watchdog_dead_pid_does_not_reboot
+run_test "watchdog: warning reaches the stub, not the host" test_watchdog_warning_reaches_the_stub_not_the_host
 run_test "watchdog: ignores wall clock step"         test_watchdog_ignores_wall_clock_step
 run_test "watchdog: state without uptime is malformed" test_watchdog_state_without_uptime_is_malformed
 run_test "watchdog: hard timeout while updating does not reboot" test_watchdog_hard_timeout_while_updating_does_not_reboot needs-exec
