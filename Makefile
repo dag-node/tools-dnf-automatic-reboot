@@ -33,10 +33,13 @@ TESTS = tests/run-tests.sh
 TOOLS = tools/verify-grub-boot-flags.sh \
         tools/verify-el-prerequisites.sh
 
-# rpmbuild output goes to ./rpmbuild, emptied on every build, so exactly one
-# build of this version is there to install.  DIST and RPM_RELEASE are optional:
+# rpmbuild output goes to rpmbuild/$(NAME)/<target>/, one folder per target:
+# el8 or el9 from DIST, local without it.  A build empties only its own folder,
+# so builds for other targets, and other projects' builds under rpmbuild/, stay.
+# DIST and RPM_RELEASE are optional:
 #   make rpm DIST=.el9 RPM_RELEASE=0.12.gitabc1234
-RPM_TOPDIR = $(CURDIR)/rpmbuild
+RPM_OUTPUT_DIRECTORY = $(CURDIR)/rpmbuild/$(NAME)
+RPM_TOPDIR = $(RPM_OUTPUT_DIRECTORY)/$(if $(DIST),$(patsubst .%,%,$(DIST)),local)
 RPMBUILD_DEFINES = --define "_topdir $(RPM_TOPDIR)" \
                    --define "_sourcedir $(CURDIR)" --define "_specdir $(CURDIR)" \
                    $(if $(DIST),--define "dist $(DIST)") \
@@ -123,8 +126,8 @@ container-rpm:
 	$(PODMAN) run --rm --security-opt label=disable -v "$(CURDIR):/src" -w /src \
 	    -e EL="$(EL)" -e RPM_RELEASE="$(CONTAINER_RPM_RELEASE)" \
 	    "quay.io/rockylinux/rockylinux:$(EL)" bash /src/.github/scripts/build-in-container.sh
-	@echo "Built:"; ls -1 $(RPM_TOPDIR)/RPMS/noarch/*.rpm
+	@echo "Built:"; ls -1 $(RPM_OUTPUT_DIRECTORY)/el$(EL)/RPMS/noarch/*.rpm
 
 clean:
 	rm -f $(TARBALL)
-	rm -rf $(RPM_TOPDIR)
+	rm -rf $(RPM_OUTPUT_DIRECTORY)

@@ -616,10 +616,11 @@ a release string using rpm's `~`/`^` operators, needs `rpmdev-vercmp` instead.
 # Syntax + lint before building
 make check && shellcheck -S info scripts/*.sh
 
-# Build RPM the way CI does, in rockylinux:$EL (podman); lands in ./rpmbuild
+# Build RPM the way CI does, in rockylinux:$EL (podman);
+# lands in ./rpmbuild/dnf-automatic-reboot/el$EL, one folder per EL major
 make container-rpm EL=9
-# Build RPM on an EL host (dnf install rpm-build systemd-rpm-macros); ./rpmbuild
-# is emptied first, so it holds only this build
+# Build RPM on an EL host (dnf install rpm-build systemd-rpm-macros); lands in
+# ./rpmbuild/dnf-automatic-reboot/el9 (local without DIST), emptied first
 make rpm DIST=.el9
 
 # Full update cycle now: applies updates and reboots if needed

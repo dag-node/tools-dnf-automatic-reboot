@@ -223,8 +223,10 @@ make container-rpm EL=9
 ```
 
 This builds the package the way CI does, inside a `rockylinux:9` container
-started with `podman`, and leaves it in `./rpmbuild/RPMS/noarch/`. `EL=8`
-builds for Enterprise Linux 8. Building in the container gives the file the
+started with `podman`, and leaves it in
+`./rpmbuild/dnf-automatic-reboot/el9/RPMS/noarch/`. `EL=8` builds for
+Enterprise Linux 8 into the `el8` folder beside it; each build replaces only
+its own folder. Building in the container gives the file the
 right `.el8` or `.el9` tag whatever the build computer runs, and keeps the
 test suite off the build computer. The file carries a local snapshot version,
 `1.4.0-0.local.git<commit>`, which a released `1.4.0-1` replaces as an
@@ -236,8 +238,8 @@ computer with `bash`; the suite does not need root and stubs every system
 command. Tests that execute a stub skip themselves where the temporary
 directory is mounted `noexec`; the container build runs them. On an EL8 or
 EL9 computer with `rpm-build` installed, `make rpm` builds directly into
-`./rpmbuild`. [CLAUDE.md](CLAUDE.md) describes the design and the conventions
-for changes.
+`./rpmbuild/dnf-automatic-reboot/local`. [CLAUDE.md](CLAUDE.md) describes the
+design and the conventions for changes.
 
 Licensed under GPL-2.0-or-later; the RPM spec file is MIT. See
 [REUSE.toml](REUSE.toml).

@@ -8,7 +8,8 @@
 #
 #   1. make rpm: lint (shellcheck, where present) and the test suite, the
 #      source tarball, then `rpmbuild -ba` with the snapshot Release into
-#      /src/rpmbuild; %check runs the suite again from the tarball.  The
+#      /src/rpmbuild/dnf-automatic-reboot/el${EL}; %check runs the suite
+#      again from the tarball.  The
 #      container's /tmp allows exec, so the tests marked needs-exec run here.
 #   2. A normal install must be refused by the %pre gate: a container is not
 #      booted by systemd.  This proves the gate runs and refuses.
@@ -24,7 +25,7 @@ IFS=$'\n\t'
 : "${RPM_RELEASE:?RPM_RELEASE must hold the snapshot Release}"
 
 readonly SOURCE_DIRECTORY=/src
-readonly TOP_DIRECTORY="${SOURCE_DIRECTORY}/rpmbuild"
+readonly TOP_DIRECTORY="${SOURCE_DIRECTORY}/rpmbuild/dnf-automatic-reboot/el${EL}"
 readonly PACKAGE_NAME=dnf-automatic-reboot
 
 dnf -y -q install rpm-build make gawk util-linux tar gzip findutils systemd-rpm-macros >/dev/null

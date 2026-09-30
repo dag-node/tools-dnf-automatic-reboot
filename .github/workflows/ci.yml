@@ -73,7 +73,7 @@ jobs:
         with:
           name: dnf-automatic-reboot-el${{ matrix.el }}-${{ steps.release.outputs.rpm_release }}
           path: |
-            rpmbuild/RPMS/noarch/*.rpm
-            rpmbuild/SRPMS/*.rpm
+            rpmbuild/dnf-automatic-reboot/el${{ matrix.el }}/RPMS/noarch/*.rpm
+            rpmbuild/dnf-automatic-reboot/el${{ matrix.el }}/SRPMS/*.rpm
           if-no-files-found: error
           retention-days: 30
