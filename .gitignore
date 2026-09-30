@@ -1,4 +1,5 @@
 .env/
 .idea/
 *.rpm
-*.tar.gz.rpmbuild/
+*.tar.gz
+.rpmbuild/

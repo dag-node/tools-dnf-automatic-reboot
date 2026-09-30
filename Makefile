@@ -41,7 +41,7 @@ all:
 check: lint test
 
 lint:
-	@for script in $(SCRIPTS) $(TESTS); do bash -n $$script && echo "syntax OK  $$script"; done
+	@for script in $(SCRIPTS) $(TESTS); do bash -n $$script || exit 1; echo "syntax OK  $$script"; done
 	@if command -v shellcheck >/dev/null 2>&1; then \
 	    shellcheck -S warning $(SCRIPTS) && echo "shellcheck OK"; \
 	else \
@@ -66,7 +66,7 @@ install:
 	install -d -m 0750 $(DESTDIR)$(STATEDIR)
 	install -m 0750 $(SCRIPTS)   $(DESTDIR)$(LIBEXECDIR)/
 	install -m 0644 $(UNITS)     $(DESTDIR)$(UNITDIR)/
-	install -m 0640 $(CONF)      $(DESTDIR)$(CONFDIR)/$(NAME).conf
+	install -m 0640 $(CONF)      $(DESTDIR)$(CONFDIR)/automatic-reboot.conf
 	install -m 0644 $(TMPFILES)  $(DESTDIR)$(TMPFILESDIR)/$(NAME).conf
 	install -m 0644 $(LOGROTATE) $(DESTDIR)$(LOGROTATEDIR)/$(NAME)
 	install -m 0644 $(DOC)       $(DESTDIR)$(DOCDIR)/README
