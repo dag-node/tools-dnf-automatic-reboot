@@ -1054,9 +1054,12 @@ readonly TEST_UPTIME_SECONDS=100000
 # write_watchdog_state PHASE AGE_MINUTES PID [WALL_CLOCK_AGE_MINUTES]
 # The run is AGE_MINUTES old on the boot clock.  WALL_CLOCK_AGE_MINUTES, which
 # defaults to the same, is how old it looks by the wall clock.
+# The stub systemctl reports the recorded pid as MainPID unless a test has
+# set STUB_MAIN_PID.
 write_watchdog_state() {
     local run_phase="$1" age_minutes="$2" recorded_pid="$3"
     local wall_clock_age_minutes="${4:-$2}"
+    export STUB_MAIN_PID="${STUB_MAIN_PID-${recorded_pid}}"
     printf '%s.42 0.00\n' "${TEST_UPTIME_SECONDS}" > "${TEST_ROOT_DIR}/proc/uptime"
     printf 'phase=%s\nstart=%s\nstart_uptime=%s\npid=%s\n' \
         "${run_phase}" "$(( $(date +%s) - wall_clock_age_minutes * 60 ))" \
@@ -1207,6 +1210,79 @@ test_watchdog_hung_reboot_check_is_undecidable() {
         "bounded at three needs-restarting timeouts"
 }
 
+# stub_watchdog_host: stubs what the sourced watchdog would reach on the host.
+# MainPID comes from STUB_MAIN_PID, which write_watchdog_state sets.
+stub_watchdog_host() {
+    pgrep() { return 1; }
+    ss() { :; }
+    unit_main_pid() { printf '%s' "${STUB_MAIN_PID:-}"; }
+    kill_service_cgroup() { printf 'kill_service_cgroup\n' >> "${STUB_LOG}"; }
+    schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
+}
+
+test_watchdog_replaced_run_is_not_killed() {
+    sleep 60 &
+    local original_pid=$! replacement_pid exit_code=0 output
+    sleep 60 &
+    replacement_pid=$!
+    export REPLACEMENT_PID="${replacement_pid}"
+    load_watchdog_library
+    write_watchdog_state checking 70 "${original_pid}"
+    pgrep() { return 1; }
+    ss() { :; }
+    unit_main_pid() { cat "${TEST_ROOT_DIR}/main-pid"; }
+    printf '%s' "${original_pid}" > "${TEST_ROOT_DIR}/main-pid"
+    schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
+    # While the watchdog checks, the stuck run ends and the next run starts
+    # updating.  The old verdict must not kill it or reboot the host.
+    run_independent_reboot_check() {
+        printf 'phase=updating\nstart=0\nstart_uptime=%s\npid=%s\n' \
+            "$(( TEST_UPTIME_SECONDS - 60 ))" "${REPLACEMENT_PID}" > "${STATE_FILE}"
+        printf '%s' "${REPLACEMENT_PID}" > "${TEST_ROOT_DIR}/main-pid"
+        return 1
+    }
+    output=$( main 2>&1 ) || exit_code=$?
+    local replacement_survived=no
+    kill -0 "${replacement_pid}" 2>/dev/null && replacement_survived=yes
+    kill "${original_pid}" "${replacement_pid}" 2>/dev/null
+    assert_exit_code 0 "${exit_code}" "a run that ended normally is no failure"
+    assert_equals "yes" "${replacement_survived}" "the replacement run is left running"
+    assert_not_contains "${output}" "systemctl kill" "no cgroup kill"
+    assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "no reboot on the old verdict"
+    assert_contains "$(cat "${STATE_FILE}")" "phase=updating" "the replacement's state file is kept"
+}
+
+test_watchdog_unknown_identity_is_not_acted_on() {
+    sleep 60 &
+    local background_pid=$! exit_code=0 output
+    load_watchdog_library
+    export STUB_MAIN_PID=""
+    write_watchdog_state checking 200 "${background_pid}"
+    stub_watchdog_host
+    reboot_now() { printf 'reboot_now\n' >> "${STUB_LOG}"; }
+    # Past the hard timeout, but systemctl reports no MainPID: the live PID
+    # may not be the run.
+    output=$( main 2>&1 ) || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "an unestablished identity fails the watchdog"
+    assert_not_contains "$(cat "${STUB_LOG}")" "kill_service_cgroup" "nothing is killed"
+    assert_not_contains "$(cat "${STUB_LOG}")" "reboot_now" "and nothing is rebooted"
+}
+
+test_watchdog_dispatch_failure_fails_the_watchdog() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state checking 70 "${background_pid}"
+    stub_watchdog_host
+    kill_service_cgroup() { return 0; }
+    schedule_reboot() { return 1; }
+    run_independent_reboot_check() { return 1; }
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "a reboot that could not be scheduled reaches OnFailure="
+}
+
 test_watchdog_helper_failure_is_not_no_reboot() {
     sleep 60 &
     local background_pid=$! exit_code=0 output
@@ -1214,10 +1290,7 @@ test_watchdog_helper_failure_is_not_no_reboot() {
     # Past the soft timeout in phase=checking with dnf idle: the watchdog runs
     # its own check.  Everything that reaches the host is stubbed.
     write_watchdog_state checking 70 "${background_pid}"
-    pgrep() { return 1; }
-    ss() { :; }
-    kill_service_cgroup() { printf 'kill_service_cgroup\n' >> "${STUB_LOG}"; }
-    schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
+    stub_watchdog_host
     run_independent_reboot_check() { return 127; }
     output=$( main 2>&1 ) || exit_code=$?
     kill "${background_pid}" 2>/dev/null
@@ -1671,6 +1744,9 @@ run_test "watchdog: prefers orderly reboot"          test_watchdog_prefers_order
 run_test "watchdog: kill option follows systemd version" test_watchdog_kill_option_follows_systemd_version
 run_test "watchdog: hung reboot check is undecidable" test_watchdog_hung_reboot_check_is_undecidable
 run_test "watchdog: helper failure is not no-reboot" test_watchdog_helper_failure_is_not_no_reboot
+run_test "watchdog: replaced run is not killed"      test_watchdog_replaced_run_is_not_killed
+run_test "watchdog: unknown identity is not acted on" test_watchdog_unknown_identity_is_not_acted_on
+run_test "watchdog: dispatch failure fails the watchdog" test_watchdog_dispatch_failure_fails_the_watchdog
 run_test "watchdog: unit has a start timeout"        test_watchdog_unit_has_a_start_timeout
 run_test "watchdog: reused pid is not the run"        test_watchdog_reused_pid_is_not_the_run       needs-exec
 run_test "watchdog: systemd 239 kills with --kill-who" test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who needs-exec

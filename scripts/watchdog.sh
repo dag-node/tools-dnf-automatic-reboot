@@ -152,22 +152,63 @@ systemctl_kill_target_option() {
     fi
 }
 
-# recorded_pid_is_the_run PID - succeeds when PID is alive and is the service
-# unit's main process.  run.sh is the unit's ExecStart, so its PID is MainPID
-# while it runs; a live PID that differs was reused by an unrelated process
-# after the run died.  When systemctl does not report a numeric MainPID the
-# result is the kill -0 check alone, so a stuck run is still acted on.
-recorded_pid_is_the_run() {
-    local recorded_pid="$1" main_pid
-    kill -0 "${recorded_pid}" 2>/dev/null || return 1
-    main_pid=$("${SYSTEMCTL_BIN}" show --property=MainPID --value "${MAIN_SERVICE_UNIT}" 2>/dev/null) || main_pid=""
-    [[ "${main_pid}" =~ ^[0-9]+$ ]] || return 0
-    [[ "${main_pid}" == "${recorded_pid}" ]]
+# unit_main_pid -> the service unit's MainPID as systemctl reports it, empty
+# when systemctl does not answer.
+unit_main_pid() {
+    "${SYSTEMCTL_BIN}" show --property=MainPID --value "${MAIN_SERVICE_UNIT}" 2>/dev/null || true
 }
 
+# recorded_pid_identity PID
+# Returns: 0 = PID is alive and is the unit's MainPID: the run
+#          1 = PID is dead, or MainPID is another process: not the run
+#          2 = PID is alive but systemctl reports no numeric MainPID: unknown
+# run.sh is the unit's ExecStart, so its PID is MainPID while it runs; a live
+# PID that differs was reused by an unrelated process after the run died.
+recorded_pid_identity() {
+    local recorded_pid="$1" main_pid
+    kill -0 "${recorded_pid}" 2>/dev/null || return 1
+    main_pid=$(unit_main_pid)
+    [[ "${main_pid}" =~ ^[0-9]+$ ]] || return 2
+    [[ "${main_pid}" == "${recorded_pid}" ]] || return 1
+    return 0
+}
+
+# recorded_run_is_unchanged PHASE START_UPTIME PID
+# Returns: 0 = the state file still describes this run and PID is still the
+#              unit's MainPID
+#          1 = the run ended, or another run replaced it
+#          2 = PID is alive but its identity cannot be established
+# The run can end, and another start, while the watchdog runs its own check;
+# acting on the old decision would kill the new run, possibly mid-transaction.
+recorded_run_is_unchanged() {
+    local expected_phase="$1" expected_start_uptime="$2" expected_pid="$3"
+    local current_phase current_start_uptime current_pid
+    current_phase=$(grep '^phase=' "${STATE_FILE}" 2>/dev/null | cut -d= -f2) || return 1
+    current_start_uptime=$(grep '^start_uptime=' "${STATE_FILE}" 2>/dev/null | cut -d= -f2) || return 1
+    current_pid=$(grep '^pid=' "${STATE_FILE}" 2>/dev/null | cut -d= -f2) || return 1
+    [[ "${current_phase}" == "${expected_phase}" \
+       && "${current_start_uptime}" == "${expected_start_uptime}" \
+       && "${current_pid}" == "${expected_pid}" ]] || return 1
+    recorded_pid_identity "${expected_pid}"
+}
+
+# kill_service_cgroup PHASE START_UPTIME PID
+# Kills the unit only after recorded_run_is_unchanged confirms it still runs
+# the recorded run, and otherwise returns that function's 1 or 2, killing
+# nothing.  The unit is signalled a moment after the check; no systemctl
+# option ties the kill to one invocation of the unit.
 kill_service_cgroup() {
-    local recorded_pid="$1" systemd_version kill_target_option recorded_pid_was_the_run=0
-    recorded_pid_is_the_run "${recorded_pid}" && recorded_pid_was_the_run=1
+    local recorded_phase="$1" recorded_start_uptime="$2" recorded_pid="$3"
+    local systemd_version kill_target_option run_check_result=0
+    recorded_run_is_unchanged "${recorded_phase}" "${recorded_start_uptime}" "${recorded_pid}" \
+        || run_check_result=$?
+    if [[ "${run_check_result}" -eq 1 ]]; then
+        log "the run in the state file ended or was replaced - killing nothing, recovery abandoned"
+        return 1
+    elif [[ "${run_check_result}" -ne 0 ]]; then
+        log_err "the identity of PID ${recorded_pid} cannot be established - killing nothing, recovery abandoned"
+        return 2
+    fi
     systemd_version=$("${SYSTEMCTL_BIN}" --version 2>/dev/null \
                       | sed -n '1s/^systemd \([0-9]\+\).*/\1/p') || true
     kill_target_option=$(systemctl_kill_target_option "${systemd_version}")
@@ -175,9 +216,9 @@ kill_service_cgroup() {
         log_err "systemctl kill ${kill_target_option} ${MAIN_SERVICE_UNIT} failed - processes of the run may survive"
     fi
     sleep 2
-    # Only a PID confirmed as the run before the cgroup kill is signalled
-    # directly; any other live PID with that number belongs to someone else.
-    if [[ "${recorded_pid_was_the_run}" -eq 1 ]] && kill -0 "${recorded_pid}" 2>/dev/null; then
+    # The PID was confirmed as the run before the cgroup kill, so a survivor
+    # with that number is the run, not a reused PID.
+    if kill -0 "${recorded_pid}" 2>/dev/null; then
         log_warn "PID ${recorded_pid} survived the cgroup kill - signalling it directly"
         kill -KILL "${recorded_pid}" 2>/dev/null || true
         sleep 1
@@ -270,7 +311,19 @@ main() {
     # ---------------------------------------------------------------------------
     # Scenario 2: dead PID with state file present
     # ---------------------------------------------------------------------------
-    if ! recorded_pid_is_the_run "${service_pid}"; then
+    recorded_pid_identity_result=0
+    recorded_pid_identity "${service_pid}" || recorded_pid_identity_result=$?
+    # Unknown identity blocks every action.  Before the soft timeout there is
+    # no action to take, so it is only a warning there.
+    if [[ "${recorded_pid_identity_result}" -eq 2 ]]; then
+        if [[ "${elapsed_min}" -lt "${SOFT_TIMEOUT_MIN}" ]]; then
+            log_warn "systemctl reports no MainPID for ${MAIN_SERVICE_UNIT} - PID ${service_pid} not verified this cycle"
+            exit 0
+        fi
+        log_err "PID ${service_pid} is alive but systemctl reports no MainPID for ${MAIN_SERVICE_UNIT} - cannot tell whether it is the run, not acting this cycle"
+        exit 1
+    fi
+    if [[ "${recorded_pid_identity_result}" -eq 1 ]]; then
         log_warn "service PID ${service_pid} is dead or not the unit's main process but state file exists - updates may be incomplete, NOT rebooting"
         wall_msg "dnf-automatic-reboot: WARNING - update process (PID ${service_pid})" \
                  "died unexpectedly in phase=${run_phase}." \
@@ -289,7 +342,10 @@ main() {
     # ---------------------------------------------------------------------------
     if [[ "${elapsed_min}" -ge "${HARD_TIMEOUT_MIN}" ]]; then
         log_err "hard timeout ${HARD_TIMEOUT_MIN}min exceeded - PID ${service_pid} still alive in phase=${run_phase}"
-        kill_service_cgroup "${service_pid}"
+        kill_result=0
+        kill_service_cgroup "${run_phase}" "${start_uptime_seconds}" "${service_pid}" || kill_result=$?
+        [[ "${kill_result}" -eq 1 ]] && exit 0
+        [[ "${kill_result}" -eq 0 ]] || exit 1
         rm -f "${STATE_FILE}" "${LOCK_FILE}"
 
         if [[ "${run_phase}" == "checking" || "${FORCE_REBOOT_ON_HARD_TIMEOUT}" == "yes" ]]; then
@@ -330,8 +386,13 @@ main() {
             needs_reboot_exit_code=0
             run_independent_reboot_check || needs_reboot_exit_code=$?
 
-            # Kill the stuck run so it cannot hold the inhibitor lock past the reboot
-            kill_service_cgroup "${service_pid}"
+            # Kill the stuck run so it cannot hold the inhibitor lock past the
+            # reboot.  The check took time: when the run it was made for has
+            # ended, or another run has started, its decision is not acted on.
+            kill_result=0
+            kill_service_cgroup "${run_phase}" "${start_uptime_seconds}" "${service_pid}" || kill_result=$?
+            [[ "${kill_result}" -eq 1 ]] && exit 0
+            [[ "${kill_result}" -eq 0 ]] || exit 1
             rm -f "${STATE_FILE}" "${LOCK_FILE}"
 
             case "${needs_reboot_exit_code}" in
@@ -339,7 +400,7 @@ main() {
                     log "Watchdog: no reboot needed - stuck run killed"
                     ;;
                 1)
-                    schedule_reboot || true
+                    schedule_reboot || exit 1
                     ;;
                 *)
                     log_err "Watchdog: needs-reboot.sh exited ${needs_reboot_exit_code}: reboot state could not be established - killed the stuck run, not rebooting"

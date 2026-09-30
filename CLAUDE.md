@@ -275,9 +275,17 @@ The watchdog treats the recorded `pid` as the run only while it is alive and equ
 the unit's `MainPID` (`systemctl show --property=MainPID`; `run.sh` is the unit's
 `ExecStart`). A live PID that differs was reused after the run died, and is handled
 as a dead run: the state file is removed, and the watchdog does not kill any process
-or reboot. When
-`systemctl` does not report a numeric `MainPID`, `kill -0` alone decides, so a stuck
-run is still acted on.
+or reboot. A live PID with no numeric `MainPID` from `systemctl` is of unknown
+identity: the watchdog takes no action, and past the soft timeout it fails its unit.
+
+Right before any kill, `kill_service_cgroup` re-reads the state file and `MainPID`.
+The independent check takes minutes, in which the stuck run can end and the next run
+start updating; a kill on the old decision would stop that run mid-transaction and
+reboot. A changed `phase`, `start_uptime` or `pid`, or a `pid` that is no longer
+`MainPID`, abandons the recovery and leaves the state file alone (exit 0); an identity
+that cannot be established abandons it with exit 1. `systemctl kill` names the unit,
+not one invocation of it, so a run starting in the moment between that re-check and the
+kill is not excluded.
 
 Watchdog decisions by phase:
 
