@@ -332,7 +332,9 @@ grub_default_is_newest_kernel() {
     newest_kernel_version=$(newest_installed_kernel_version "${package_name}")
     [[ -n "${newest_kernel_version}" ]] || return 2
     grub_default_kernel_path=$(grubby --default-kernel 2>/dev/null) || return 2
-    [[ -n "${grub_default_kernel_path}" ]] || return 2
+    # grubby prints "/boot" and exits 0 when it cannot read grubenv.  Anything
+    # that is not a kernel image path is no reading at all, not a stale default.
+    [[ "${grub_default_kernel_path}" == /boot/vmlinuz-* ]] || return 2
     [[ "${grub_default_kernel_path}" == "/boot/vmlinuz-${newest_kernel_version}" ]]
 }
 

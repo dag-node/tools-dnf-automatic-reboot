@@ -437,6 +437,15 @@ test_grub_default_is_stale() {
     assert_exit_code 1 "$?" "stale default must be detected"
 }
 
+test_grub_unreadable_grubenv_is_undetermined() {
+    load_needs_reboot_library
+    export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.4.el9uek.aarch64"
+    # What grubby printed, with exit 0, when grubenv was unreadable.
+    export STUB_GRUBBY_DEFAULT="/boot"
+    grub_default_is_newest_kernel kernel-uek-core
+    assert_exit_code 2 "$?" "no kernel path is undetermined, not a stale default"
+}
+
 test_grub_unavailable_is_undetermined() {
     load_needs_reboot_library
     unset -f grubby
@@ -885,6 +894,7 @@ printf 'grub\n'
 run_test "grub: default matches newest"              test_grub_default_matches_newest
 run_test "grub: stale default is detected"           test_grub_default_is_stale
 run_test "grub: missing grubby is undetermined"      test_grub_unavailable_is_undetermined
+run_test "grub: unreadable grubenv is undetermined"  test_grub_unreadable_grubenv_is_undetermined
 
 printf 'buildid\n'
 run_test "buildid: all processes match"              test_build_id_all_processes_match
