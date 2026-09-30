@@ -9,6 +9,10 @@ OnFailure=dnf-automatic-reboot-notify@%n.service
 Type=oneshot
 ExecStart=/usr/libexec/dnf-automatic-reboot/watchdog.sh
 RemainAfterExit=no
+# A oneshot has no start timeout by default.  A watchdog that hangs never
+# exits, so the timer cannot start the next cycle and the hard timeout is
+# never reached.  watchdog.sh bounds its own reboot check below this.
+TimeoutStartSec=15min
 # needs-restarting output is translated; the parsers match C strings.
 Environment=LC_ALL=C
 StandardOutput=journal

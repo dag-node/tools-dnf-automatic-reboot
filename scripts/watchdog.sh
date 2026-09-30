@@ -102,6 +102,32 @@ SOFT_TIMEOUT_MIN=$(conf_get_int watchdog_soft_timeout_min 60)
 HARD_TIMEOUT_MIN=$(conf_get_int watchdog_hard_timeout_min 180)
 REBOOT_DELAY_SEC=$(conf_get_int reboot_delay_sec 60)
 FORCE_REBOOT_ON_HARD_TIMEOUT=$(conf_get force_reboot_on_hard_timeout no)
+NEEDS_RESTARTING_TIMEOUT_SEC=$(conf_get_int needs_restarting_timeout_sec 120)
+
+# ---------------------------------------------------------------------------
+# Independent reboot check, bounded.
+#
+# needs-reboot.sh runs needs-restarting at most twice, each run bounded by
+# needs_restarting_timeout_sec; a third share of the budget covers its rpm and
+# build-id queries.  A check that hangs anyway is killed at the bound and
+# reported as undecidable, so the watchdog exits and a later cycle still
+# reaches the hard timeout.  A timeout of 0, which leaves needs-restarting
+# unbounded, gives the check the default budget.
+#
+# Returns needs-reboot.sh's exit code, or 2 when it did not finish in time.
+# ---------------------------------------------------------------------------
+run_independent_reboot_check() {
+    local check_timeout_seconds=$(( 3 * NEEDS_RESTARTING_TIMEOUT_SEC )) exit_code=0
+    [[ "${check_timeout_seconds}" -gt 0 ]] || check_timeout_seconds=360
+    timeout --kill-after=10s "${check_timeout_seconds}s" "${LIBRARY_DIRECTORY}/needs-reboot.sh" \
+        || exit_code=$?
+    # 124: timed out; 137: still running at the timeout and killed after it.
+    if [[ "${exit_code}" -eq 124 || "${exit_code}" -eq 137 ]]; then
+        log_err "independent reboot check did not finish within ${check_timeout_seconds}s - treating the reboot state as undecidable"
+        return 2
+    fi
+    return "${exit_code}"
+}
 
 # ---------------------------------------------------------------------------
 # Kill the entire service cgroup.
@@ -302,7 +328,7 @@ main() {
             # needs-reboot.sh appears to be hung - run independently
             log "Phase=checking with idle dnf - running independent reboot check"
             needs_reboot_exit_code=0
-            "${LIBRARY_DIRECTORY}/needs-reboot.sh" || needs_reboot_exit_code=$?
+            run_independent_reboot_check || needs_reboot_exit_code=$?
 
             # Kill the stuck run so it cannot hold the inhibitor lock past the reboot
             kill_service_cgroup "${service_pid}"

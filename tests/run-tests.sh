@@ -1126,6 +1126,27 @@ test_watchdog_reused_pid_is_not_the_run() {
     assert_not_contains "$(cat "${STUB_LOG}")" "systemctl kill" "no cgroup kill for a run that is gone"
 }
 
+test_watchdog_hung_reboot_check_is_undecidable() {
+    load_watchdog_library
+    # The check the watchdog runs when the main run is stuck in phase=checking
+    # can hang the same way; it must end, or no later cycle reaches the hard
+    # timeout.
+    timeout() { printf 'timeout %s\n' "$*" >> "${STUB_LOG}"; return 124; }
+    run_independent_reboot_check >/dev/null 2>&1
+    assert_exit_code 2 "$?" "a check that did not finish is undecidable, never a reboot"
+    assert_contains "$(cat "${STUB_LOG}")" "360s ${TEST_ROOT_DIR}/usr/libexec/dnf-automatic-reboot/needs-reboot.sh" \
+        "bounded at three needs-restarting timeouts"
+}
+
+test_watchdog_unit_has_a_start_timeout() {
+    # A oneshot's start timeout is disabled by default; a hung watchdog would
+    # never exit and the timer would never start the next cycle.
+    local start_timeout
+    start_timeout=$(sed -n 's/^TimeoutStartSec=//p' "${REPO_ROOT}/units/dnf-automatic-watchdog.service")
+    [[ -n "${start_timeout}" && "${start_timeout}" != "infinity" ]] \
+        || fail "dnf-automatic-watchdog.service needs a finite TimeoutStartSec, has [${start_timeout}]"
+}
+
 test_watchdog_prefers_orderly_reboot() {
     sleep 60 &
     local background_pid=$!
@@ -1556,6 +1577,8 @@ run_test "watchdog: hard timeout while updating can be forced"   test_watchdog_h
 run_test "watchdog: hard timeout while checking reboots"         test_watchdog_hard_timeout_while_checking_reboots         needs-exec
 run_test "watchdog: prefers orderly reboot"          test_watchdog_prefers_orderly_reboot          needs-exec
 run_test "watchdog: kill option follows systemd version" test_watchdog_kill_option_follows_systemd_version
+run_test "watchdog: hung reboot check is undecidable" test_watchdog_hung_reboot_check_is_undecidable
+run_test "watchdog: unit has a start timeout"        test_watchdog_unit_has_a_start_timeout
 run_test "watchdog: reused pid is not the run"        test_watchdog_reused_pid_is_not_the_run       needs-exec
 run_test "watchdog: systemd 239 kills with --kill-who" test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who needs-exec
 
