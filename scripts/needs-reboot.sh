@@ -361,12 +361,24 @@ grub_default_is_newest_kernel() {
 #
 # Invoked through dnf so -C (cache only) can be passed: needs-restarting asks
 # for filelists metadata it does not use in -r mode, and dnf-automatic has
-# just populated the cache.  A cache miss falls back to a refreshing run
-# rather than being reported as a tool error.
+# just populated the cache.  A cache-only run without a plugin result falls
+# back to a refreshing run rather than being reported as a tool error.
 #
 # Sets NEEDS_RESTARTING_OUTPUT and returns needs-restarting's exit code, or 2
 # when no temporary file for its stderr can be created.
 # ---------------------------------------------------------------------------
+
+# needs_restarting_gave_result EXIT_CODE - succeeds when EXIT_CODE and
+# NEEDS_RESTARTING_OUTPUT form a plugin result: 0, or 1 with at least one
+# package line.  dnf also exits 1 for errors it handles, such as a missing
+# cache, so exit 1 alone is no reboot requirement.
+needs_restarting_gave_result() {
+    local exit_code="$1"
+    [[ "${exit_code}" -eq 0 ]] && return 0
+    [[ "${exit_code}" -eq 1 ]] || return 1
+    [[ -n "$(printf '%s\n' "${NEEDS_RESTARTING_OUTPUT}" | parse_flagged_package_names)" ]]
+}
+
 run_needs_restarting() {
     local stderr_capture_file stderr_line exit_code=0
 
@@ -380,8 +392,8 @@ run_needs_restarting() {
     NEEDS_RESTARTING_OUTPUT=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
         "${DNF_BIN}" -q -C needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?
 
-    if [[ "${exit_code}" -gt 1 ]]; then
-        log_warn "cache-only needs-restarting exited ${exit_code} - retrying with a metadata refresh"
+    if ! needs_restarting_gave_result "${exit_code}"; then
+        log_warn "cache-only needs-restarting exited ${exit_code} without a result - retrying with a metadata refresh"
         exit_code=0
         NEEDS_RESTARTING_OUTPUT=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
             "${DNF_BIN}" -q needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?
@@ -580,21 +592,15 @@ main() {
         exit 0
     fi
 
-    if [[ "${needs_restarting_exit_code}" -gt 1 ]]; then
-        log_err "needs-restarting exited ${needs_restarting_exit_code} - cannot determine reboot state, not rebooting"
+    # Exit 1 without a package line is a dnf error, not the plugin's answer.
+    if ! needs_restarting_gave_result "${needs_restarting_exit_code}"; then
+        log_err "needs-restarting exited ${needs_restarting_exit_code} without naming a package - cannot determine reboot state, not rebooting"
         exit 2
     fi
 
     FLAGGED_PACKAGE_NAMES=()
     mapfile -t FLAGGED_PACKAGE_NAMES < <(printf '%s\n' "${NEEDS_RESTARTING_OUTPUT}" \
         | parse_flagged_package_names)
-
-    if [[ "${#FLAGGED_PACKAGE_NAMES[@]}" -eq 0 ]]; then
-        # needs-restarting said "reboot required" but named nothing we can
-        # parse.  Honour its exit code rather than discarding the signal.
-        log_err "needs-restarting reported a reboot requirement with no parseable package list - rebooting on its exit code"
-        exit 1
-    fi
 
     log "Packages flagged by needs-restarting: $(printf '%s,' "${FLAGGED_PACKAGE_NAMES[@]}" | sed 's/,$//')"
 

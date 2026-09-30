@@ -719,6 +719,27 @@ stub_needs_restarting() {
     }
 }
 
+test_decision_dnf_error_does_not_reboot() {
+    load_needs_reboot_library
+    # dnf exits 1 for errors it handles, the same code the plugin uses for
+    # "reboot required".  Without a package line it is no reboot decision.
+    stub_needs_restarting "1:${CACHE_ONLY_ERROR}" "1:${CACHE_ONLY_ERROR}"
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 2 "${exit_code}" "a dnf error is undecidable, never a reboot"
+}
+
+test_decision_cache_miss_retries_with_refresh() {
+    load_needs_reboot_library
+    stub_needs_restarting "1:${CACHE_ONLY_ERROR}" "1:Core libraries or services have been updated since boot-up:
+  * glibc"
+    local exit_code=0
+    run_needs_restarting >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "the refreshed run's result is used"
+    assert_equals "2" "$(grep -c 'needs-restarting' "${STUB_LOG}")" "retried after the cache-only error"
+    assert_contains "${NEEDS_RESTARTING_OUTPUT}" "* glibc" "refreshed output kept"
+}
+
 test_decision_temporary_file_failure_removes_nothing() {
     load_needs_reboot_library
     stub_needs_restarting "0:" "0:"
@@ -1448,6 +1469,8 @@ run_test "classify: schedules genuine kernel reboot" test_classify_schedules_gen
 run_test "classify: keeps package when verifier missing" test_classify_keeps_package_when_verifier_missing
 
 printf 'decision\n'
+run_test "decision: dnf error does not reboot"       test_decision_dnf_error_does_not_reboot
+run_test "decision: cache miss retries with refresh" test_decision_cache_miss_retries_with_refresh
 run_test "decision: temporary file failure removes nothing" test_decision_temporary_file_failure_removes_nothing
 
 printf 'repositories\n'

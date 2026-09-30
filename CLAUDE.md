@@ -234,6 +234,11 @@ leaves a host running known-vulnerable code, so it is never the default.
 | 1 | Reboot needed |
 | 2 | Undecidable: tool error, or a genuine kernel update that rebooting would not apply |
 
+`needs-restarting -r` exits 1 both for "reboot required" and for any error dnf
+handles, such as a missing cache. Only exit 1 with at least one `  * <name>` line is a
+reboot requirement; exit 1 without one is retried once with a metadata refresh, then
+reported as code 2.
+
 Code 2 does not reboot, to avoid a loop. `run.sh` escalates it to a non-zero exit so
 `OnFailure=` fires and the fail-open is never silent.
 
