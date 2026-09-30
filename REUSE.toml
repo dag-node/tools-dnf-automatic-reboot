@@ -3,8 +3,9 @@
 # Every source file states its own licence in a one-line `SPDX-License-Identifier` header. The
 # copyright holder is declared here instead of in each file, so it is single-sourced: a file added
 # later inherits it without a header line of its own, and the year is one line to update rather
-# than a tree-wide sweep. `precedence = "aggregate"` means a file's own header wins where it has one and
-# these annotations only fill the gaps.
+# than a tree-wide sweep. `precedence = "closest"` means a file's own header wins where it has one and
+# these annotations only fill the gaps, separately for copyright and for licence: the spec keeps its
+# MIT header and takes its copyright from here. `aggregate` would add GPL-2.0-or-later to the spec.
 #
 # The project is GPL-2.0-or-later. The RPM spec is MIT, as in every DagNode project: it is
 # packaging machinery, not the program, and its header says so.
@@ -20,7 +21,7 @@ SPDX-PackageDownloadLocation = "https://github.com/dag-node/tools-dnf-automatic-
 # Catch-all: the maintainer's own work.
 [[annotations]]
 path = "**"
-precedence = "aggregate"
+precedence = "closest"
 SPDX-FileCopyrightText = "2026 Ondřej Nedomlel <tools@dagnode.com>"
 SPDX-License-Identifier = "GPL-2.0-or-later"
 
