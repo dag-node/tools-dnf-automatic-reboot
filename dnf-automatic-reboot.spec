@@ -549,8 +549,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   withheld the next genuine kernel reboot.
 - FIX: The reboot check no longer removes /dev/null when it cannot create a temporary file; it
   fails without rebooting.
-- FIX: The watchdog re-checks the run right before stopping it, and no new run starts until the
-  kill is done. A run that ended during the watchdog's own reboot check, and the next run that
+- FIX: The watchdog re-checks the run right before stopping it, and no new run starts until its
+  recovery ends, or, when it reboots, until that reboot. A run that ended during the watchdog's own reboot check, and the next run that
   started meanwhile, could otherwise be killed mid-update and the host rebooted. A process whose
   identity systemd cannot confirm is left alone.
 - FIX: The watchdog counts a stuck run as stopped only once systemd reports it inactive or

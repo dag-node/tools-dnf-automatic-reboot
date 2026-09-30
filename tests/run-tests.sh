@@ -1354,8 +1354,20 @@ stub_watchdog_kill_path() {
         [[ "${STUB_KILL_FAILS:-}" == "yes" ]] && return 1
         return 0
     }
-    reboot_now() { printf 'reboot_now\n' >> "${STUB_LOG}"; }
-    schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
+    reboot_now() {
+        printf 'reboot_now recovery_file=%s state_file=%s\n' \
+            "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${STATE_FILE}")" >> "${STUB_LOG}"
+    }
+    schedule_reboot() {
+        printf 'schedule_reboot recovery_file=%s\n' "$(file_presence "${RECOVERY_FILE}")" >> "${STUB_LOG}"
+        [[ "${STUB_SCHEDULE_FAILS:-}" == "yes" ]] && return 1
+        return 0
+    }
+}
+
+# file_presence PATH -> present or absent
+file_presence() {
+    if [[ -e "$1" ]]; then printf present; else printf absent; fi
 }
 
 test_watchdog_failed_kill_keeps_supervision() {
@@ -1406,8 +1418,56 @@ test_watchdog_no_run_starts_during_the_kill() {
     assert_exit_code 0 "${exit_code}" "a confirmed kill at the hard timeout succeeds"
     assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes recovery_file=present" \
         "the main unit is blocked from starting while its run is killed"
-    assert_contains "$(cat "${STUB_LOG}")" "reboot_now" "phase=checking reboots after the kill"
-    [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery file must be removed after the kill"
+    # A run starting after the kill would have its state file removed and
+    # be rebooted under; the marker must outlast the reboot request.
+    assert_contains "$(cat "${STUB_LOG}")" "reboot_now recovery_file=present state_file=absent" \
+        "no run can start between the state cleanup and the reboot"
+    [[ -f "${RECOVERY_FILE}" ]] || fail "the marker must stay while the reboot is pending"
+    return 0
+}
+
+test_watchdog_scheduled_reboot_keeps_runs_blocked() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state checking 70 "${background_pid}"
+    stub_watchdog_kill_path
+    run_independent_reboot_check() { return 1; }
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 0 "${exit_code}" "the reboot is scheduled"
+    assert_contains "$(cat "${STUB_LOG}")" "schedule_reboot recovery_file=present" "blocked through the decision"
+    [[ -f "${RECOVERY_FILE}" ]] || fail "no update may start before the scheduled reboot"
+    return 0
+}
+
+test_watchdog_recovery_without_reboot_allows_runs_again() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    # phase=updating at the hard timeout: killed, not rebooted.
+    write_watchdog_state updating 200 "${background_pid}"
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 0 "${exit_code}" "recovery completes"
+    assert_not_contains "$(cat "${STUB_LOG}")" "reboot_now" "no reboot while updating"
+    [[ -f "${RECOVERY_FILE}" ]] && fail "with no reboot pending the next run must be allowed"
+    return 0
+}
+
+test_watchdog_failed_schedule_allows_runs_again() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state checking 70 "${background_pid}"
+    stub_watchdog_kill_path
+    export STUB_SCHEDULE_FAILS=yes
+    run_independent_reboot_check() { return 1; }
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "the failed dispatch fails the watchdog"
+    [[ -f "${RECOVERY_FILE}" ]] && fail "no reboot is pending, so runs must be allowed again"
     return 0
 }
 
@@ -1415,9 +1475,9 @@ test_watchdog_recovery_file_blocks_the_main_unit() {
     grep -qx 'ConditionPathExists=!/run/dnf-automatic-reboot.recovery' \
         "${REPO_ROOT}/units/dnf-automatic-reboot.service" \
         || fail "dnf-automatic-reboot.service must not start while the watchdog kills a run"
-    grep -qx 'ExecStopPost=/usr/bin/rm -f /run/dnf-automatic-reboot.recovery' \
+    grep -q '^ExecStopPost=.*SERVICE_RESULT.*rm -f /run/dnf-automatic-reboot.recovery' \
         "${REPO_ROOT}/units/dnf-automatic-watchdog.service" \
-        || fail "a watchdog stopped at its timeout must not leave the recovery file behind"
+        || fail "a watchdog that failed or timed out must not leave the recovery file behind"
 }
 
 test_watchdog_replaced_run_is_not_killed() {
@@ -1955,6 +2015,9 @@ run_test "watchdog: replaced run is not killed"      test_watchdog_replaced_run_
 run_test "watchdog: failed kill keeps supervision"   test_watchdog_failed_kill_keeps_supervision
 run_test "watchdog: unconfirmed kill signals no pid" test_watchdog_unconfirmed_kill_signals_no_pid
 run_test "watchdog: no run starts during the kill"   test_watchdog_no_run_starts_during_the_kill
+run_test "watchdog: scheduled reboot keeps runs blocked" test_watchdog_scheduled_reboot_keeps_runs_blocked
+run_test "watchdog: recovery without reboot allows runs" test_watchdog_recovery_without_reboot_allows_runs_again
+run_test "watchdog: failed schedule allows runs again" test_watchdog_failed_schedule_allows_runs_again
 run_test "watchdog: recovery file blocks the main unit" test_watchdog_recovery_file_blocks_the_main_unit
 run_test "watchdog: unknown identity is not acted on" test_watchdog_unknown_identity_is_not_acted_on
 run_test "watchdog: dispatch failure fails the watchdog" test_watchdog_dispatch_failure_fails_the_watchdog

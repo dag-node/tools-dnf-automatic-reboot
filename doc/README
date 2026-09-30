@@ -357,6 +357,12 @@ Scheduled reboots
   systemctl list-timers dnf-automatic-reboot-scheduled-reboot.timer
   systemctl stop dnf-automatic-reboot-scheduled-reboot.timer   # cancel it
 
+  A reboot the watchdog scheduled after stopping a stuck run also keeps
+  /run/dnf-automatic-reboot.recovery, which holds off every update run until
+  the reboot.  After cancelling such a reboot, allow runs again with:
+
+  rm -f /run/dnf-automatic-reboot.recovery
+
   If the reboot itself fails to start, dnf-automatic-reboot-notify@ reports
   the failed dnf-automatic-reboot-scheduled-reboot.service.
 

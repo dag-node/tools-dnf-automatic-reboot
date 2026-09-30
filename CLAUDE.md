@@ -287,13 +287,20 @@ reboot. A changed `phase`, `start_uptime` or `pid`, or a `pid` that is no longer
 with no numeric `MainPID` abandons it with exit 1.
 
 `systemctl kill` names the unit, not one invocation of it, so the re-check alone would
-leave a moment in which a new run could start and be killed. The watchdog therefore
-creates `/run/dnf-automatic-reboot.recovery` before the re-check and removes it after the
-kill, and `dnf-automatic-reboot.service` carries
+leave a moment in which a new run could start and be killed, have its state file
+removed, and be rebooted under. The watchdog therefore creates
+`/run/dnf-automatic-reboot.recovery` before the re-check, and
+`dnf-automatic-reboot.service` carries
 `ConditionPathExists=!/run/dnf-automatic-reboot.recovery`: no run starts while the file
-exists, and a run that started before it shows in the re-check. The watchdog unit's
-`ExecStopPost=` removes the file if `TimeoutStartSec=` stops the watchdog first. A timer
-start skipped by the condition waits for the next `OnCalendar=`.
+exists, and a run that started before it shows in the re-check. The file covers the
+kill, the state-file removal and the reboot decision. When the watchdog requests or
+schedules a reboot the file stays, so no update starts before that reboot, which empties
+`/run`; every other exit removes it through the EXIT trap. The watchdog unit's
+`ExecStopPost=` removes it when `$SERVICE_RESULT` is not `success`, covering a watchdog
+that failed or was stopped by `TimeoutStartSec=`. A timer start skipped by the
+condition waits for the next `OnCalendar=`. Cancelling a watchdog-scheduled reboot takes
+`systemctl stop dnf-automatic-reboot-scheduled-reboot.timer` and
+`rm -f /run/dnf-automatic-reboot.recovery`.
 
 After the kill, the watchdog waits up to `watchdog_kill_confirm_sec` for systemd to report
 the unit `inactive` or `failed`. A failed `systemctl kill`, or a unit still active then,

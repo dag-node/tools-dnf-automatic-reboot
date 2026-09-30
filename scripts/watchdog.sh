@@ -210,6 +210,40 @@ signal_unit_processes() {
     "${SYSTEMCTL_BIN}" kill "$1" --signal=SIGKILL "${MAIN_SERVICE_UNIT}" 2>/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# Recovery marker.
+#
+# RECOVERY_FILE exists from before the identity re-check until recovery ends,
+# and the main unit's ConditionPathExists=! refuses to start while it does.
+# No new run can start between the re-check and the kill, while the state file
+# is removed, or during the reboot decision; a run started before the file
+# existed shows in the re-check.  When recovery requests or schedules a reboot
+# the file stays, so no update starts before that reboot, and /run is emptied
+# by it.  Every other exit removes it, through the EXIT trap.
+# ---------------------------------------------------------------------------
+RECOVERY_REBOOT_PENDING=0
+# Set by schedule_reboot.
+SCHEDULED_REBOOT_SUMMARY=""
+
+# begin_recovery - creates RECOVERY_FILE, or exits 1 when it cannot.
+begin_recovery() {
+    if ! : > "${RECOVERY_FILE}" 2>/dev/null; then
+        log_err "cannot create ${RECOVERY_FILE} - a new run could start during recovery, recovery abandoned"
+        exit 1
+    fi
+    trap end_recovery EXIT
+}
+
+# end_recovery - the EXIT trap: removes RECOVERY_FILE unless a reboot is
+# pending.
+end_recovery() {
+    if [[ "${RECOVERY_REBOOT_PENDING}" -eq 1 ]]; then
+        log "no update run starts before the reboot; to cancel the reboot and allow runs again: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer; rm -f /run/dnf-automatic-reboot.recovery"
+        return 0
+    fi
+    rm -f "${RECOVERY_FILE}"
+}
+
 # kill_service_cgroup PHASE START_UPTIME PID
 # Returns: 0 = the recorded run was killed and systemd reports the unit
 #              inactive or failed
@@ -217,28 +251,10 @@ signal_unit_processes() {
 #          2 = the run's identity cannot be established; no process signalled
 #          3 = the kill failed, or the unit was still active
 #              KILL_CONFIRM_SEC seconds after it: recovery failed
-#
-# RECOVERY_FILE exists from before the identity check until this returns, and
-# the main unit's ConditionPathExists=! refuses to start while it does, so no
-# new run can start between the check and the kill.  Any run already started
-# before the file existed shows in the check as a changed state file or
-# MainPID.  The kill targets the unit's cgroup only; the recorded PID is never
-# signalled on its own, since by then its number may belong to another
-# process.
+# Called between begin_recovery and the end of recovery.  The kill targets the
+# unit's cgroup only; the recorded PID is never signalled on its own, since by
+# then its number may belong to another process.
 kill_service_cgroup() {
-    local kill_result=0
-    if ! : > "${RECOVERY_FILE}" 2>/dev/null; then
-        log_err "cannot create ${RECOVERY_FILE} - a new run could start during the kill, recovery abandoned"
-        return 3
-    fi
-    kill_recorded_run "$@" || kill_result=$?
-    rm -f "${RECOVERY_FILE}"
-    return "${kill_result}"
-}
-
-# kill_recorded_run PHASE START_UPTIME PID - kill_service_cgroup's work,
-# run while RECOVERY_FILE blocks new runs.
-kill_recorded_run() {
     local recorded_phase="$1" recorded_start_uptime="$2" recorded_pid="$3"
     local systemd_version kill_target_option run_check_result=0 active_state="" waited_seconds=0
     recorded_run_is_unchanged "${recorded_phase}" "${recorded_start_uptime}" "${recorded_pid}" \
@@ -404,6 +420,7 @@ main() {
     # ---------------------------------------------------------------------------
     if [[ "${elapsed_min}" -ge "${HARD_TIMEOUT_MIN}" ]]; then
         log_err "hard timeout ${HARD_TIMEOUT_MIN}min exceeded - PID ${service_pid} still alive in phase=${run_phase}"
+        begin_recovery
         kill_result=0
         kill_service_cgroup "${run_phase}" "${start_uptime_seconds}" "${service_pid}" || kill_result=$?
         [[ "${kill_result}" -eq 1 ]] && exit 0
@@ -413,7 +430,11 @@ main() {
         if [[ "${run_phase}" == "checking" || "${FORCE_REBOOT_ON_HARD_TIMEOUT}" == "yes" ]]; then
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded." \
                      "Killed the stuck run and rebooting now."
-            reboot_now
+            if ! reboot_now; then
+                log_err "reboot request failed - the host was not rebooted"
+                exit 1
+            fi
+            RECOVERY_REBOOT_PENDING=1
         else
             log_err "phase=${run_phase} at hard timeout - an rpm transaction may be incomplete, NOT rebooting; set force_reboot_on_hard_timeout=yes to override"
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded in phase=${run_phase}." \
@@ -451,6 +472,7 @@ main() {
             # Kill the stuck run so it cannot hold the inhibitor lock past the
             # reboot.  The check took time: when the run it was made for has
             # ended, or another run has started, its decision is not acted on.
+            begin_recovery
             kill_result=0
             kill_service_cgroup "${run_phase}" "${start_uptime_seconds}" "${service_pid}" || kill_result=$?
             [[ "${kill_result}" -eq 1 ]] && exit 0
@@ -463,6 +485,7 @@ main() {
                     ;;
                 1)
                     schedule_reboot || exit 1
+                    RECOVERY_REBOOT_PENDING=1
                     log "Watchdog: stuck run killed; ${SCHEDULED_REBOOT_SUMMARY}"
                     ;;
                 *)
