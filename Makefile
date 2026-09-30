@@ -27,6 +27,11 @@ TMPFILES  = tmpfiles/$(NAME).conf
 LOGROTATE = logrotate/$(NAME)
 DOC       = doc/README
 LICENSE   = LICENSE
+# Licence texts and copyright metadata: the spec is MIT, so a source archive
+# carries the MIT text and REUSE.toml, which names the copyright holder.
+LICENSE_METADATA = REUSE.toml LICENSES/GPL-2.0-or-later.txt LICENSES/MIT.txt
+# Run by container-rpm, so an unpacked source archive can build the same way.
+CONTAINER_BUILD_SCRIPT = .github/scripts/build-in-container.sh
 
 TESTS = tests/run-tests.sh
 # Operator diagnostics: linted with the scripts, never installed.
@@ -114,7 +119,8 @@ uninstall:
 dist: check
 	tar czf $(TARBALL) --transform 's,^,$(NAME)-$(VERSION)/,' \
 	    Makefile $(SCRIPTS) $(UNITS) $(CONF) $(TMPFILES) $(LOGROTATE) \
-	    $(TESTS) $(TOOLS) $(DOC) $(LICENSE) $(NAME).spec
+	    $(TESTS) $(TOOLS) $(DOC) $(LICENSE) $(LICENSE_METADATA) $(NAME).spec \
+	    $(CONTAINER_BUILD_SCRIPT)
 	@echo "Created $(TARBALL)"
 
 rpm: dist
@@ -125,7 +131,7 @@ rpm: dist
 container-rpm:
 	$(PODMAN) run --rm --security-opt label=disable -v "$(CURDIR):/src" -w /src \
 	    -e EL="$(EL)" -e RPM_RELEASE="$(CONTAINER_RPM_RELEASE)" \
-	    "quay.io/rockylinux/rockylinux:$(EL)" bash /src/.github/scripts/build-in-container.sh
+	    "quay.io/rockylinux/rockylinux:$(EL)" bash /src/$(CONTAINER_BUILD_SCRIPT)
 	@echo "Built:"; ls -1 $(RPM_OUTPUT_DIRECTORY)/el$(EL)/RPMS/noarch/*.rpm
 
 clean:
