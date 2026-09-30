@@ -346,6 +346,21 @@ Restart-state learning
   learn_false_positives = no
 
 
+Scheduled reboots
+-----------------
+
+  A reboot runs from the transient timer
+  dnf-automatic-reboot-scheduled-reboot.timer, reboot_delay_sec after the
+  decision; run.sh and the watchdog use the same name.  The wall message and
+  the log give the time.
+
+  systemctl list-timers dnf-automatic-reboot-scheduled-reboot.timer
+  systemctl stop dnf-automatic-reboot-scheduled-reboot.timer   # cancel it
+
+  If the reboot itself fails to start, dnf-automatic-reboot-notify@ reports
+  the failed dnf-automatic-reboot-scheduled-reboot.service.
+
+
 Forcing a manual run
 --------------------
 

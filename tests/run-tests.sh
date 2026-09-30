@@ -162,6 +162,8 @@ if [[ "$1" == "show" ]]; then
     exit 0
 fi
 printf 'systemctl %s\n' "$*" >> "${STUB_LOG}"
+# is-active: 3 (inactive) unless a test sets STUB_IS_ACTIVE_RC.
+[[ "$1" == "is-active" ]] && exit "${STUB_IS_ACTIVE_RC:-3}"
 [[ "${STUB_SYSTEMCTL_FAIL:-}" == "yes" ]] && exit 1
 exit 0
 STUB
@@ -918,6 +920,27 @@ test_services_restart_is_bounded() {
     assert_contains "$(cat "${STUB_LOG}")" "timeout 300s ${TEST_ROOT_DIR}/usr/bin/systemctl try-restart sshd.service" \
         "each restart runs under the configured bound"
     assert_contains "${output}" "did not finish within 300s" "an expired restart is reported"
+}
+
+test_reboot_is_scheduled_on_a_named_unit() {
+    load_run_library
+    schedule_reboot >/dev/null 2>&1
+    assert_exit_code 0 "$?" "dispatch succeeds"
+    local dispatch_call
+    dispatch_call=$(grep '^systemd-run' "${STUB_LOG}")
+    assert_contains "${dispatch_call}" "--unit=dnf-automatic-reboot-scheduled-reboot" "an operator can find the reboot"
+    assert_contains "${dispatch_call}" "OnFailure=dnf-automatic-reboot-notify@dnf-automatic-reboot-scheduled-reboot.service.service" \
+        "a reboot that fails to start is reported"
+    assert_contains "${SCHEDULED_REBOOT_SUMMARY}" "cancel with: systemctl stop dnf-automatic-reboot-scheduled-reboot.timer" \
+        "the summary says how to cancel it"
+}
+
+test_reboot_already_scheduled_is_not_scheduled_twice() {
+    load_run_library
+    export STUB_IS_ACTIVE_RC=0
+    schedule_reboot >/dev/null 2>&1
+    assert_exit_code 0 "$?" "an active reboot timer is success"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run" "no second transient unit"
 }
 
 test_run_helper_failure_fails_the_run() {
@@ -1798,6 +1821,8 @@ run_test "run: helper failure fails the run"        test_run_helper_failure_fail
 run_test "run: pending restart fails the run"       test_run_pending_restart_fails_the_run
 run_test "run: failed restart fails the run"        test_run_failed_restart_fails_the_run
 run_test "run: completion summary names every outcome" test_run_completion_summary_names_every_outcome
+run_test "run: reboot is scheduled on a named unit"  test_reboot_is_scheduled_on_a_named_unit needs-exec
+run_test "run: reboot already scheduled is kept"     test_reboot_already_scheduled_is_not_scheduled_twice needs-exec
 run_test "run: service restarts stay supervised"    test_run_service_restarts_stay_supervised
 
 printf 'repositories\n'

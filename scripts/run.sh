@@ -50,6 +50,8 @@ readonly DNF_AUTOMATIC_BIN="${TEST_ROOT}/usr/bin/dnf-automatic"
 readonly SYSTEMD_RUN_BIN="${TEST_ROOT}/usr/bin/systemd-run"
 readonly SYSTEMCTL_BIN="${TEST_ROOT}/usr/bin/systemctl"
 readonly SCRIPT_NAME=run
+# Transient unit that carries a scheduled reboot; the watchdog uses the same.
+readonly SCHEDULED_REBOOT_UNIT=dnf-automatic-reboot-scheduled-reboot
 SERVICE_PID=$$
 
 # ---------------------------------------------------------------------------
@@ -223,6 +225,7 @@ FAILED_SERVICE_NAMES=()
 PENDING_SERVICE_NAMES=()
 EXCLUDED_SERVICE_NAMES=()
 SERVICE_RESTART_SUMMARY="stale services not checked"
+SCHEDULED_REBOOT_SUMMARY=""
 
 # ---------------------------------------------------------------------------
 # Cleanup handler - run by the EXIT trap
@@ -456,18 +459,37 @@ run_reboot_check() {
 
 # ---------------------------------------------------------------------------
 # Schedule a reboot through a transient systemd timer.
+#
+# Sets SCHEDULED_REBOOT_SUMMARY to the reboot time and the command that
+# cancels it.  An active timer of the same name is an already scheduled
+# reboot, from the watchdog or an earlier run, and is left as it is.
 # ---------------------------------------------------------------------------
 schedule_reboot() {
-    local systemd_run_exit_code=0
-    log "Scheduling reboot in ${REBOOT_DELAY_SEC}s"
-    wall_msg "dnf-automatic-reboot: Updates complete. System will reboot in ${REBOOT_DELAY_SEC} seconds."
+    local systemd_run_exit_code=0 reboot_time
+    reboot_time=$(date -d "@$(( $(date +%s) + REBOOT_DELAY_SEC ))" '+%F %T %Z')
+    SCHEDULED_REBOOT_SUMMARY="reboot scheduled for ${reboot_time}; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+    if "${SYSTEMCTL_BIN}" is-active --quiet "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null; then
+        SCHEDULED_REBOOT_SUMMARY="reboot already scheduled; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+        log "${SCHEDULED_REBOOT_UNIT}.timer is already active - not scheduling a second reboot"
+        return 0
+    fi
+    # A transient unit left failed by an earlier attempt in this boot keeps
+    # its name taken until reset.
+    "${SYSTEMCTL_BIN}" reset-failed "${SCHEDULED_REBOOT_UNIT}.service" "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null || true
+    log "scheduling reboot in ${REBOOT_DELAY_SEC}s"
+    wall_msg "dnf-automatic-reboot: Updates installed. System will reboot at ${reboot_time}." \
+             "Cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+    # A named unit an operator can find and stop; OnFailure= reports a reboot
+    # that systemctl could not start, such as one blocked by an inhibitor.
     "${SYSTEMD_RUN_BIN}" \
+        --unit="${SCHEDULED_REBOOT_UNIT}" \
         --on-active="${REBOOT_DELAY_SEC}" \
         --timer-property=AccuracySec=1s \
+        --property="OnFailure=dnf-automatic-reboot-notify@${SCHEDULED_REBOOT_UNIT}.service.service" \
         --description="dnf-automatic-reboot scheduled reboot" \
         "${SYSTEMCTL_BIN}" reboot || systemd_run_exit_code=$?
     if [[ "${systemd_run_exit_code}" -eq 0 ]]; then
-        log "Reboot dispatch confirmed: systemd-run accepted the transient timer"
+        log "Reboot dispatch confirmed: ${SCHEDULED_REBOOT_UNIT}.timer fires at ${reboot_time}; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
         return 0
     fi
     log_err "Reboot dispatch FAILED: systemd-run exited ${systemd_run_exit_code} - system will NOT reboot"
@@ -537,6 +559,8 @@ main() {
             ;;
         1)
             schedule_reboot || exit 1
+            SERVICE_RESTART_SUMMARY="service restarts skipped, the reboot replaces them"
+            report_completion "${SCHEDULED_REBOOT_SUMMARY}" 0
             ;;
         *)
             log_err "needs-reboot.sh exited ${needs_reboot_exit_code}: reboot state could not be established - not rebooting. Updates were applied; the host may still need a manual reboot."

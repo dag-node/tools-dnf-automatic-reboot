@@ -51,6 +51,8 @@ readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
 readonly SYSTEMD_RUN_BIN="${TEST_ROOT}/usr/bin/systemd-run"
 readonly SYSTEMCTL_BIN="${TEST_ROOT}/usr/bin/systemctl"
 readonly MAIN_SERVICE_UNIT=dnf-automatic-reboot.service
+# Transient unit that carries a scheduled reboot; run.sh uses the same.
+readonly SCHEDULED_REBOOT_UNIT=dnf-automatic-reboot-scheduled-reboot
 readonly SCRIPT_NAME=watchdog
 
 # ---------------------------------------------------------------------------
@@ -244,20 +246,35 @@ reboot_now() {
 }
 
 # ---------------------------------------------------------------------------
-# Schedule a delayed reboot through a transient systemd timer.
+# Schedule a delayed reboot through a transient systemd timer, named as in
+# run.sh; an active timer of that name is a reboot already scheduled.
 # ---------------------------------------------------------------------------
 schedule_reboot() {
-    local systemd_run_exit_code=0
+    local systemd_run_exit_code=0 reboot_time
+    reboot_time=$(date -d "@$(( $(date +%s) + REBOOT_DELAY_SEC ))" '+%F %T %Z')
+    SCHEDULED_REBOOT_SUMMARY="reboot scheduled for ${reboot_time}; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+    if "${SYSTEMCTL_BIN}" is-active --quiet "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null; then
+        SCHEDULED_REBOOT_SUMMARY="reboot already scheduled; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+        log "${SCHEDULED_REBOOT_UNIT}.timer is already active - not scheduling a second reboot"
+        return 0
+    fi
+    # A transient unit left failed by an earlier attempt in this boot keeps
+    # its name taken until reset.
+    "${SYSTEMCTL_BIN}" reset-failed "${SCHEDULED_REBOOT_UNIT}.service" "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null || true
     log "Watchdog scheduling reboot in ${REBOOT_DELAY_SEC}s"
-    wall_msg "dnf-automatic-reboot: Watchdog detected stuck check." \
-             "Scheduling reboot in ${REBOOT_DELAY_SEC} seconds."
+    wall_msg "dnf-automatic-reboot: Watchdog detected stuck check. System will reboot at ${reboot_time}." \
+             "Cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+    # A named unit an operator can find and stop; OnFailure= reports a reboot
+    # that systemctl could not start, such as one blocked by an inhibitor.
     "${SYSTEMD_RUN_BIN}" \
+        --unit="${SCHEDULED_REBOOT_UNIT}" \
         --on-active="${REBOOT_DELAY_SEC}" \
         --timer-property=AccuracySec=1s \
+        --property="OnFailure=dnf-automatic-reboot-notify@${SCHEDULED_REBOOT_UNIT}.service.service" \
         --description="dnf-automatic-reboot watchdog reboot" \
         "${SYSTEMCTL_BIN}" reboot || systemd_run_exit_code=$?
     if [[ "${systemd_run_exit_code}" -eq 0 ]]; then
-        log "Reboot dispatch confirmed: systemd-run accepted the transient timer"
+        log "Reboot dispatch confirmed: ${SCHEDULED_REBOOT_UNIT}.timer fires at ${reboot_time}; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
         return 0
     fi
     log_err "Reboot dispatch FAILED: systemd-run exited ${systemd_run_exit_code} - system will NOT reboot"
@@ -402,6 +419,7 @@ main() {
                     ;;
                 1)
                     schedule_reboot || exit 1
+                    log "Watchdog: stuck run killed; ${SCHEDULED_REBOOT_SUMMARY}"
                     ;;
                 *)
                     log_err "Watchdog: needs-reboot.sh exited ${needs_reboot_exit_code}: reboot state could not be established - killed the stuck run, not rebooting"
