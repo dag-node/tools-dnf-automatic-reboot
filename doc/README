@@ -4,8 +4,9 @@ dnf-automatic-reboot
 Unattended update + conditional reboot for EL8 and EL9 (RHEL, Oracle Linux).
 Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
 
-  - Holds a systemd shutdown inhibitor while updates are in progress so an
-    accidental reboot does not corrupt a partial update.
+  - Runs dnf-automatic under a systemd shutdown inhibitor, so an accidental
+    reboot does not corrupt a partial update; when logind refuses the lock,
+    no update runs and the run fails.
   - Filters false-positive reboot triggers on positive evidence only: the
     running kernel already being the newest installed one, or matching ELF
     build-ids between a running daemon and its on-disk binary.  Anything

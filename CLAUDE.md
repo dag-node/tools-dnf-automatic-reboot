@@ -288,7 +288,7 @@ accepts only the old spelling, 252 accepts either; `systemctl_kill_target_option
 it from
 `systemctl --version`). On RHEL 8.10 (systemd 239), `--kill-who=all --signal=SIGKILL`
 on a transient unit killed an orphaned grandchild left in its cgroup, which is the case
-this kill exists for. `dnf-automatic` runs as a grandchild behind
+this kill exists for. `dnf-automatic` runs behind `systemd-inhibit` and
 `timeout(1)`, so signalling the recorded PID and its direct children leaves the rpm
 transaction running while the caller proceeds to reboot.
 

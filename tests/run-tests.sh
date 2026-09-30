@@ -752,6 +752,49 @@ test_decision_temporary_file_failure_removes_nothing() {
 }
 
 # ---------------------------------------------------------------------------
+# run: no update without the inhibitor lock
+# ---------------------------------------------------------------------------
+# stub_run_main: stubs every step of run.sh's main that would reach the host.
+# systemd-inhibit runs its command unless STUB_INHIBITOR_REFUSED=yes; timeout,
+# through which dnf-automatic runs, exits STUB_DNF_AUTOMATIC_RC.
+stub_run_main() {
+    check_conflicts() { :; }
+    warn_on_unapplied_security_advisories() { :; }
+    pgrep() { return 1; }
+    systemd-inhibit() {
+        printf 'systemd-inhibit %s\n' "$*" >> "${STUB_LOG}"
+        [[ "${STUB_INHIBITOR_REFUSED:-}" == "yes" ]] && return 1
+        while [[ "$1" == --* ]]; do shift; done
+        "$@"
+    }
+    timeout() {
+        printf 'timeout %s\n' "$*" >> "${STUB_LOG}"
+        return "${STUB_DNF_AUTOMATIC_RC:-0}"
+    }
+}
+
+test_run_refused_inhibitor_stops_the_update() {
+    load_run_library
+    stub_run_main
+    export STUB_INHIBITOR_REFUSED=yes
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "the run fails"
+    assert_equals "0" "$(grep -c "^timeout" "${STUB_LOG}")" "dnf-automatic never starts without the lock"
+}
+
+test_run_update_runs_inside_the_inhibitor() {
+    load_run_library
+    stub_run_main
+    run_dnf_automatic_under_inhibitor >/dev/null 2>&1
+    local inhibitor_call
+    inhibitor_call=$(grep '^systemd-inhibit' "${STUB_LOG}")
+    assert_contains "${inhibitor_call}" "--mode=block" "a blocking lock"
+    assert_contains "${inhibitor_call}" "timeout --kill-after=" "the update is the lock's own command"
+    assert_contains "${inhibitor_call}" "/usr/bin/dnf-automatic" "dnf-automatic runs under it"
+}
+
+# ---------------------------------------------------------------------------
 # services: restarting the wrong unit takes the host down
 # ---------------------------------------------------------------------------
 test_conflicts_refuse_apply_updates_off() {
@@ -1472,6 +1515,10 @@ printf 'decision\n'
 run_test "decision: dnf error does not reboot"       test_decision_dnf_error_does_not_reboot
 run_test "decision: cache miss retries with refresh" test_decision_cache_miss_retries_with_refresh
 run_test "decision: temporary file failure removes nothing" test_decision_temporary_file_failure_removes_nothing
+
+printf 'run\n'
+run_test "run: refused inhibitor stops the update"   test_run_refused_inhibitor_stops_the_update
+run_test "run: update runs inside the inhibitor"     test_run_update_runs_inside_the_inhibitor
 
 printf 'repositories\n'
 run_test "repositories: unsigned enabled repo is reported"  test_repositories_unsigned_enabled_is_reported

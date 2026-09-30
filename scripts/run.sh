@@ -6,14 +6,12 @@
 #
 # Sequence:
 #   1. Detect concurrent dnf processes and warn via wall(1).
-#   2. Acquire a systemd inhibitor lock so shutdown/reboot is blocked
-#      for the duration of the update.
-#   3. Write a state file consumed by watchdog.sh.
-#   4. Run dnf-automatic under a hard wall-clock timeout.
-#   5. On completion (or timeout), call needs-reboot.sh to decide whether
-#      a reboot is required, filtering known false positives.
-#   6. Release the inhibitor lock.
-#   7. Schedule a reboot if needed; otherwise restart the services whose
+#   2. Write a state file consumed by watchdog.sh.
+#   3. Run dnf-automatic under a hard wall-clock timeout, as the child of a
+#      systemd inhibitor lock that blocks shutdown and reboot until it exits.
+#   4. Call needs-reboot.sh to decide whether a reboot is required,
+#      filtering known false positives.
+#   5. Schedule a reboot if needed; otherwise restart the services whose
 #      running processes still map pre-update files.
 #
 # State file /run/dnf-automatic-reboot.state
@@ -51,9 +49,7 @@ readonly DNF_BIN="${TEST_ROOT}/usr/bin/dnf"
 readonly DNF_AUTOMATIC_BIN="${TEST_ROOT}/usr/bin/dnf-automatic"
 readonly SYSTEMD_RUN_BIN="${TEST_ROOT}/usr/bin/systemd-run"
 readonly SYSTEMCTL_BIN="${TEST_ROOT}/usr/bin/systemctl"
-readonly SLEEP_BIN="${TEST_ROOT}/usr/bin/sleep"
 readonly SCRIPT_NAME=run
-INHIBITOR_PID=0
 SERVICE_PID=$$
 
 # ---------------------------------------------------------------------------
@@ -222,14 +218,10 @@ NEEDS_RESTARTING_TIMEOUT_SEC=$(conf_get_int needs_restarting_timeout_sec 120)
 
 # ---------------------------------------------------------------------------
 # Cleanup handler - always runs on exit
-# Releases inhibitor lock and removes state/lock files.
+# Removes state/lock files.
 # ---------------------------------------------------------------------------
 cleanup() {
     local exit_code=$?
-    if [[ "${INHIBITOR_PID}" -gt 0 ]]; then
-        kill "${INHIBITOR_PID}" 2>/dev/null || true
-        wait "${INHIBITOR_PID}" 2>/dev/null || true
-    fi
     rm -f "${STATE_FILE}" "${LOCK_FILE}"
     log "Exiting rc=${exit_code}"
     exit "${exit_code}"
@@ -385,6 +377,28 @@ warn_on_unapplied_security_advisories() {
 }
 
 # ---------------------------------------------------------------------------
+# Run dnf-automatic under the inhibitor lock and a hard timeout.
+#
+# systemd-inhibit takes a block-mode shutdown:sleep lock from logind before it
+# starts its command, holds it for exactly as long as that command runs, and
+# exits non-zero without starting the command when the lock is refused.  No
+# update runs unprotected, and the lock is gone before any reboot is
+# scheduled.  An admin can still force-reboot with: systemctl reboot --force
+#
+# timeout sends SIGTERM at DNF_TIMEOUT_MIN minutes, then SIGKILL after
+# KILL_GRACE_SEC seconds; 124 = timed out.  Returns dnf-automatic's exit code,
+# or systemd-inhibit's when the lock was refused.
+# ---------------------------------------------------------------------------
+run_dnf_automatic_under_inhibitor() {
+    systemd-inhibit \
+        --what="shutdown:sleep" \
+        --who="dnf-automatic-reboot" \
+        --why="dnf-automatic update in progress - do not reboot" \
+        --mode="block" \
+        timeout --kill-after="${KILL_GRACE_SEC}s" "${DNF_TIMEOUT_MIN}m" "${DNF_AUTOMATIC_BIN}"
+}
+
+# ---------------------------------------------------------------------------
 # Schedule a reboot through a transient systemd timer.
 # ---------------------------------------------------------------------------
 schedule_reboot() {
@@ -431,28 +445,12 @@ main() {
 
     write_state "updating"
 
-    # Acquire systemd inhibitor lock via background sleep.  The lock prevents
-    # systemctl reboot/poweroff until we release it.  An admin can still
-    # force-reboot with: systemctl reboot --force
-    systemd-inhibit \
-        --what="shutdown:sleep" \
-        --who="dnf-automatic-reboot" \
-        --why="dnf-automatic update in progress - do not reboot" \
-        --mode="block" \
-        "${SLEEP_BIN}" infinity &
-    INHIBITOR_PID=$!
-    log "Inhibitor lock acquired PID=${INHIBITOR_PID}"
-    wall_msg "dnf-automatic-reboot: Starting automatic updates. Reboot is inhibited until complete."
-
-    # Run dnf-automatic under a hard wall-clock timeout.  timeout sends
-    # SIGTERM at DNF_TIMEOUT_MIN minutes, then SIGKILL after KILL_GRACE_SEC
-    # seconds.  Exit code 124 = timed out.
-    log "Running dnf-automatic (timeout=${DNF_TIMEOUT_MIN}m kill_grace=${KILL_GRACE_SEC}s)"
-    timeout --kill-after="${KILL_GRACE_SEC}s" "${DNF_TIMEOUT_MIN}m" "${DNF_AUTOMATIC_BIN}" \
-        || dnf_automatic_exit_code=$?
+    wall_msg "dnf-automatic-reboot: Starting automatic updates. Reboot is inhibited until they complete."
+    log "Running dnf-automatic under the inhibitor lock (timeout=${DNF_TIMEOUT_MIN}m kill_grace=${KILL_GRACE_SEC}s)"
+    run_dnf_automatic_under_inhibitor || dnf_automatic_exit_code=$?
 
     if [[ "${dnf_automatic_exit_code}" -ne 0 ]]; then
-        log_err "dnf-automatic exited ${dnf_automatic_exit_code}"
+        log_err "dnf-automatic, or the inhibitor lock taken before it, exited ${dnf_automatic_exit_code}"
         wall_msg "dnf-automatic-reboot: Update FAILED (exit ${dnf_automatic_exit_code})." \
                  "Manual inspection required."
         exit 1
@@ -471,12 +469,6 @@ main() {
         log "always_reboot=yes in config - scheduling reboot regardless"
         needs_reboot_exit_code=1
     fi
-
-    # Release the inhibitor lock BEFORE scheduling the reboot: a block-mode
-    # inhibitor would prevent our own reboot call if still held.
-    kill "${INHIBITOR_PID}" 2>/dev/null || true
-    wait "${INHIBITOR_PID}" 2>/dev/null || true
-    INHIBITOR_PID=0
 
     rm -f "${STATE_FILE}" "${LOCK_FILE}"
     trap - EXIT   # prevent double-cleanup after this point

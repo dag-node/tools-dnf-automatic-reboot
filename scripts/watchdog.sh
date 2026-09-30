@@ -27,8 +27,8 @@
 #                         timeout.
 #
 # Killing always targets the whole service cgroup, never the run.sh PID
-# alone: dnf-automatic runs as a grandchild behind timeout(1), so signalling
-# direct children leaves the rpm transaction running.
+# alone: dnf-automatic runs behind systemd-inhibit and timeout(1), so
+# signalling direct children leaves the rpm transaction running.
 #
 # Configuration: /etc/dnf/automatic-reboot.conf
 # Log:           /var/log/dnf-automatic-reboot.log
