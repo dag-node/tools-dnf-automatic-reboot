@@ -364,12 +364,18 @@ grub_default_is_newest_kernel() {
 # just populated the cache.  A cache miss falls back to a refreshing run
 # rather than being reported as a tool error.
 #
-# Sets NEEDS_RESTARTING_OUTPUT and returns needs-restarting's exit code.
+# Sets NEEDS_RESTARTING_OUTPUT and returns needs-restarting's exit code, or 2
+# when no temporary file for its stderr can be created.
 # ---------------------------------------------------------------------------
 run_needs_restarting() {
     local stderr_capture_file stderr_line exit_code=0
 
-    stderr_capture_file=$(mktemp) || stderr_capture_file=/dev/null
+    # No fallback path: the file is removed below, and a fixed path such as
+    # /dev/null would be removed with it.
+    if ! stderr_capture_file=$(mktemp); then
+        log_err "cannot create a temporary file for needs-restarting stderr"
+        return 2
+    fi
 
     NEEDS_RESTARTING_OUTPUT=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
         "${DNF_BIN}" -q -C needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?

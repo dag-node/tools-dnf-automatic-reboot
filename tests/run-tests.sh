@@ -697,6 +697,40 @@ test_classify_keeps_package_when_verifier_missing() {
 }
 
 # ---------------------------------------------------------------------------
+# decision: only a recognisable plugin result may reboot the host
+# ---------------------------------------------------------------------------
+# DNF output with a cache-only failure, as dnf prints it and exits 1.
+readonly CACHE_ONLY_ERROR="Error: Cache-only enabled but no cache for 'ol9_baseos_latest'"
+
+# stub_needs_restarting CACHE_ONLY_RESULT REFRESHED_RESULT
+# Stubs timeout(1), through which the script runs dnf, so no exec is needed.
+# Each result is "EXIT_CODE:STDOUT"; calls are recorded in the stub log.
+stub_needs_restarting() {
+    export STUB_CACHE_ONLY_RESULT="$1" STUB_REFRESHED_RESULT="$2"
+    timeout() {
+        local result="${STUB_REFRESHED_RESULT}" argument
+        shift
+        printf 'dnf %s\n' "${*:2}" >> "${STUB_LOG}"
+        for argument in "$@"; do
+            [[ "${argument}" == "-C" ]] && result="${STUB_CACHE_ONLY_RESULT}"
+        done
+        printf '%s\n' "${result#*:}"
+        return "${result%%:*}"
+    }
+}
+
+test_decision_temporary_file_failure_removes_nothing() {
+    load_needs_reboot_library
+    stub_needs_restarting "0:" "0:"
+    mktemp() { return 1; }
+    rm() { printf 'rm %s\n' "$*" >> "${STUB_LOG}"; }
+    local exit_code=0
+    run_needs_restarting >/dev/null 2>&1 || exit_code=$?
+    assert_not_contains "$(cat "${STUB_LOG}")" "/dev/null" "never removes a path mktemp did not create"
+    [[ "${exit_code}" -gt 1 ]] || fail "expected a tool-error exit, got ${exit_code}"
+}
+
+# ---------------------------------------------------------------------------
 # services: restarting the wrong unit takes the host down
 # ---------------------------------------------------------------------------
 test_conflicts_refuse_apply_updates_off() {
@@ -1412,6 +1446,9 @@ run_test "classify: withholds on stale grub default" test_classify_withholds_on_
 run_test "classify: withholds at attempt limit"      test_classify_withholds_at_attempt_limit
 run_test "classify: schedules genuine kernel reboot" test_classify_schedules_genuine_kernel_reboot
 run_test "classify: keeps package when verifier missing" test_classify_keeps_package_when_verifier_missing
+
+printf 'decision\n'
+run_test "decision: temporary file failure removes nothing" test_decision_temporary_file_failure_removes_nothing
 
 printf 'repositories\n'
 run_test "repositories: unsigned enabled repo is reported"  test_repositories_unsigned_enabled_is_reported
