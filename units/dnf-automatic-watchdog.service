@@ -14,6 +14,10 @@ RemainAfterExit=no
 # never reached.  watchdog.sh bounds its own reboot check to less than this
 # at the default needs_restarting_timeout_sec.
 TimeoutStartSec=15min
+# watchdog.sh removes its recovery file itself; this covers a watchdog that
+# was stopped at the timeout, which would otherwise keep the main unit from
+# starting until the next boot.
+ExecStopPost=/usr/bin/rm -f /run/dnf-automatic-reboot.recovery
 # needs-restarting output is translated; the parsers match C strings.
 Environment=LC_ALL=C
 StandardOutput=journal

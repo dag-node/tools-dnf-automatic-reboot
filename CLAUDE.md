@@ -286,8 +286,14 @@ reboot. A changed `phase`, `start_uptime` or `pid`, or a `pid` that is no longer
 `MainPID`, abandons the recovery and leaves the state file alone (exit 0); a live `pid`
 with no numeric `MainPID` abandons it with exit 1.
 
-`systemctl kill` names the unit, not one invocation of it, so a run starting in the
-moment between that re-check and the kill is not excluded.
+`systemctl kill` names the unit, not one invocation of it, so the re-check alone would
+leave a moment in which a new run could start and be killed. The watchdog therefore
+creates `/run/dnf-automatic-reboot.recovery` before the re-check and removes it after the
+kill, and `dnf-automatic-reboot.service` carries
+`ConditionPathExists=!/run/dnf-automatic-reboot.recovery`: no run starts while the file
+exists, and a run that started before it shows in the re-check. The watchdog unit's
+`ExecStopPost=` removes the file if `TimeoutStartSec=` stops the watchdog first. A timer
+start skipped by the condition waits for the next `OnCalendar=`.
 
 After the kill, the watchdog waits up to `watchdog_kill_confirm_sec` for systemd to report
 the unit `inactive` or `failed`. A failed `systemctl kill`, or a unit still active then,

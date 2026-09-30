@@ -45,6 +45,8 @@ readonly TEST_ROOT="${DNF_AUTOMATIC_REBOOT_TEST_ROOT:-}"
 readonly CONFIG_FILE="${TEST_ROOT}/etc/dnf/automatic-reboot.conf"
 readonly STATE_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.state"
 readonly LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.lock"
+# Present while the watchdog kills a run; the main unit does not start then.
+readonly RECOVERY_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.recovery"
 readonly UPTIME_FILE="${TEST_ROOT}/proc/uptime"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
@@ -215,11 +217,28 @@ signal_unit_processes() {
 #          2 = the run's identity cannot be established; no process signalled
 #          3 = the kill failed, or the unit was still active
 #              KILL_CONFIRM_SEC seconds after it: recovery failed
-# The kill targets the unit's cgroup only; the recorded PID is never
+#
+# RECOVERY_FILE exists from before the identity check until this returns, and
+# the main unit's ConditionPathExists=! refuses to start while it does, so no
+# new run can start between the check and the kill.  Any run already started
+# before the file existed shows in the check as a changed state file or
+# MainPID.  The kill targets the unit's cgroup only; the recorded PID is never
 # signalled on its own, since by then its number may belong to another
-# process.  The unit is signalled a moment after the identity check; no
-# systemctl option ties the kill to one invocation of the unit.
+# process.
 kill_service_cgroup() {
+    local kill_result=0
+    if ! : > "${RECOVERY_FILE}" 2>/dev/null; then
+        log_err "cannot create ${RECOVERY_FILE} - a new run could start during the kill, recovery abandoned"
+        return 3
+    fi
+    kill_recorded_run "$@" || kill_result=$?
+    rm -f "${RECOVERY_FILE}"
+    return "${kill_result}"
+}
+
+# kill_recorded_run PHASE START_UPTIME PID - kill_service_cgroup's work,
+# run while RECOVERY_FILE blocks new runs.
+kill_recorded_run() {
     local recorded_phase="$1" recorded_start_uptime="$2" recorded_pid="$3"
     local systemd_version kill_target_option run_check_result=0 active_state="" waited_seconds=0
     recorded_run_is_unchanged "${recorded_phase}" "${recorded_start_uptime}" "${recorded_pid}" \
