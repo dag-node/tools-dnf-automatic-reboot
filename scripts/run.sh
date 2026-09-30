@@ -159,10 +159,15 @@ warn_on_unsigned_repositories() {
 }
 
 # ---------------------------------------------------------------------------
-# Pre-flight: abort if conflicting services would cause double-reboots
+# Pre-flight: abort if conflicting services would cause double-reboots, or if
+# dnf-automatic would not install anything.
+#
+# Repeats the %pre checks on /etc/dnf/automatic.conf at every start, so an
+# edit made after install fails the run through OnFailure= instead of
+# producing silent successes.  The file is the operator's and is only read.
 # ---------------------------------------------------------------------------
 check_conflicts() {
-    local conflict_found=0 conflicting_timer automatic_reboot_value
+    local conflict_found=0 conflicting_timer automatic_reboot_value apply_updates_value
 
     for conflicting_timer in dnf-automatic.timer dnf-automatic-install.timer; do
         if systemctl is-enabled --quiet "${conflicting_timer}" 2>/dev/null || \
@@ -181,6 +186,19 @@ check_conflicts() {
             conflict_found=1
         fi
     fi
+
+    # dnf-automatic defaults apply_updates to false and then exits 0 after
+    # downloading.  True values are those libdnf's OptionBool accepts.
+    apply_updates_value=$(grep -E '^\s*apply_updates\s*=' "${AUTOMATIC_CONFIG_FILE}" 2>/dev/null \
+                          | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
+                          | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]') || true
+    case "${apply_updates_value}" in
+        yes|true|1|on) ;;
+        *)
+            log_err "/etc/dnf/automatic.conf has apply_updates = ${apply_updates_value:-<unset>}; dnf-automatic would download updates without installing them; set 'apply_updates = yes'"
+            conflict_found=1
+            ;;
+    esac
 
     if [[ "${conflict_found}" -ne 0 ]]; then
         log_err "Aborting: resolve the conflicts above, then restart the service"

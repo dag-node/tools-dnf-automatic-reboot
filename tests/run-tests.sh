@@ -125,7 +125,7 @@ make_test_root() {
     : > "${STUB_LOG}"
 
     cp "${REPO_ROOT}/conf/automatic-reboot.conf" "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    printf 'reboot = never\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
+    printf 'reboot = never\napply_updates = yes\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
     printf 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n' \
         > "${TEST_ROOT_DIR}/proc/sys/kernel/random/boot_id"
 
@@ -658,6 +658,25 @@ test_classify_keeps_package_when_verifier_missing() {
 # ---------------------------------------------------------------------------
 # services: restarting the wrong unit takes the host down
 # ---------------------------------------------------------------------------
+test_conflicts_refuse_apply_updates_off() {
+    load_run_library
+    systemctl() { return 1; }
+    # Changed after install: every run would download and install nothing.
+    printf 'reboot = never\napply_updates = no\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
+    local output exit_code=0
+    output=$( check_conflicts 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "run refused"
+    assert_contains "${output}" "apply_updates = no" "names the setting"
+}
+
+test_conflicts_pass_on_prepared_host() {
+    load_run_library
+    systemctl() { return 1; }
+    local exit_code=0
+    ( check_conflicts ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "reboot = never and apply_updates = yes pass"
+}
+
 test_services_excluded_units_are_not_restarted() {
     load_run_library
     export STUB_STALE_SERVICES="sshd.service
@@ -1036,6 +1055,10 @@ run_test "advisories: still pending is only a warning"    test_advisories_still_
 run_test "advisories: none is silent"                     test_advisories_none_is_silent                 needs-exec
 run_test "advisories: ignores non-advisory lines"         test_advisories_ignores_non_advisory_lines     needs-exec
 run_test "advisories: disabled by config"                 test_advisories_disabled_by_config
+
+printf 'conflicts\n'
+run_test "conflicts: refuse apply_updates off"      test_conflicts_refuse_apply_updates_off
+run_test "conflicts: pass on prepared host"         test_conflicts_pass_on_prepared_host
 
 printf 'services\n'
 run_test "services: excluded units are not restarted" test_services_excluded_units_are_not_restarted needs-exec
