@@ -174,9 +174,10 @@ themselves where the temporary tree is mounted `noexec`.
 and writes only inside its temporary tree.
 
 `.github/workflows/ci.yml` runs `make lint` with a pinned ShellCheck on the runner,
-then `.github/scripts/build-in-container.sh` in `rockylinux:8` and `rockylinux:9`:
-`make dist` (the suite, including the `needs-exec` tests), `rpmbuild -ba` with a
-`0.<run>.git<sha>` snapshot Release, a normal install that the `%pre` gate must refuse,
+then `make container-rpm` for `EL=8` and `EL=9`, which runs
+`.github/scripts/build-in-container.sh` in `rockylinux:$EL`: `make rpm` (the suite,
+including the `needs-exec` tests, then `rpmbuild -ba`) with a `0.<run>.git<sha>`
+snapshot Release, a normal install that the `%pre` gate must refuse,
 and a scriptlet-free install that must resolve every dependency and pass `rpm -V`. It
 uploads the RPMs as artifacts; it does not sign or publish anything.
 
@@ -615,14 +616,11 @@ a release string using rpm's `~`/`^` operators, needs `rpmdev-vercmp` instead.
 # Syntax + lint before building
 make check && shellcheck -S info scripts/*.sh
 
-# Build RPM (build host: dnf install rpm-build systemd-rpm-macros)
-mkdir -p ~/rpmbuild/{BUILD,RPMS,SRPMS,SOURCES,SPECS}   # once
-make dist        # runs make check, then writes dnf-automatic-reboot-$(VERSION).tar.gz
-rpmbuild -ba dnf-automatic-reboot.spec \
-  --define "_sourcedir $(pwd)" \
-  --define "_specdir $(pwd)"
-# _sourcedir/_specdir build from the working tree, without copying into
-# ~/rpmbuild/SOURCES; the package lands in ~/rpmbuild/RPMS/noarch/.
+# Build RPM the way CI does, in rockylinux:$EL (podman); lands in ./rpmbuild
+make container-rpm EL=9
+# Build RPM on an EL host (dnf install rpm-build systemd-rpm-macros); ./rpmbuild
+# is emptied first, so it holds only this build
+make rpm DIST=.el9
 
 # Full update cycle now: applies updates and reboots if needed
 systemctl start dnf-automatic-reboot.service

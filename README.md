@@ -33,13 +33,14 @@ Linux, Rocky Linux, AlmaLinux) with the standard GRUB boot menu.
 ```bash
 sudo dnf install dnf-automatic
 sudoedit /etc/dnf/automatic.conf
-sudo dnf install ./dnf-automatic-reboot-1.4.0-1.el9.noarch.rpm
+sudo dnf install ./dnf-automatic-reboot-1.4.0-*.el9.noarch.rpm
 sudo systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
 ```
 
-The package is installed from its RPM file: the `.el9` file on Enterprise
-Linux 9, the `.el8` file on Enterprise Linux 8. The file comes from a CI run
-of this repository or from [Building from source](#building-from-source).
+The package is installed from its RPM file, run from the directory that
+holds it: the `.el9` file on Enterprise Linux 9, the `.el8` file on
+Enterprise Linux 8. The file comes from a CI run of this repository or from
+[Building from source](#building-from-source).
 
 The first two commands install `dnf-automatic` and open its settings file,
 in which two lines must read:
@@ -218,18 +219,25 @@ state. A settings file you changed is kept as
 ## Building from source
 
 ```bash
-make check
-make dist
-rpmbuild -ba dnf-automatic-reboot.spec --define "_sourcedir $(pwd)" --define "_specdir $(pwd)"
-sudo dnf install ~/rpmbuild/RPMS/noarch/dnf-automatic-reboot-*.noarch.rpm
+make container-rpm EL=9
 ```
 
-`make check` runs the syntax checks, `shellcheck` and the test suite, which
-does not need root and stubs every system command; `make dist` runs it too
-before writing the source tarball. Tests that execute a stub skip themselves
-where the temporary directory is mounted `noexec`;
-`TMPDIR=<exec-capable dir> make test` runs them. [CLAUDE.md](CLAUDE.md)
-describes the design and the conventions for changes.
+This builds the package the way CI does, inside a `rockylinux:9` container
+started with `podman`, and leaves it in `./rpmbuild/RPMS/noarch/`. `EL=8`
+builds for Enterprise Linux 8. Building in the container gives the file the
+right `.el8` or `.el9` tag whatever the build computer runs, and keeps the
+test suite off the build computer. The file carries a local snapshot version,
+`1.4.0-0.local.git<commit>`, which a released `1.4.0-1` replaces as an
+ordinary upgrade. Copy it to the computer it is for and install it as in
+[Quick start](#quick-start).
+
+`make check` runs the syntax checks, `shellcheck` and the test suite on any
+computer with `bash`; the suite does not need root and stubs every system
+command. Tests that execute a stub skip themselves where the temporary
+directory is mounted `noexec`; the container build runs them. On an EL8 or
+EL9 computer with `rpm-build` installed, `make rpm` builds directly into
+`./rpmbuild`. [CLAUDE.md](CLAUDE.md) describes the design and the conventions
+for changes.
 
 Licensed under GPL-2.0-or-later; the RPM spec file is MIT. See
 [REUSE.toml](REUSE.toml).

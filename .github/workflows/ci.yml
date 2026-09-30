@@ -66,9 +66,7 @@ jobs:
         env:
           EL: ${{ matrix.el }}
           RPM_RELEASE: ${{ steps.release.outputs.rpm_release }}
-        run: |
-          sudo podman run --rm -v "${PWD}:/src" -w /src -e EL -e RPM_RELEASE \
-            "quay.io/rockylinux/rockylinux:${EL}" bash /src/.github/scripts/build-in-container.sh
+        run: make container-rpm EL="${EL}" RPM_RELEASE="${RPM_RELEASE}" PODMAN="sudo podman"
 
       - name: Upload the RPMs
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

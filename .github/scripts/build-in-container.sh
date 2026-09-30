@@ -3,16 +3,16 @@
 # build-in-container.sh
 # ---------------------------------------------------------------------------
 # Builds and checks the package inside quay.io/rockylinux/rockylinux:${EL},
-# started by .github/workflows/ci.yml with the checkout mounted at /src.
+# started by `make container-rpm` (locally and from .github/workflows/ci.yml)
+# with the checkout mounted at /src.
 #
-#   1. make dist: lint (shellcheck runs in the lint job) and the test suite,
-#      then the source tarball.  The container's /tmp allows exec, so the
-#      tests marked needs-exec run here.
-#   2. rpmbuild -ba with the snapshot Release; %check runs the suite again
-#      from the extracted tarball.
-#   3. A normal install must be refused by the %pre gate: a container is not
+#   1. make rpm: lint (shellcheck, where present) and the test suite, the
+#      source tarball, then `rpmbuild -ba` with the snapshot Release into
+#      /src/rpmbuild; %check runs the suite again from the tarball.  The
+#      container's /tmp allows exec, so the tests marked needs-exec run here.
+#   2. A normal install must be refused by the %pre gate: a container is not
 #      booted by systemd.  This proves the gate runs and refuses.
-#   4. An install without scriptlets must resolve every dependency from the EL
+#   3. An install without scriptlets must resolve every dependency from the EL
 #      repositories and pass rpm -V.
 #
 # Environment: EL (8 or 9), RPM_RELEASE (0.<run>.git<sha>).
@@ -29,14 +29,7 @@ readonly PACKAGE_NAME=dnf-automatic-reboot
 
 dnf -y -q install rpm-build make gawk util-linux tar gzip findutils systemd-rpm-macros >/dev/null
 
-make -C "${SOURCE_DIRECTORY}" dist
-
-rpmbuild -ba "${SOURCE_DIRECTORY}/${PACKAGE_NAME}.spec" \
-    --define "_topdir ${TOP_DIRECTORY}" \
-    --define "_sourcedir ${SOURCE_DIRECTORY}" \
-    --define "_specdir ${SOURCE_DIRECTORY}" \
-    --define "dist .el${EL}" \
-    --define "rpm_release ${RPM_RELEASE}"
+make -C "${SOURCE_DIRECTORY}" rpm DIST=".el${EL}" RPM_RELEASE="${RPM_RELEASE}"
 
 package_file=$(find "${TOP_DIRECTORY}/RPMS/noarch" -name "${PACKAGE_NAME}-*.el${EL}.noarch.rpm" | head -n 1)
 if [[ -z "${package_file}" ]]; then

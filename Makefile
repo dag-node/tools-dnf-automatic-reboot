@@ -42,13 +42,24 @@ RPMBUILD_DEFINES = --define "_topdir $(RPM_TOPDIR)" \
                    $(if $(DIST),--define "dist $(DIST)") \
                    $(if $(RPM_RELEASE),--define "rpm_release $(RPM_RELEASE)")
 
-.PHONY: all install uninstall dist rpm clean check lint test
+# The same build CI runs, in quay.io/rockylinux/rockylinux:$(EL): the RPM
+# carries the .el$(EL) tag whatever the build host runs, and the test suite
+# runs inside the container, not on the host.  label=disable keeps the SELinux
+# labels of the mounted checkout unchanged.  The Release defaults to a local
+# snapshot, 0.local.git<sha>, so the build never shares a version with a release.
+#   make container-rpm EL=8
+EL ?= 9
+PODMAN ?= podman
+CONTAINER_RPM_RELEASE = $(or $(RPM_RELEASE),0.local.git$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown))
+
+.PHONY: all install uninstall dist rpm container-rpm clean check lint test
 
 all:
 	@echo "Run: make check     (syntax, lint and tests)"
 	@echo "Run: make install   (as root)"
 	@echo "Run: make dist      (to create source tarball)"
 	@echo "Run: make rpm       (to build the RPM into ./rpmbuild)"
+	@echo "Run: make container-rpm EL=9   (to build it in a Rocky Linux container)"
 
 # Gate for every change: parse, lint, then run the suite.
 check: lint test
@@ -106,6 +117,12 @@ dist: check
 rpm: dist
 	rm -rf $(RPM_TOPDIR)
 	rpmbuild -ba $(NAME).spec $(RPMBUILD_DEFINES)
+	@echo "Built:"; ls -1 $(RPM_TOPDIR)/RPMS/noarch/*.rpm
+
+container-rpm:
+	$(PODMAN) run --rm --security-opt label=disable -v "$(CURDIR):/src" -w /src \
+	    -e EL="$(EL)" -e RPM_RELEASE="$(CONTAINER_RPM_RELEASE)" \
+	    "quay.io/rockylinux/rockylinux:$(EL)" bash /src/.github/scripts/build-in-container.sh
 	@echo "Built:"; ls -1 $(RPM_TOPDIR)/RPMS/noarch/*.rpm
 
 clean:
