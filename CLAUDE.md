@@ -662,11 +662,17 @@ make rpm DIST=.el9
 # Full update cycle now: applies updates and reboots if needed
 systemctl start dnf-automatic-reboot.service
 
-# Test reboot logic without running dnf
+# Test reboot logic without running dnf.  Writes state as a scheduled run
+# does: restart-state rows, and one kernel reboot attempt for this boot.
 /usr/libexec/dnf-automatic-reboot/needs-reboot.sh; echo "exit: $?"
 
-# Watchdog by hand: exits at once when no run is in progress (no state file)
+# Watchdog by hand: exits at once when no run is in progress (no state file);
+# during a run it acts as its timer would, kill and reboot included
 /usr/libexec/dnf-automatic-reboot/watchdog.sh
+
+# A scheduled reboot, and how to cancel it
+systemctl list-timers dnf-automatic-reboot-scheduled-reboot.timer
+systemctl stop dnf-automatic-reboot-scheduled-reboot.timer
 
 # What -r decides, and the boot time it decides against
 LC_ALL=C dnf -q -C needs-restarting -r

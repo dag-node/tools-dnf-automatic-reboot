@@ -374,24 +374,47 @@ Forcing a manual run
 
   # Test needs-reboot detection only (no update, no reboot):
   /usr/libexec/dnf-automatic-reboot/needs-reboot.sh; echo "exit: $?"
+  # Side effects, the same as in a scheduled run: restart-state records a
+  # newly flagged package as pending, and confirms a pending one still
+  # flagged after a reboot; for a pending kernel, kernel-reboot-attempts
+  # counts the current boot as one attempt (once per boot).
 
   # Test watchdog (with no state file it exits immediately):
   /usr/libexec/dnf-automatic-reboot/watchdog.sh
+  # While a run is in progress it acts as its timer would: past the soft or
+  # hard timeout it can kill the run and reboot.
 
 
 Uninstalling
 ------------
 
-  dnf remove dnf-automatic-reboot
-  # or
-  make uninstall
+  Installed from the RPM:
 
-  The log file /var/log/dnf-automatic-reboot.log is preserved on uninstall.
-  Remove manually if not needed:  rm /var/log/dnf-automatic-reboot.log
+      dnf remove dnf-automatic-reboot
 
-  The restart-state and kernel-reboot-attempts files are preserved the same
-  way.  Remove manually if not needed:
+  This disables and stops both timers and removes every file the package
+  owns: the scripts, units, tmpfiles.d and logrotate drop-ins, the log
+  /var/log/dnf-automatic-reboot.log, and the state files restart-state and
+  kernel-reboot-attempts.  An edited /etc/dnf/automatic-reboot.conf or
+  /etc/logrotate.d/dnf-automatic-reboot is kept with a .rpmsave suffix.
+  Files the package does not own stay: rotated logs
+  (dnf-automatic-reboot.log.1, .2.gz, ...) and
+  /var/lib/dnf-automatic-reboot/.state.lock, which keeps its directory.
+  Remove them with:
+      rm -f /var/log/dnf-automatic-reboot.log.*
       rm -rf /var/lib/dnf-automatic-reboot
+
+  Installed with make install:
+
+      systemctl disable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
+      make uninstall
+      systemctl daemon-reload
+
+  make uninstall removes the units, the drop-ins, the scripts, this
+  documentation and /var/lib/dnf-automatic-reboot with its state.  It does
+  not stop the timers, hence the first command, and it keeps
+  /etc/dnf/automatic-reboot.conf and the logs.  Remove them with:
+      rm -f /etc/dnf/automatic-reboot.conf /var/log/dnf-automatic-reboot.log*
 
 
 Hardware watchdog (recommended for headless systems)

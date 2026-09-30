@@ -111,7 +111,11 @@ sudo systemctl start dnf-automatic-reboot.service
 
 To only ask whether a restart is needed right now, without updating or
 restarting: `sudo /usr/libexec/dnf-automatic-reboot/needs-reboot.sh; echo $?`.
-It prints `0` for no, `1` for yes, and `2` when it cannot tell.
+It prints `0` for no, `1` for yes, and `2` when it cannot tell. It records
+what it sees, as the nightly run does: a package flagged for the first time
+is remembered, and one still flagged after a restart is marked as a false
+alarm from then on. For a pending kernel it counts this boot as one restart
+attempt, which later checks in the same boot do not repeat.
 
 ## If the installer refuses
 
@@ -213,7 +217,10 @@ sudo dnf remove dnf-automatic-reboot
 
 This stops and removes the timers, the program, its log and its learned
 state. A settings file you changed is kept as
-`/etc/dnf/automatic-reboot.conf.rpmsave`.
+`/etc/dnf/automatic-reboot.conf.rpmsave`. Rotated logs and the lock file in
+`/var/lib/dnf-automatic-reboot` are not the package's and stay; the
+[operational reference](doc/README) lists them, and covers removing a
+`make install` copy.
 
 ## More information
 
