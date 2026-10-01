@@ -2568,6 +2568,15 @@ test_invariant_state_file_written_only_by_rename() {
     return 0
 }
 
+test_invariant_probe_assigns_its_library_before_use() {
+    # Under set -u a lost assignment only shows on a host, as "unbound variable".
+    local probe_file="${REPO_ROOT}/tools/verify-reboot-protocol.sh" assignment_line use_line
+    assignment_line=$(grep -n '^library_file="\$(dirname' "${probe_file}" | head -1 | cut -d: -f1)
+    use_line=$(grep -n '"\${library_file}"' "${probe_file}" | head -1 | cut -d: -f1)
+    [[ -n "${assignment_line}" && -n "${use_line}" && "${assignment_line}" -lt "${use_line}" ]] \
+        || fail "verify-reboot-protocol.sh must assign library_file before its first use"
+}
+
 test_invariant_every_script_is_shipped() {
     local script_path script_name
     for script_path in "${REPO_ROOT}"/scripts/*.sh; do
@@ -3326,6 +3335,7 @@ run_test "invariant: lock file is never removed"    test_invariant_lock_file_is_
 run_test "invariant: reboots check inhibitors and never force" test_invariant_reboots_check_inhibitors_and_never_force
 run_test "invariant: flock uses documented short options" test_invariant_flock_uses_documented_short_options
 run_test "invariant: state file written only by rename" test_invariant_state_file_written_only_by_rename
+run_test "invariant: probe assigns its library before use" test_invariant_probe_assigns_its_library_before_use
 run_test "invariant: every script is shipped"       test_invariant_every_script_is_shipped
 run_test "invariant: versions agree"                test_invariant_versions_agree
 run_test "reader: unit snapshot job forms"          test_reader_unit_snapshot_job_forms

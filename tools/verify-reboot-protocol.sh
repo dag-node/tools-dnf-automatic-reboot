@@ -93,6 +93,8 @@ if [[ "${EUID}" -ne 0 ]]; then
     printf 'ERROR: run as root; the probe starts transient units.\n' >&2
     exit 2
 fi
+
+library_file="$(dirname "${BASH_SOURCE[0]}")/../scripts/reboot-request.sh"
 [[ -f "${library_file}" ]] || library_file="${INSTALLED_LIBRARY}"
 if [[ ! -f "${library_file}" ]]; then
     printf 'ERROR: reboot-request.sh found neither beside this tool nor at %s\n' "${INSTALLED_LIBRARY}" >&2
