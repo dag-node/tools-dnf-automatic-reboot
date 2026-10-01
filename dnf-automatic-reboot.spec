@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 Name:           dnf-automatic-reboot
-Version:        1.4.0
+Version:        1.5.0
 # Plain "1" for a release; CI passes --define "rpm_release 0.<run>.git<sha>"
 # for a snapshot build.  The leading "0." makes rpm rank the release above
 # every snapshot that preceded it, so a trial build upgrades to it in place.
@@ -457,6 +457,24 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %ghost %attr(0640, root, root) %{_localstatedir}/lib/%{name}/kernel-reboot-attempts
 
 %changelog
+* Thu Oct 01 2026 DagNode <packages@dagnode.com> - 1.5.0-1
+- CHANGE: A pending reboot holds update runs through its own marker,
+  /run/dnf-automatic-reboot.reboot-pending, created before the reboot is requested and removed
+  only by the reboot or by cancelling it. It covers the reboots run.sh schedules as well as the
+  watchdog's, so no update run starts in reboot_delay_sec before either.
+  /run/dnf-automatic-reboot.recovery now covers only the watchdog's recovery and is always
+  removed when the watchdog ends.
+- NEW: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels a pending reboot and allows
+  update runs again. It exits 1 and changes nothing once the reboot command is running or the
+  host is shutting down. It replaces stopping the timer and removing the recovery file by hand.
+- FIX: A watchdog that failed or timed out while a reboot it had scheduled was pending removed
+  the file that held update runs, so an update could start before that reboot.
+- FIX: A run or watchdog stopped while requesting a reboot keeps update runs held and logs that
+  the outcome is unknown, with the commands to check and recover. A request that definitely
+  failed releases the hold it created.
+- FIX: A failed scheduled reboot's notice says whether update runs are still held and how to
+  release them.
+
 * Wed Sep 30 2026 DagNode <packages@dagnode.com> - 1.4.0-1
 - LICENSE: The project license is now GPL-2.0-or-later. Releases through 1.3 were licensed MIT,
   and anyone who received them keeps those terms on those versions. The spec file stays MIT;
