@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 Name:           dnf-automatic-reboot
-Version:        1.4.0
+Version:        1.5.0
 # Plain "1" for a release; CI passes --define "rpm_release 0.<run>.git<sha>"
 # for a snapshot build.  The leading "0." makes rpm rank the release above
 # every snapshot that preceded it, so a trial build upgrades to it in place.
@@ -28,14 +28,18 @@ Requires:       systemd >= 239
 Requires:       util-linux
 # eu-readelf for systemd build-id comparison (false-positive detection)
 Requires:       elfutils
-# grubby reads and sets the GRUB BLS default: needs-reboot.sh verifies it
-# before a kernel reboot, %%post repairs it on UEK, and %%pre refuses a host
-# where it does not answer - hence also Requires(pre).
+# grubby reads the GRUB BLS default: needs-reboot.sh verifies it before a
+# kernel reboot, and %%pre refuses a host where it does not answer - hence
+# also Requires(pre).
 Requires:       grubby
 Requires(pre):  grubby
 # logrotate consumes the drop-in in %%{_sysconfdir}/logrotate.d; without it
 # /var/log/dnf-automatic-reboot.log grows without bound
 Requires:       logrotate
+# run.sh installs nothing until `chronyc waitsync` confirms the clock
+# (require_clock_sync = yes by default).  Installed is not running: the
+# runtime check stays.
+Requires:       chrony
 
 # We install systemd unit files
 BuildRequires:  systemd-rpm-macros
@@ -88,6 +92,10 @@ install -m 0750 scripts/run.sh            %{buildroot}%{pkglibexecdir}/run.sh
 install -m 0750 scripts/watchdog.sh       %{buildroot}%{pkglibexecdir}/watchdog.sh
 install -m 0750 scripts/needs-reboot.sh   %{buildroot}%{pkglibexecdir}/needs-reboot.sh
 install -m 0750 scripts/notify-failure.sh %{buildroot}%{pkglibexecdir}/notify-failure.sh
+install -m 0750 scripts/cancel-reboot.sh  %{buildroot}%{pkglibexecdir}/cancel-reboot.sh
+install -m 0750 scripts/reboot-if-pending.sh %{buildroot}%{pkglibexecdir}/reboot-if-pending.sh
+install -m 0640 scripts/reboot-request.sh %{buildroot}%{pkglibexecdir}/reboot-request.sh
+install -m 0640 scripts/run-state.sh      %{buildroot}%{pkglibexecdir}/run-state.sh
 
 # systemd units
 install -d -m 0755 %{buildroot}%{_unitdir}
@@ -176,7 +184,7 @@ fi
 # The packages every decision depends on.  Requires: covers a normal install;
 # this catches `rpm -i --nodeps`, which would otherwise leave the build-id or
 # GRUB check silently disabled at runtime.
-for required_package in dnf-automatic yum-utils elfutils grubby; do
+for required_package in dnf-automatic yum-utils elfutils grubby chrony; do
     if ! rpm -q "${required_package}" >/dev/null 2>&1; then
         echo "ERROR: ${required_package} is not installed." >&2
         echo "       Install it first:  dnf install ${required_package}" >&2
@@ -425,6 +433,13 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %attr(0750, root, root) %{pkglibexecdir}/watchdog.sh
 %attr(0750, root, root) %{pkglibexecdir}/needs-reboot.sh
 %attr(0750, root, root) %{pkglibexecdir}/notify-failure.sh
+%attr(0750, root, root) %{pkglibexecdir}/cancel-reboot.sh
+%attr(0750, root, root) %{pkglibexecdir}/reboot-if-pending.sh
+# Sourced by run.sh, watchdog.sh, cancel-reboot.sh and reboot-if-pending.sh;
+# never executed.
+%attr(0640, root, root) %{pkglibexecdir}/reboot-request.sh
+# Sourced by run.sh and watchdog.sh; never executed.
+%attr(0640, root, root) %{pkglibexecdir}/run-state.sh
 
 # systemd units
 %{_unitdir}/dnf-automatic-reboot.service
@@ -455,6 +470,74 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %ghost %attr(0640, root, root) %{_localstatedir}/lib/%{name}/kernel-reboot-attempts
 
 %changelog
+* Thu Oct 01 2026 DagNode <packages@dagnode.com> - 1.5.0-1
+- CHANGE: A pending reboot holds update runs through its own marker,
+  /run/dnf-automatic-reboot.reboot-pending, created before the reboot is requested and removed
+  by the reboot or by cancelling it. It covers the reboots run.sh schedules as well as the
+  watchdog's, so no update run starts in reboot_delay_sec before either.
+  /run/dnf-automatic-reboot.recovery now covers only the watchdog's recovery and is always
+  removed when the watchdog ends.
+- CHANGE: Every reboot, the watchdog's immediate one included, runs
+  /usr/libexec/dnf-automatic-reboot/reboot-if-pending.sh in the transient
+  dnf-automatic-reboot-scheduled-reboot.service, which reboots only while the reboot is still
+  pending.
+- CHANGE: run.sh does not update while a scheduled reboot is waiting or under way. This also
+  holds when upgrading from 1.4.0 while its watchdog has a reboot scheduled.
+- CHANGE: reboot_delay_sec defaults to 300, giving five minutes between the warning and the
+  reboot to cancel it. An edited automatic-reboot.conf keeps its own value.
+- NEW: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels a pending reboot and allows
+  update runs again; a timer that fires afterwards does not reboot. It exits 1 without
+  changing anything while a reboot is being requested or carried out, once systemctl reboot
+  has been called, while the host shuts down (including a shutdown logind delays for an
+  inhibitor), and when systemd's state cannot be read. It replaces stopping the timer and
+  removing the recovery file by hand.
+- NEW: reboot_request_lock_wait_sec (default 60) bounds how long a reboot request waits for a
+  cancellation or another request to finish.
+- FIX: A watchdog that failed or timed out while a reboot it had scheduled was pending removed
+  the file that held update runs, so an update could start before that reboot.
+- FIX: A reboot request whose outcome cannot be established keeps update runs held and fails
+  the run or watchdog, naming the commands to check and recover; a reboot that reaches systemd
+  late still happens. This covers an interrupted request and a failed systemd-run.
+- FIX: When the orderly reboot reports failure, the watchdog's reboot checks whether the host
+  is already shutting down before it falls back to systemctl reboot --force, and does not force
+  when it cannot tell.
+- FIX: A timer that has elapsed is no longer taken for a reboot still to come, so a reboot that
+  failed earlier no longer stops a new one from being scheduled.
+- FIX: The kernel reboot attempt count is cleared once the target kernel runs, also on a host
+  with a correct clock. There needs-restarting stops flagging the kernel after the reboot, and
+  the count stayed until the next kernel update replaced it.
+- FIX: An update run installs nothing until chronyd confirms the clock synchronised, waiting at
+  most clock_sync_wait_sec (new, default 600, enforced with timeout); otherwise it fails. The
+  package now requires chrony. The unit's ordering after
+  time-sync.target did not require synchronisation to succeed, so a failed chrony-wait.service
+  let updates run with a wrong clock. require_clock_sync = no (new) turns the check off.
+- FIX: The reboot respects shutdown inhibitors. From a service, systemctl reboot skipped the
+  inhibitor check, so a package transaction started by hand during reboot_delay_sec could be cut
+  off. A refused reboot is retried every 30 seconds for reboot_inhibited_wait_sec (new, default
+  1800) and can be cancelled meanwhile. The watchdog no longer falls back to
+  systemctl reboot --force.
+- FIX: The watchdog no longer removes the state file of a run it did not inspect. run.sh wrote the
+  file in place, and a watchdog reading it at that moment found it empty and deleted it as
+  malformed; cleanup after a dead run could delete the state of the run that started next. Either
+  left that run unsupervised. The file is now published by rename and removed, under a lock,
+  only while it holds what the watchdog read.
+- FIX: Restart-state learning no longer drops a package that the build-id check found running
+  stale code, or could not verify. A systemd flag with a stale daemon could be recorded as a
+  confirmed false positive and the reboot skipped.
+- FIX: No reboot is requested, and the run fails, when a kernel reboot attempt cannot be recorded
+  in /var/lib/dnf-automatic-reboot/kernel-reboot-attempts, even when another package needs one. A failed write was ignored, so
+  kernel_reboot_attempt_limit stopped counting and a kernel that never boots could be rebooted
+  for without end.
+- FIX: A number in automatic-reboot.conf with a leading zero, such as reboot_delay_sec = 08, is
+  read as decimal. Bash read it as an invalid octal number, and a reboot could be submitted with
+  no delay. reboot_delay_sec must lie between 1 and 86400 and reboot_request_lock_wait_sec
+  between 1 and 600; a value outside is logged and the default used.
+- FIX: The completion line says "No updates installed" when dnf-automatic installed nothing, and
+  otherwise counts the packages it installed; it said "Updates installed" either way. The reboot
+  warning no longer claims updates were installed.
+- FIX: A failed scheduled reboot's notice says whether update runs are still held and how to
+  release them.
+
 * Wed Sep 30 2026 DagNode <packages@dagnode.com> - 1.4.0-1
 - LICENSE: The project license is now GPL-2.0-or-later. Releases through 1.3 were licensed MIT,
   and anyone who received them keeps those terms on those versions. The spec file stays MIT;

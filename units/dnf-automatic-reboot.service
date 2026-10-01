@@ -3,14 +3,15 @@ Description=dnf-automatic with shutdown inhibitor and conditional reboot
 Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
 After=network-online.target time-sync.target
 Wants=network-online.target
-# Gate startup on time synchronization so RPM INSTALLTIME entries written by
-# dnf and the boot-time comparison in needs-restarting are both stamped with
-# the correct wall-clock time.
-# NOTE: systemd-time-wait-sync.service is absent on UEK R8, and nothing else
-# pulls in time-sync.target by default, so this ordering is satisfied
-# trivially unless chrony-wait.service is enabled - it is ordered
-# Before=time-sync.target and runs `chronyc waitsync`, which makes the gate
-# real. The RPM %post enables it when [time] enable_chrony_wait = yes.
+# Order startup after time synchronization so RPM INSTALLTIME entries written
+# by dnf, and the boot-time comparison in needs-restarting, see the correct
+# wall-clock time.  This is ordering only: time-sync.target is reached even
+# when chrony-wait.service fails, and at once when nothing is ordered before
+# it (systemd-time-wait-sync.service is absent on UEK R8).  run.sh requires
+# the synchronisation itself: it runs `chronyc waitsync`, bounded by
+# clock_sync_wait_sec, and installs nothing until chronyd confirms the clock.
+# The RPM %post enables chrony-wait.service when [time] enable_chrony_wait =
+# yes, which makes the ordering wait at boot too.
 # Prerequisite on this host (see doc/README):
 #   /etc/chrony.conf must contain: makestep 1 -1
 Requires=time-sync.target
@@ -19,6 +20,9 @@ ConditionPathExists=!/run/dnf-automatic-reboot.lock
 # The watchdog holds this file while it checks and kills a stuck run, so no
 # new run can start in between and be killed in its place.
 ConditionPathExists=!/run/dnf-automatic-reboot.recovery
+# Present from a reboot request until the reboot, or until
+# /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels it.
+ConditionPathExists=!/run/dnf-automatic-reboot.reboot-pending
 # A failed run is otherwise visible only in the journal; %n names the unit.
 OnFailure=dnf-automatic-reboot-notify@%n.service
 

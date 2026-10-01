@@ -6,17 +6,17 @@
 developed on Oracle Linux 9 `aarch64` (UEK R8, RPi4, CM5) and RHEL 8 `x86_64`. Shell
 scripts packaged as a noarch RPM.
 
-Scope: hosts where `dnf-automatic`'s own `reboot = when-needed` does not work — observed
-on Oracle Linux 9 aarch64 booting through U-Boot (RPi4, CM5: no RTC, UEK `saved_entry`
-not advancing) and on RHEL 8. The stalls observed on RHEL 8 `x86_64` and OL9 `aarch64` all
-ran with `apply_updates = yes`, under both `upgrade_type = security` and `default`; the
-`apply_updates` check comes from dnf-automatic's defaults, not from an observed failure.
-The `automatic.conf` on both surveyed hosts carries `reboot` and `reboot_command`; with
-this package installed `reboot = never` is required, so `reboot_command` is not used.
-The `%pre` gate accepts
-`PLATFORM_ID` `platform:el8` and `platform:el9` and refuses any other. User-facing docs
-do not recommend the package for an EL9 host where the built-in reboot works; they point
-there instead.
+Scope: EL8 and EL9 hosts on which `dnf-automatic` does not reboot when an update needs it.
+On EL8 it cannot: RHEL 8.10's `dnf-automatic` has no reboot handling (see
+[`dnf-automatic` on EL8](#dnf-automatic-on-el8)). On EL9 it has `reboot = when-needed`,
+which fails on Oracle Linux 9 aarch64 booting through U-Boot (RPi4, CM5: no RTC, UEK
+`saved_entry` not advancing). The failures observed on both ran with `apply_updates = yes`,
+under both `upgrade_type = security` and `default`; the `apply_updates` check comes from
+dnf-automatic's defaults, not from an observed failure. The `automatic.conf` on both surveyed
+hosts carries `reboot` and `reboot_command`; with this package installed `reboot = never` is
+required, so `reboot_command` is not used. The `%pre` gate accepts `PLATFORM_ID`
+`platform:el8` and `platform:el9` and refuses any other. User-facing docs do not recommend
+the package for an EL9 host where the built-in reboot works; they point there instead.
 
 `tools/verify-el-prerequisites.sh` surveys every platform fact the package relies on.
 The EL8/EL9 differences recorded in this file come from its runs on RHEL 8.10 (systemd 239, dnf 4.7)
@@ -49,6 +49,10 @@ scripts/run.sh                  Main orchestration (inhibitor + dnf + reboot)
 scripts/watchdog.sh             Independent watchdog (soft/hard timeout)
 scripts/needs-reboot.sh         Reboot decision + false-positive filtering
 scripts/notify-failure.sh       OnFailure= notifier (wall + log)
+scripts/cancel-reboot.sh        Cancels a pending reboot and allows update runs again
+scripts/reboot-if-pending.sh    The scheduled reboot's command: reboots only while one is pending
+scripts/reboot-request.sh       Reboot request/cancel protocol, sourced by the scripts that request, run or cancel reboots
+scripts/run-state.sh            State file protocol (atomic publish, snapshot, checked removal), sourced by run and watchdog
 units/dnf-automatic-reboot.service    Oneshot service wrapping run.sh
 units/dnf-automatic-reboot.timer      Daily 03:00, RandomizedDelaySec=10min, Persistent
 units/dnf-automatic-watchdog.service  Oneshot service wrapping watchdog.sh
@@ -58,9 +62,11 @@ tests/run-tests.sh              Test suite (bash only, run by make check and %ch
 tmpfiles/dnf-automatic-reboot.conf   Log + state path modes and labels
 logrotate/dnf-automatic-reboot       Log rotation drop-in
 doc/README                      Operational reference (installed to /usr/share/doc/)
+doc/END-TO-END-TEST.md          Live-host test of inhibitors, cancellation and the reboot (repository only)
 LICENSE, LICENSES/, REUSE.toml  GPL-2.0-or-later; the spec alone is MIT
 tools/verify-grub-boot-flags.sh Read-only host check: can grubenv flags pick the boot entry?
 tools/verify-el-prerequisites.sh Read-only host survey of every platform fact the package relies on
+tools/verify-reboot-protocol.sh Host check of the systemd behaviour the reboot protocol relies on (probe units only, never reboots)
 ```
 
 **Licensing.** Every script, test and the Makefile carries
@@ -103,12 +109,12 @@ readonly CONFIG_FILE=/etc/dnf/automatic-reboot.conf
 readonly LOG_FILE=/var/log/dnf-automatic-reboot.log
 readonly SCRIPT_NAME=script-name   # used in log prefix
 
-log()      { printf '<6>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: %s\n'          "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
-log_warn() { printf '<4>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
-log_err()  { printf '<3>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: ERROR: %s\n'   "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
+log()         { printf '<6>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: %s\n'          "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
+log_warning() { printf '<4>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
+log_error()   { printf '<3>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: ERROR: %s\n'   "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
 
-# Config reader: conf_get KEY DEFAULT_VALUE
-conf_get() {
+# Config reader: get_config_value KEY DEFAULT_VALUE
+get_config_value() {
     local config_key="$1" default_value="$2" config_value
     config_value=$(grep -E "^\s*${config_key}\s*=" "${CONFIG_FILE}" 2>/dev/null \
                    | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//') || true
@@ -129,7 +135,7 @@ Script-scope constants and globals are `UPPER_SNAKE_CASE`; function locals are
 - Save/restore `IFS` around comma-split loops: `PREVIOUS_IFS="${IFS}"; IFS=','; ...; IFS="${PREVIOUS_IFS}"`
 - `|| true` on commands that are allowed to fail
 - Never `return` at top level; use `exit`
-- `conf_get_int` for any value that reaches an arithmetic test — a typo in the
+- `get_config_integer` for any value that reaches an arithmetic test — a typo in the
   config must not abort the run inside `[[ ... -gt ... ]]`
 - A function whose value is captured with `$(...)` must not log to stdout. Log
   helpers write to stdout for the journal, so inside a value-returning function
@@ -188,8 +194,8 @@ watchdog path that could reboot a host mid-transaction — not on line coverage.
 ### Config file parsing
 
 All tunables live in `conf/automatic-reboot.conf`. Scripts never have hardcoded
-policy values — always `conf_get key default`. This keeps scripts testable without
-installing the config. `conf_get` is section-blind: it matches `^\s*KEY\s*=` anywhere
+policy values — always `get_config_value key default`. This keeps scripts testable without
+installing the config. `get_config_value` is section-blind: it matches `^\s*KEY\s*=` anywhere
 in the file, so every key name must be unique across all sections.
 
 ### Parsing external tool output
@@ -233,7 +239,7 @@ leaves a host running known-vulnerable code, so it is never the default.
 |------|---------|
 | 0 | No reboot needed |
 | 1 | Reboot needed |
-| 2 | Undecidable: tool error, or a genuine kernel update that rebooting would not apply |
+| 2 | Undecidable: tool error, a genuine kernel update that rebooting would not apply, or a kernel reboot attempt that could not be recorded (this one vetoes the reboot even when another package needs one) |
 
 `needs-restarting -r` exits 1 both for "reboot required" and for any error dnf
 handles, such as a missing cache. Only exit 1 with at least one `  * <name>` line is a
@@ -250,6 +256,17 @@ than 0, 1 and 2, such as 127 from a missing helper, is handled as code 2: only 0
 Written by `run.sh`, consumed by `watchdog.sh`. It exists from before `dnf-automatic`
 starts until `run.sh` exits; `checking` covers the reboot decision and the service
 restarts after it.
+
+`scripts/run-state.sh`, sourced by both, holds the protocol. `run.sh` publishes the file by
+writing a temporary file beside it and renaming it over the old one, so a reader never sees it
+empty or half-written; a write that fails before the update aborts the run, since the
+watchdog could not supervise it. Every write and removal holds
+`/run/dnf-automatic-reboot.state.lock` (`flock`, `0600` like the request lock). The watchdog
+reads the file once per cycle and decides from that snapshot; the identity re-check before a
+kill compares the whole file with it. It removes the state and lock files only under the lock
+and only while the state file still holds that snapshot, so a run that started in the
+meantime keeps both. `run.sh` removes the file only while it holds the content it last
+published.
 
 ```
 phase=updating|checking
@@ -293,14 +310,118 @@ removed, and be rebooted under. The watchdog therefore creates
 `dnf-automatic-reboot.service` carries
 `ConditionPathExists=!/run/dnf-automatic-reboot.recovery`: no run starts while the file
 exists, and a run that started before it shows in the re-check. The file covers the
-kill, the state-file removal and the reboot decision. When the watchdog requests or
-schedules a reboot the file stays, so no update starts before that reboot, which empties
-`/run`; every other exit removes it through the EXIT trap. The watchdog unit's
-`ExecStopPost=` removes it when `$SERVICE_RESULT` is not `success`, covering a watchdog
-that failed or was stopped by `TimeoutStartSec=`. A timer start skipped by the
-condition waits for the next `OnCalendar=`. Cancelling a watchdog-scheduled reboot takes
-`systemctl stop dnf-automatic-reboot-scheduled-reboot.timer` and
-`rm -f /run/dnf-automatic-reboot.recovery`.
+kill, the state-file removal and the reboot decision, and never outlives the watchdog:
+the EXIT trap removes it on every exit, and the watchdog unit's `ExecStopPost=` removes it
+unconditionally, covering a watchdog stopped by `TimeoutStartSec=`. A timer start
+skipped by the condition waits for the next `OnCalendar=`.
+
+A pending reboot has its own marker, so each file has one lifetime and one set of
+removers:
+
+| Marker | Lifetime | Removed by |
+|--------|----------|------------|
+| `/run/dnf-automatic-reboot.recovery` | identity re-check, kill, state cleanup, reboot decision | the watchdog's EXIT trap; `ExecStopPost=` |
+| `/run/dnf-automatic-reboot.reboot-pending` | from before a reboot request until the reboot | the reboot (emptying `/run`); `cancel-reboot.sh`; a request that submitted nothing, for the file it created |
+
+`dnf-automatic-reboot.service` carries `ConditionPathExists=!` for both. No timeout or
+further condition is to be added to either marker.
+
+### Reboot requests (`scripts/reboot-request.sh`)
+
+`run.sh`, `watchdog.sh`, `cancel-reboot.sh` and `reboot-if-pending.sh` source one library for
+the request and cancellation protocol; it is installed 0640 and never executed.
+
+**The invariant.** No script calls `systemctl reboot` directly. Every reboot is the transient
+`dnf-automatic-reboot-scheduled-reboot.service` running `reboot-if-pending.sh`, after
+`reboot_delay_sec` through its timer, or at once for the watchdog's hard timeout. Holding the
+request lock, `reboot-if-pending.sh` reboots only while `.reboot-pending` exists, and writes
+`/run/dnf-automatic-reboot.reboot-dispatched` before it calls `systemctl reboot`. Holding the
+same lock, `cancel-reboot.sh` refuses when the dispatched file exists, and otherwise removes
+`.reboot-pending`. After a cancellation succeeds, no request of this package can reboot the
+host: a timer that still fires, a job the timer queued before it stopped, or a submission
+systemd processes late all find no marker and exit 0. Cancellation therefore does not depend
+on reading every systemd state exactly.
+
+**Lock.** `/run/dnf-automatic-reboot.reboot-request.lock` (`flock`). `request_reboot` holds it
+from before it creates `.reboot-pending` until the dispatch's outcome is known, waiting up to
+`reboot_request_lock_wait_sec`; `reboot-if-pending.sh` holds it from its marker check until
+`systemctl reboot` returns, waiting the same time (passed on its command line).
+`cancel-reboot.sh` takes it without waiting and refuses when it is held. `flock(2)` grants an
+exclusive lock through a read-only descriptor, so any user who can open the file can block
+every request: tmpfiles.d creates it `0600 root`, and `acquire_reboot_request_lock` creates
+it under `umask 077` and `chmod 0600`s it before every use, in place, so holders and waiters
+keep the same inode. The file is never removed.
+
+**Request outcomes.** `submit_reboot` returns accepted (0), rejected (1) or unknown (2).
+Rejected only when nothing was submitted: the scheduled reboot's state could not be read
+before `systemd-run`. A failed `systemd-run` is accepted when the unit is visible afterwards,
+and unknown otherwise, because a request may still be on its way to systemd. Accepted and
+unknown keep `.reboot-pending`; rejected removes the one this request created. Unknown, and a
+process stopped mid-request (its EXIT trap), log the check and recovery commands and fail the
+unit; a late reboot still happens, because the marker is there. A run killed by SIGKILL
+mid-request has no trap: when the watchdog then decides no reboot is needed, it fails its
+unit if `.reboot-pending` exists with no reboot waiting or under way.
+
+**Reboot outcomes.** `reboot-if-pending.sh` calls `systemctl reboot --check-inhibitors=yes`.
+Run from a service, outside a terminal, `systemctl` otherwise skips the inhibitor check and
+reboots under a package transaction that holds a block inhibitor. A `systemctl` that rejects
+the option makes the script fail without rebooting. It exits 0 when the reboot is accepted,
+and when no reboot is pending. When the call fails it reads the shutdown state first: `yes`
+(logind accepted, perhaps delaying for an inhibitor) is success and is never requested again;
+`unknown` fails with the dispatched file kept. Only `no` counts as a refusal, most likely by a
+block inhibitor: the script removes the dispatched file, releases the lock, and tries again
+every 30 seconds until `reboot_inhibited_wait_sec` (default 1800) has passed, then fails,
+naming the block inhibitors logind lists. Between attempts the reboot can be cancelled. Nothing
+in the package uses `--force`: the watchdog's kill ends the stuck run's own inhibitor, and any
+other inhibitor belongs to somebody else. Its `OnFailure=` notice says whether update runs are
+still held, and names `cancel-reboot.sh` unless the dispatched file makes cancellation refuse.
+
+**Reading systemd.** `read_unit_snapshot` reads `LoadState`, `ActiveState`, `SubState` and
+`Job` of one unit from one `systemctl show`, so the values describe one moment; a missing
+`Job` line is no job. `read_scheduled_reboot_status` reads the timer, then the service, and
+returns `dispatched` (the dispatched file exists), `in_progress` (service queued or running,
+or timer `running`), `failed`, `waiting` (timer `SubState=waiting`; an `elapsed` timer is
+not), `none`, or `unknown` for a failed read or any unlisted value. `read_host_shutdown_state`
+is `yes` when `systemctl is-system-running` prints `stopping` or logind's
+`PreparingForShutdown` is true, `no` only when both were read and the state is one of
+`initializing`, `starting`, `running`, `degraded` or `maintenance`, and `unknown` otherwise.
+
+**Cancellation.** `cancel-reboot.sh` refuses (exit 1, marker kept) while the lock is held,
+when the dispatched file exists, when the scheduled reboot's state is `unknown`, and when the
+shutdown state is `yes` or `unknown`. Otherwise it removes `.reboot-pending`, then stops a
+waiting or running timer (a failure only warns: the timer's command finds no marker) and
+resets a failed service.
+
+**No update before a pending reboot.** `run.sh` exits 0 without updating while the scheduled
+reboot is `waiting`, `in_progress` or `dispatched`, and 1 when it is `unknown`. The marker's
+`ConditionPathExists=!` normally keeps the unit from starting then; this also covers a timer
+with no marker, such as one a 1.4.0 watchdog scheduled during an upgrade to this version,
+whose `ExecStopPost=` removes the 1.4.0 hold. Nothing migrates from 1.4.0.
+
+`tools/verify-reboot-protocol.sh` checks these facts against real systemd, through the
+library's own readers, with transient probe units that run `/bin/true` or `sleep`. On OL 9.8
+(systemd 252) and RHEL 8.10 (systemd 239, util-linux 2.32.1) it observed the same:
+
+- An unknown unit shows `Job=` with an empty value, and a queued start shows `Job=<id>` while
+  the unit is still `inactive`.
+- A transient `--on-active` timer is `SubState=waiting` until it fires, with
+  `RemainAfterElapse=no`; once it has fired or been stopped, it and its service are
+  `not-found`.
+- Stopping a timer that has fired leaves its service's queued start job in place. Only
+  `reboot-if-pending.sh`'s own marker check stops that job from rebooting.
+- `systemd-run` without `--on-active` runs the command at once.
+- A running host can report `degraded`, which reads as not shutting down.
+- tmpfiles.d creates the lock `0600 root:root` with label `var_run_t`, and user `nobody` cannot
+  open it.
+
+- On both hosts `flock -n` and `flock -w` behave as the library expects, free and held, and
+  bash expands an empty array under `set -u`.
+- `systemctl` accepts `--check-inhibitors=yes` on both: systemd 252 has it, and RHEL 8.10's
+  239-82.el8_10 carries the backport.
+- `chronyc waitsync` confirms the clock on both, with `rtcsync` set on one and not the other.
+
+`PreparingForShutdown` under a delay inhibitor needs a real shutdown, and is read from the
+systemd 239 and 252 sources only.
 
 After the kill, the watchdog waits up to `watchdog_kill_confirm_sec` for systemd to report
 the unit `inactive` or `failed`. A failed `systemctl kill`, or a unit still active then,
@@ -333,9 +454,9 @@ transaction running while the caller proceeds to reboot.
 
 At hard timeout in `phase=updating` an rpm transaction may be half-applied. That is
 the same uncertainty for which the dead-PID path already refuses to reboot, so the
-default is to kill and alert. `systemctl reboot` is preferred over `--force`, which
-remounts filesystems read-only under running processes and risks the rootfs on a
-flash-backed host.
+default is to kill and alert. The reboot never uses `--force`, which remounts filesystems
+read-only under running processes, risks the rootfs on a flash-backed host, and overrides
+other users' inhibitors.
 
 ### State files under `/var/lib/dnf-automatic-reboot/`
 
@@ -352,7 +473,8 @@ design. One row per tracked package; a new EVR supersedes the old row:
 ```
 
 `kernel-reboot-attempts` — consecutive reboots scheduled for a kernel version that
-has not become the running one. Cleared as soon as it does. `boot_id` names the boot
+has not become the running one. Cleared by the first check that finds the target running,
+whatever `needs-restarting` reports: with a correct clock it no longer flags the kernel then. `boot_id` names the boot
 that counted the last attempt: every check in that boot belongs to the same attempt,
 so a check run by hand, the watchdog's check or a repeated run does not use up the
 limit; only a boot that comes up on the old kernel counts the next one. With an
@@ -444,7 +566,10 @@ The first observation of a given package/EVR pair always triggers one reboot —
 reboot is what proves the flag spurious or genuine. A new EVR on an
 already-`confirmed` package starts a fresh, unverified cycle, so a real future update
 is never masked by an old confirmation. `kernel*` packages are exempt; the
-version-string check above remains their sole authority. Controlled by
+version-string check above remains their sole authority. Packages in `filter_packages` are
+exempt too: a build-id mismatch, or a build-id that cannot be verified, keeps the package, and
+no recorded `confirmed` row can overrule it. Only packages that reach the learning branch of
+`classify_flagged_packages` (`LEARNABLE_PACKAGE_NAMES`) are learned. Controlled by
 `learn_false_positives` in `automatic-reboot.conf`.
 
 ## What `needs-restarting -r` does not cover
@@ -466,8 +591,43 @@ A restart that fails, one still unfinished at `restart_service_timeout_sec`, and
 `needs-restarting -s` that cannot list the units each leave pre-update code running, so
 each fails the run. An excluded unit does not: it is left running by design. The run
 ends with one line naming the update, reboot and restart outcome, for example
-`Updates installed; no reboot needed; restart still pending for sshd.service. Check:
+`Updates installed (packages: 3); no reboot needed; restart still pending for sshd.service. Check:
 systemctl status sshd.service`, logged and sent through `wall`.
+
+## `dnf-automatic` on EL8
+
+RHEL 8.10's `dnf-automatic` (dnf 4.7) installs updates and never reboots.
+`/usr/lib/python3.6/site-packages/dnf/automatic/main.py` does not contain the word `reboot`,
+and a run that installed a newer kernel logged no reboot attempt. A `reboot` or
+`reboot_command` key in `automatic.conf` is accepted and never read, so on EL8 every kernel
+update waits for a manual reboot unless this package performs it. On Oracle Linux 9.8,
+`/usr/lib/python3.9/site-packages/dnf/automatic/main.py` defines both options and reboots
+when `reboot` is `when-changed`, or `when-needed` and `base.reboot_needed()` is true; it runs
+`reboot_command` through `os.system` and raises an error on a non-zero exit code. `%pre` and `check_conflicts`
+still require `reboot = never` on EL8: the key is inert there and is honoured on EL9, and one
+rule for both keeps the file's meaning the same across platforms.
+
+With a correct clock, `needs-restarting -r` flagging a kernel means a kernel package was
+installed during this boot, which under unattended updates is a newer kernel awaiting a
+reboot: genuine. A kernel is never applied without one. The only cause of a false kernel flag
+is a boot time recorded before the clock was set (see
+[Root cause](#root-cause-of-every-false-positive-a-wrong-clock-at-boot)); the version
+comparison in `needs-reboot.sh` exists for that case.
+
+### kpatch
+
+kpatch loads live patches (`kpatch-patch-<kernel version>` packages) into the running kernel.
+They cover selected CVEs of that kernel, not the whole content of a later kernel erratum, and
+they install no kernel package. `needs-restarting -r` does not consider them, and neither does
+`needs-reboot.sh`: a newer installed kernel is a genuine reboot whether or not live patches are
+loaded. `kpatch.service` in `active (exited)` only says it ran at boot; `kpatch list` shows
+what is loaded.
+
+The package has no kpatch exemption, by design. That a loaded live patch covers every fix in
+the installed kernel cannot be established from package data, and that is the "cannot tell"
+case [fail-closed verification](#fail-closed-verification) keeps. On a kpatch host the lever is
+when the reboot happens: an `OnCalendar=` override of `dnf-automatic-reboot.timer` for a
+maintenance window. Deferring kernel reboots on such hosts would be a separate design decision.
 
 ## Unsigned repositories
 
@@ -569,7 +729,21 @@ means nothing on its own.
 `chrony` ships `chrony-wait.service` — `chronyc waitsync`, ordered
 `Before=time-sync.target` — disabled by default. `%post` enables it when
 `[time] enable_chrony_wait = yes`. It is never disabled on erase: a synchronised
-clock is not this package's to take away.
+clock is not this package's to take away. `%post` does not start it for the current boot.
+
+The unit ordering does not require a successful synchronisation: `time-sync.target` is
+reached even when `chrony-wait.service` fails (systemd issue 4880). `run.sh` therefore
+checks the clock itself before installing anything: `wait_for_clock_sync` runs
+`chronyc waitsync` (every 10 s, remaining correction below 0.1 s) for at most
+`clock_sync_wait_sec` (default 600) under `timeout`, since each request adds its own time to
+the polling interval and the run is not yet supervised by the watchdog; a run whose clock
+chronyd has not confirmed by then installs nothing and fails. A missing `chronyc` fails it too. `require_clock_sync = no`
+turns the check off for a host without chrony. The check asks chronyd, not the kernel's
+synchronised flag (`timedatectl`'s `NTPSynchronized`). On Linux chrony clears `STA_UNSYNC`
+only with `rtcsync` (`sys_timex.c`, chrony 4.3), and the surveyed OL 9.8 aarch64 host, which
+has no RTC, has `rtcsync` commented out; the surveyed RHEL 8.10 host sets it. The kernel flag
+therefore does not tell whether chrony is synchronised; chronyd itself does. `tools/verify-reboot-protocol.sh` reports whether
+`chronyc waitsync` confirms the clock on a host.
 
 `/etc/chrony.conf` needs `makestep 1 -1` so the clock is stepped rather than slewed
 at boot. `rtcsync` is pointless on a host with no RTC and is not required.
@@ -625,6 +799,9 @@ compares ELF notes and does not read the clock, so skew does not affect it.
 - `BuildArch: noarch` — shell scripts only, no compiled artifacts.
 - `Requires: elfutils` — `eu-readelf` is required for the build-id check.
 - `Requires: logrotate` — the drop-in in `/etc/logrotate.d` needs a consumer.
+- `Requires: chrony` — `run.sh` runs `chronyc waitsync` before every update; `%pre` checks
+  it too, for `--nodeps`. Installed does not mean running or synchronised, so the runtime
+  check stays.
 - `Requires: systemd >= 239` — EL8's systemd. Every unit directive and systemctl
   option the package uses exists there; the one renamed option is chosen at runtime
   (see the state file section).
@@ -690,9 +867,9 @@ systemctl start dnf-automatic-reboot.service
 # during a run it acts as its timer would, kill and reboot included
 /usr/libexec/dnf-automatic-reboot/watchdog.sh
 
-# A scheduled reboot, and how to cancel it
+# A scheduled reboot, and how to cancel it (also allows update runs again)
 systemctl list-timers dnf-automatic-reboot-scheduled-reboot.timer
-systemctl stop dnf-automatic-reboot-scheduled-reboot.timer
+/usr/libexec/dnf-automatic-reboot/cancel-reboot.sh
 
 # What -r decides, and the boot time it decides against
 LC_ALL=C dnf -q -C needs-restarting -r
@@ -732,7 +909,7 @@ tail -f /var/log/dnf-automatic-reboot.log
 ## What not to do
 
 - Do not add `setenforce 0` or `permissive` as a workaround for any SELinux denial.
-- Do not hardcode policy (timeouts, package names) in scripts — use `conf_get`.
+- Do not hardcode policy (timeouts, package names) in scripts — use `get_config_value`.
 - Do not parse tool output with a blocklist of known-uninteresting lines, and do not
   fold stderr into a parsed stream. Match the shape you want and discard the rest.
 - Do not treat an unverifiable state as a false positive. "Cannot tell" keeps the
@@ -751,8 +928,8 @@ tail -f /var/log/dnf-automatic-reboot.log
   check is their sole, more authoritative, source of truth.
 - Do not kill the run by PID — `systemctl kill` the whole unit, or
   `dnf-automatic` survives behind `timeout(1)`.
-- Do not reach for `systemctl reboot --force` as the first option; it remounts
-  filesystems read-only under running processes.
+- Do not use `systemctl reboot --force`, and do not call `systemctl reboot` without
+  `--check-inhibitors=yes`; reboot only through `reboot-if-pending.sh`.
 - Do not install anything under `/usr/local` from the RPM.
 - Do not edit `/etc/dnf/automatic.conf` from a scriptlet, a script or the docs'
   commands. It belongs to the operator and may predate this package: check it and

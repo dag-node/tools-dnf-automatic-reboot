@@ -10,7 +10,9 @@
 # no operator-facing signal at all.
 #
 # Argument 1 is the name of the unit that failed, passed as %I from the
-# templated dnf-automatic-reboot-notify@.service.
+# templated dnf-automatic-reboot-notify@.service.  For the scheduled reboot's
+# transient service, the message says whether update runs stay blocked and
+# how to recover.
 #
 # Configuration: /etc/dnf/automatic-reboot.conf
 # Log:           /var/log/dnf-automatic-reboot.log
@@ -20,12 +22,20 @@ IFS=$'\n\t'
 
 export LC_ALL=C
 
-readonly CONFIG_FILE=/etc/dnf/automatic-reboot.conf
-readonly LOG_FILE=/var/log/dnf-automatic-reboot.log
+# Path prefix, empty in production.  tests/run-tests.sh points it at a
+# temporary tree so every path below resolves inside it.
+readonly TEST_ROOT="${DNF_AUTOMATIC_REBOOT_TEST_ROOT:-}"
+
+readonly CONFIG_FILE="${TEST_ROOT}/etc/dnf/automatic-reboot.conf"
+readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
+readonly REBOOT_PENDING_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-pending"
+readonly REBOOT_DISPATCHED_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-dispatched"
+readonly SCHEDULED_REBOOT_SERVICE=dnf-automatic-reboot-scheduled-reboot.service
+readonly CANCEL_REBOOT_COMMAND=/usr/libexec/dnf-automatic-reboot/cancel-reboot.sh
 readonly SCRIPT_NAME=notify-failure
 readonly JOURNAL_EXCERPT_LINES=15
 
-log_err() {
+log_error() {
     printf '<3>%s: %s\n' "${SCRIPT_NAME}" "$*"
     printf '%s %s: ERROR: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
@@ -39,21 +49,46 @@ wall_msg() {
     wall "$*" 2>/dev/null || true
 }
 
-failed_unit_name="${1:-dnf-automatic-reboot.service}"
+# failed_reboot_recovery_hint -> what a failed scheduled reboot leaves behind
+# and how to recover from it.
+failed_reboot_recovery_hint() {
+    if [[ -e "${REBOOT_DISPATCHED_FILE}" ]]; then
+        printf '%s' "The reboot command ran, but whether systemd accepted it is unknown. Update runs stay blocked until the host reboots: reboot it."
+    elif [[ -e "${REBOOT_PENDING_FILE}" ]]; then
+        printf '%s' "The scheduled reboot did not happen. Update runs stay blocked until the host reboots: reboot it, or allow updates again with ${CANCEL_REBOOT_COMMAND}"
+    else
+        printf '%s' "The scheduled reboot did not happen. Update runs are not blocked; reboot the host to apply the updates."
+    fi
+}
 
-log_err "${failed_unit_name} FAILED - the host may be running unpatched or unrebooted"
+main() {
+    local failed_unit_name="${1:-dnf-automatic-reboot.service}" journal_excerpt="" journal_line
+    local outcome_summary="Automatic updates or the reboot decision did not complete."
 
-journal_excerpt=""
-journal_excerpt=$(journalctl -u "${failed_unit_name}" -n "${JOURNAL_EXCERPT_LINES}" \
-                  --no-pager --output=cat 2>/dev/null) || true
-if [[ -n "${journal_excerpt}" ]]; then
-    while IFS= read -r journal_line; do
-        [[ -n "${journal_line}" ]] && log_err "${failed_unit_name}: ${journal_line}"
-    done <<< "${journal_excerpt}"
+    log_error "${failed_unit_name} FAILED - the host may be running unpatched or unrebooted"
+
+    journal_excerpt=$(journalctl -u "${failed_unit_name}" -n "${JOURNAL_EXCERPT_LINES}" \
+                      --no-pager --output=cat 2>/dev/null) || true
+    if [[ -n "${journal_excerpt}" ]]; then
+        while IFS= read -r journal_line; do
+            if [[ -n "${journal_line}" ]]; then
+                log_error "${failed_unit_name}: ${journal_line}"
+            fi
+        done <<< "${journal_excerpt}"
+    fi
+
+    if [[ "${failed_unit_name}" == "${SCHEDULED_REBOOT_SERVICE}" ]]; then
+        outcome_summary=$(failed_reboot_recovery_hint)
+        log_error "${outcome_summary}"
+    fi
+
+    wall_msg "dnf-automatic-reboot: ${failed_unit_name} FAILED." \
+             "${outcome_summary}" \
+             "Inspect: journalctl -u ${failed_unit_name} -e"
+    exit 0
+}
+
+# Sourcing defines the functions above without notifying.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
 fi
-
-wall_msg "dnf-automatic-reboot: ${failed_unit_name} FAILED." \
-         "Automatic updates or the reboot decision did not complete." \
-         "Inspect: journalctl -u ${failed_unit_name} -e"
-
-exit 0

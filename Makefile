@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 NAME    = dnf-automatic-reboot
-VERSION = 1.4.0
+VERSION = 1.5.0
 TARBALL = $(NAME)-$(VERSION).tar.gz
 
 # /usr/libexec, not /usr/local/lib: /usr/local is reserved for the local
@@ -16,7 +16,12 @@ LOGROTATEDIR = /etc/logrotate.d
 SCRIPTS = scripts/run.sh \
           scripts/watchdog.sh \
           scripts/needs-reboot.sh \
-          scripts/notify-failure.sh
+          scripts/notify-failure.sh \
+          scripts/cancel-reboot.sh \
+          scripts/reboot-if-pending.sh
+# Sourced, never executed.
+LIBRARIES = scripts/reboot-request.sh \
+            scripts/run-state.sh
 UNITS   = units/dnf-automatic-reboot.service \
           units/dnf-automatic-reboot.timer \
           units/dnf-automatic-watchdog.service \
@@ -26,6 +31,8 @@ CONF      = conf/automatic-reboot.conf
 TMPFILES  = tmpfiles/$(NAME).conf
 LOGROTATE = logrotate/$(NAME)
 DOC       = doc/README
+# Repository and source archive only; it drives tools/, which the RPM does not ship.
+E2E_DOC   = doc/END-TO-END-TEST.md
 LICENSE   = LICENSE
 # Licence texts and copyright metadata: the spec is MIT, so a source archive
 # carries the MIT text and REUSE.toml, which names the copyright holder.
@@ -36,7 +43,8 @@ CONTAINER_BUILD_SCRIPT = .github/scripts/build-in-container.sh
 TESTS = tests/run-tests.sh
 # Operator diagnostics: linted with the scripts, never installed.
 TOOLS = tools/verify-grub-boot-flags.sh \
-        tools/verify-el-prerequisites.sh
+        tools/verify-el-prerequisites.sh \
+        tools/verify-reboot-protocol.sh
 
 # rpmbuild output goes to rpmbuild/$(NAME)/<target>/, one folder per target:
 # el8 or el9 from DIST, local without it.  A build empties only its own folder,
@@ -73,13 +81,13 @@ all:
 check: lint test
 
 lint:
-	@for script in $(SCRIPTS) $(TESTS) $(TOOLS); do bash -n $$script || exit 1; echo "syntax OK  $$script"; done
+	@for script in $(SCRIPTS) $(LIBRARIES) $(TESTS) $(TOOLS); do bash -n $$script || exit 1; echo "syntax OK  $$script"; done
 	@if command -v shellcheck >/dev/null 2>&1; then \
-	    shellcheck -S warning $(SCRIPTS) $(TOOLS) && echo "shellcheck OK"; \
+	    shellcheck -S warning $(SCRIPTS) $(LIBRARIES) $(TOOLS) && echo "shellcheck OK"; \
 	else \
 	    echo "shellcheck not installed - skipping lint"; \
 	fi
-	@if LC_ALL=C grep -nP '[^\x00-\x7F]' $(SCRIPTS) $(TOOLS) $(CONF) $(UNITS) $(TMPFILES) $(LOGROTATE); then \
+	@if LC_ALL=C grep -nP '[^\x00-\x7F]' $(SCRIPTS) $(LIBRARIES) $(TOOLS) $(CONF) $(UNITS) $(TMPFILES) $(LOGROTATE); then \
 	    echo "ERROR: non-ASCII characters found (scripts and config must be ASCII only)"; exit 1; \
 	else \
 	    echo "ascii OK"; \
@@ -97,6 +105,7 @@ install:
 	install -d -m 0755 $(DESTDIR)$(LOGROTATEDIR)
 	install -d -m 0750 $(DESTDIR)$(STATEDIR)
 	install -m 0750 $(SCRIPTS)   $(DESTDIR)$(LIBEXECDIR)/
+	install -m 0640 $(LIBRARIES) $(DESTDIR)$(LIBEXECDIR)/
 	install -m 0644 $(UNITS)     $(DESTDIR)$(UNITDIR)/
 	install -m 0640 $(CONF)      $(DESTDIR)$(CONFDIR)/automatic-reboot.conf
 	install -m 0644 $(TMPFILES)  $(DESTDIR)$(TMPFILESDIR)/$(NAME).conf
@@ -118,8 +127,8 @@ uninstall:
 
 dist: check
 	tar czf $(TARBALL) --transform 's,^,$(NAME)-$(VERSION)/,' \
-	    Makefile $(SCRIPTS) $(UNITS) $(CONF) $(TMPFILES) $(LOGROTATE) \
-	    $(TESTS) $(TOOLS) $(DOC) $(LICENSE) $(LICENSE_METADATA) $(NAME).spec \
+	    Makefile $(SCRIPTS) $(LIBRARIES) $(UNITS) $(CONF) $(TMPFILES) $(LOGROTATE) \
+	    $(TESTS) $(TOOLS) $(DOC) $(E2E_DOC) $(LICENSE) $(LICENSE_METADATA) $(NAME).spec \
 	    $(CONTAINER_BUILD_SCRIPT)
 	@echo "Created $(TARBALL)"
 

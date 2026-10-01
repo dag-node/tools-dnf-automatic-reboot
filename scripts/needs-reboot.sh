@@ -59,11 +59,11 @@ log() {
     printf '<6>%s: %s\n' "${SCRIPT_NAME}" "$*"
     printf '%s %s: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
-log_warn() {
+log_warning() {
     printf '<4>%s: %s\n' "${SCRIPT_NAME}" "$*"
     printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
-log_err() {
+log_error() {
     printf '<3>%s: %s\n' "${SCRIPT_NAME}" "$*"
     printf '%s %s: ERROR: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
@@ -71,25 +71,36 @@ log_err() {
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
-# conf_get KEY DEFAULT_VALUE
+# get_config_value KEY DEFAULT_VALUE
 # Reads a key from any section; returns DEFAULT_VALUE when the key is absent.
-conf_get() {
+get_config_value() {
     local config_key="$1" default_value="$2" config_value
     config_value=$(grep -E "^\s*${config_key}\s*=" "${CONFIG_FILE}" 2>/dev/null \
                    | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//') || true
     printf '%s' "${config_value:-${default_value}}"
 }
 
-# conf_get_int KEY DEFAULT_VALUE
-# As conf_get, but falls back to DEFAULT_VALUE when the configured value is
+# get_config_integer KEY DEFAULT_VALUE
+# As get_config_value, but falls back to DEFAULT_VALUE when the configured value is
 # not a plain non-negative integer.  Keeps a typo in the config from aborting
 # the run inside an arithmetic comparison.
-conf_get_int() {
-    local config_key="$1" default_value="$2" config_value
-    config_value=$(conf_get "${config_key}" "${default_value}")
+# get_config_integer KEY DEFAULT_VALUE [MINIMUM [MAXIMUM]] -> the value as a
+# decimal integer.  Leading zeros are dropped: bash arithmetic reads 08 as an
+# invalid octal number.  A value that is not 1 to 9 digits, or lies outside
+# MINIMUM..MAXIMUM (default 0..999999999), is reported and DEFAULT_VALUE used.
+get_config_integer() {
+    local config_key="$1" default_value="$2" minimum_value="${3:-0}" maximum_value="${4:-999999999}"
+    local config_value
+    config_value=$(get_config_value "${config_key}" "${default_value}")
     config_value="${config_value//[[:space:]]/}"
-    if [[ ! "${config_value}" =~ ^[0-9]+$ ]]; then
-        log_warn "${config_key}='${config_value}' is not a non-negative integer - using default ${default_value}" >&2
+    if [[ ! "${config_value}" =~ ^[0-9]{1,9}$ ]]; then
+        log_warning "${config_key}='${config_value}' is not a non-negative integer - using default ${default_value}" >&2
+        printf '%s' "${default_value}"
+        return 0
+    fi
+    config_value=$(( 10#${config_value} ))
+    if (( config_value < minimum_value || config_value > maximum_value )); then
+        log_warning "${config_key}=${config_value} is outside ${minimum_value}..${maximum_value} - using default ${default_value}" >&2
         config_value="${default_value}"
     fi
     printf '%s' "${config_value}"
@@ -151,14 +162,16 @@ read_kernel_reboot_attempt_boot_id() {
 }
 
 # write_kernel_reboot_attempts PACKAGE_NAME TARGET_VERSION ATTEMPT_COUNT [BOOT_ID]
-# An ATTEMPT_COUNT of 0 clears the package's row.
+# An ATTEMPT_COUNT of 0 clears the package's row.  Returns 1 when the lock,
+# the temporary file or the replacement fails: the file then still holds the
+# previous count.
 write_kernel_reboot_attempts() {
     local package_name="$1" target_version="$2" attempt_count="$3" boot_id="${4:-}"
     mkdir -p "${STATE_DIRECTORY}" 2>/dev/null || true
     (
-        flock -w 10 9 || exit 0
+        flock -w 10 9 || exit 1
         local temporary_file
-        temporary_file=$(mktemp "${KERNEL_REBOOT_ATTEMPT_FILE}.XXXXXX") || exit 0
+        temporary_file=$(mktemp "${KERNEL_REBOOT_ATTEMPT_FILE}.XXXXXX") || exit 1
         # The `if` must not be the last command of the group: as a bare
         # `[[ ]] && printf`, a zero count made the group exit non-zero and the
         # rewritten file was discarded instead of clearing the row.
@@ -167,21 +180,48 @@ write_kernel_reboot_attempts() {
             if [[ "${attempt_count}" -gt 0 ]]; then
                 printf '%s\t%s\t%s\t%s\n' "${package_name}" "${target_version}" "${attempt_count}" "${boot_id}"
             fi
-        } > "${temporary_file}" 2>/dev/null || { rm -f "${temporary_file}"; exit 0; }
+        } > "${temporary_file}" 2>/dev/null || { rm -f "${temporary_file}"; exit 1; }
+        chmod 0640 "${temporary_file}" 2>/dev/null || true
+        mv -f "${temporary_file}" "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null \
+            || { rm -f "${temporary_file}"; exit 1; }
+    ) 9>>"${STATE_LOCK_FILE}" 2>/dev/null
+}
+
+# clear_kernel_reboot_attempts_for_running_kernel
+# Removes every kernel-reboot-attempts row whose target is the running kernel:
+# that reboot worked.  Runs at every check, whatever needs-restarting reports:
+# on a host with a correct clock it no longer flags the kernel once the new one
+# runs, so the false-positive branch that also clears the row is not reached.
+clear_kernel_reboot_attempts_for_running_kernel() {
+    local running_kernel_version machine_architecture
+    [[ -s "${KERNEL_REBOOT_ATTEMPT_FILE}" ]] || return 0
+    running_kernel_version=$(uname -r)
+    machine_architecture=$(uname -m)
+    awk -F'\t' -v running="${running_kernel_version}" -v arch="${machine_architecture}" \
+        '$2 == running || $2 == running "." arch { found = 1 } END { exit !found }' \
+        "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || return 0
+    (
+        flock -w 10 9 || exit 0
+        local temporary_file
+        temporary_file=$(mktemp "${KERNEL_REBOOT_ATTEMPT_FILE}.XXXXXX") || exit 0
+        awk -F'\t' -v running="${running_kernel_version}" -v arch="${machine_architecture}" \
+            '!($2 == running || $2 == running "." arch)' "${KERNEL_REBOOT_ATTEMPT_FILE}" \
+            > "${temporary_file}" 2>/dev/null || { rm -f "${temporary_file}"; exit 0; }
         chmod 0640 "${temporary_file}" 2>/dev/null || true
         mv -f "${temporary_file}" "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || rm -f "${temporary_file}"
+        log "kernel ${running_kernel_version} is running - its reboot attempts are cleared"
     ) 9>>"${STATE_LOCK_FILE}" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
 # Read config
 # ---------------------------------------------------------------------------
-FILTER_PACKAGE_LIST=$(conf_get filter_packages "kernel-uek,kernel-uek-core,kernel,kernel-core,systemd")
-VERIFY_KERNEL_VERSION=$(conf_get verify_kernel_version yes)
-LEARN_FALSE_POSITIVES=$(conf_get learn_false_positives yes)
-VERIFY_GRUB_DEFAULT=$(conf_get verify_grub_default yes)
-KERNEL_REBOOT_ATTEMPT_LIMIT=$(conf_get_int kernel_reboot_attempt_limit 3)
-NEEDS_RESTARTING_TIMEOUT_SEC=$(conf_get_int needs_restarting_timeout_sec 120)
+FILTER_PACKAGE_LIST=$(get_config_value filter_packages "kernel-uek,kernel-uek-core,kernel,kernel-core,systemd")
+VERIFY_KERNEL_VERSION=$(get_config_value verify_kernel_version yes)
+LEARN_FALSE_POSITIVES=$(get_config_value learn_false_positives yes)
+VERIFY_GRUB_DEFAULT=$(get_config_value verify_grub_default yes)
+KERNEL_REBOOT_ATTEMPT_LIMIT=$(get_config_integer kernel_reboot_attempt_limit 3)
+NEEDS_RESTARTING_TIMEOUT_SEC=$(get_config_integer needs_restarting_timeout_sec 120)
 
 # Save and restore IFS around the comma-split so the global \n\t setting
 # is not silently clobbered for the rest of the script.
@@ -227,6 +267,11 @@ parse_flagged_package_names() {
 # PROCESS_BINARY_TO_PIDS values are newline-separated PID lists.
 declare -gA PROCESS_BINARY_TO_PIDS=()
 declare -gA PROCESS_BINARY_TO_PACKAGE=()
+# Packages classify_flagged_packages handed to restart-state learning: those
+# outside filter_packages, which no verifier covers.  Learning never sees a
+# kernel or a package a build-id check examined, so history cannot overrule a
+# current result.
+declare -gA LEARNABLE_PACKAGE_NAMES=()
 PROCESS_MAP_BUILT=0
 
 build_process_binary_map() {
@@ -303,7 +348,7 @@ verify_build_id() {
                     log "${package_name}: pid ${process_id} of ${binary_path} exited before its build-id was read"
                     continue
                 fi
-                log_warn "${package_name}: could not read build-ids for ${binary_path} (pid ${process_id})"
+                log_warning "${package_name}: could not read build-ids for ${binary_path} (pid ${process_id})"
                 unreadable_build_id=1
                 continue
             fi
@@ -316,11 +361,11 @@ verify_build_id() {
     done
 
     if [[ "${unreadable_build_id}" -eq 1 ]]; then
-        log_warn "${package_name}: a running process could not be verified - keeping the package"
+        log_warning "${package_name}: a running process could not be verified - keeping the package"
         return 1
     fi
     if [[ "${verified_process_count}" -eq 0 ]]; then
-        log_warn "${package_name}: no running process owned by this package"
+        log_warning "${package_name}: no running process owned by this package"
         return 1
     fi
 
@@ -354,7 +399,7 @@ running_kernel_is_newest() {
     newest_kernel_version=$(newest_installed_kernel_version "${package_name}")
     if [[ -z "${newest_kernel_version}" ]]; then
         # Flagged but not installed, or rpm failed: no evidence of spuriousness.
-        log_warn "${package_name}: no installed version found, treating as genuine"
+        log_warning "${package_name}: no installed version found, treating as genuine"
         return 1
     fi
     newest_kernel_version_without_arch="${newest_kernel_version%".${machine_architecture}"}"
@@ -407,7 +452,7 @@ run_needs_restarting() {
     # No fallback path: this function removes the file when needs-restarting
     # returns, and a fixed path such as /dev/null would be removed with it.
     if ! stderr_capture_file=$(mktemp); then
-        log_err "cannot create a temporary file for needs-restarting stderr"
+        log_error "cannot create a temporary file for needs-restarting stderr"
         return 2
     fi
 
@@ -415,7 +460,7 @@ run_needs_restarting() {
         "${DNF_BIN}" -q -C needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?
 
     if ! needs_restarting_gave_result "${exit_code}"; then
-        log_warn "cache-only needs-restarting exited ${exit_code} without a result - retrying with a metadata refresh"
+        log_warning "cache-only needs-restarting exited ${exit_code} without a result - retrying with a metadata refresh"
         exit_code=0
         NEEDS_RESTARTING_OUTPUT=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
             "${DNF_BIN}" -q needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?
@@ -427,7 +472,7 @@ run_needs_restarting() {
     # package name.
     if [[ -s "${stderr_capture_file}" ]]; then
         while IFS= read -r stderr_line; do
-            [[ -n "${stderr_line}" ]] && log_warn "needs-restarting: ${stderr_line}"
+            [[ -n "${stderr_line}" ]] && log_warning "needs-restarting: ${stderr_line}"
         done < "${stderr_capture_file}"
     fi
 
@@ -438,7 +483,9 @@ run_needs_restarting() {
 # ---------------------------------------------------------------------------
 # Classify every flagged package into REBOOT_TRIGGER_PACKAGES.
 # Sets REBOOT_WITHHELD when a genuine requirement exists that rebooting would
-# not satisfy.
+# not satisfy, and REBOOT_VETOED when a kernel reboot attempt could not be
+# recorded: kernel_reboot_attempt_limit cannot be enforced then, so no reboot
+# may be requested at all, whatever else triggers one.
 # ---------------------------------------------------------------------------
 classify_flagged_packages() {
     local flagged_package_name target_kernel_version
@@ -453,11 +500,13 @@ classify_flagged_packages() {
         # run, but the kernel and learning paths still can.  Losing one verifier
         # must not suppress the reboot decision the others are able to make.
         build_id_verifier_available=0
-        log_err "eu-readelf unavailable - elfutils is required; build-id verification disabled, affected packages treated as genuine"
+        log_error "eu-readelf unavailable - elfutils is required; build-id verification disabled, affected packages treated as genuine"
     fi
 
     REBOOT_TRIGGER_PACKAGES=()
+    LEARNABLE_PACKAGE_NAMES=()
     REBOOT_WITHHELD=0
+    REBOOT_VETOED=0
 
     for flagged_package_name in "${FLAGGED_PACKAGE_NAMES[@]}"; do
 
@@ -470,7 +519,8 @@ classify_flagged_packages() {
 
             if running_kernel_is_newest "${flagged_package_name}"; then
                 log "${flagged_package_name} false positive: running kernel is the newest installed ($(uname -r))"
-                write_kernel_reboot_attempts "${flagged_package_name}" "-" 0
+                write_kernel_reboot_attempts "${flagged_package_name}" "-" 0 \
+                    || log_warning "${flagged_package_name}: could not clear ${KERNEL_REBOOT_ATTEMPT_FILE}"
                 continue
             fi
 
@@ -481,11 +531,11 @@ classify_flagged_packages() {
                 grub_default_check_result=0
                 grub_default_is_newest_kernel "${flagged_package_name}" || grub_default_check_result=$?
                 if [[ "${grub_default_check_result}" -eq 1 ]]; then
-                    log_err "${flagged_package_name}: GRUB default is $(grubby --default-kernel 2>/dev/null) but the newest installed kernel is ${target_kernel_version} - a reboot would return to the same kernel; withholding reboot, repair the BLS default"
+                    log_error "${flagged_package_name}: GRUB default is $(grubby --default-kernel 2>/dev/null) but the newest installed kernel is ${target_kernel_version} - a reboot would return to the same kernel; withholding reboot, repair the BLS default"
                     REBOOT_WITHHELD=1
                     continue
                 elif [[ "${grub_default_check_result}" -eq 2 ]]; then
-                    log_warn "${flagged_package_name}: could not read the GRUB default; proceeding with the reboot decision"
+                    log_warning "${flagged_package_name}: could not read the GRUB default; proceeding with the reboot decision"
                 fi
             fi
 
@@ -501,15 +551,21 @@ classify_flagged_packages() {
                     log "${flagged_package_name}: attempt ${kernel_reboot_attempts} of ${KERNEL_REBOOT_ATTEMPT_LIMIT} for ${target_kernel_version} is already counted in this boot"
                 else
                     if [[ "${kernel_reboot_attempts}" -ge "${KERNEL_REBOOT_ATTEMPT_LIMIT}" ]]; then
-                        log_err "${flagged_package_name}: ${kernel_reboot_attempts} consecutive reboots for ${target_kernel_version} did not make it the running kernel - giving up, manual intervention required"
+                        log_error "${flagged_package_name}: ${kernel_reboot_attempts} consecutive reboots for ${target_kernel_version} did not make it the running kernel - giving up, manual intervention required"
                         REBOOT_WITHHELD=1
                         continue
                     fi
                     if [[ -z "${current_boot_id}" ]]; then
-                        log_warn "could not read boot_id - counting this check as a reboot attempt"
+                        log_warning "could not read boot_id - counting this check as a reboot attempt"
                     fi
-                    write_kernel_reboot_attempts "${flagged_package_name}" \
-                        "${target_kernel_version}" $(( kernel_reboot_attempts + 1 )) "${current_boot_id}"
+                    # The limit only holds while each attempt is recorded; an
+                    # attempt that cannot be recorded is not made.
+                    if ! write_kernel_reboot_attempts "${flagged_package_name}" \
+                            "${target_kernel_version}" $(( kernel_reboot_attempts + 1 )) "${current_boot_id}"; then
+                        log_error "${flagged_package_name}: cannot record reboot attempt $(( kernel_reboot_attempts + 1 )) in ${KERNEL_REBOOT_ATTEMPT_FILE} - withholding every reboot, kernel_reboot_attempt_limit could not be enforced"
+                        REBOOT_VETOED=1
+                        continue
+                    fi
                 fi
             fi
 
@@ -533,6 +589,7 @@ classify_flagged_packages() {
 
         # -- everything else: restart-state learning -----------------------
         REBOOT_TRIGGER_PACKAGES+=("${flagged_package_name}")
+        LEARNABLE_PACKAGE_NAMES["${flagged_package_name}"]=1
     done
     return 0
 }
@@ -562,19 +619,21 @@ apply_restart_state_learning() {
 
     current_boot_id=$(cat "${BOOT_ID_FILE}" 2>/dev/null) || true
     if [[ -z "${current_boot_id}" ]]; then
-        log_warn "could not read boot_id - restart-state learning skipped this run"
+        log_warning "could not read boot_id - restart-state learning skipped this run"
         return 0
     fi
 
     for trigger_package_name in "${REBOOT_TRIGGER_PACKAGES[@]}"; do
-        if [[ "${trigger_package_name}" == kernel* ]]; then
+        # A kernel, or a package whose build-id check found it stale or could
+        # not verify it, keeps its verdict.
+        if [[ -z "${LEARNABLE_PACKAGE_NAMES[${trigger_package_name}]:-}" ]]; then
             learned_trigger_packages+=("${trigger_package_name}")
             continue
         fi
 
         installed_package_evr=$(rpm -q --qf '%{EVR}' "${trigger_package_name}" 2>/dev/null) || true
         if [[ -z "${installed_package_evr}" ]]; then
-            log_warn "${trigger_package_name}: not installed or rpm query failed, cannot track restart-state"
+            log_warning "${trigger_package_name}: not installed or rpm query failed, cannot track restart-state"
             learned_trigger_packages+=("${trigger_package_name}")
             continue
         fi
@@ -621,6 +680,8 @@ apply_restart_state_learning() {
 main() {
     local needs_restarting_exit_code=0
 
+    clear_kernel_reboot_attempts_for_running_kernel
+
     NEEDS_RESTARTING_OUTPUT=""
     run_needs_restarting || needs_restarting_exit_code=$?
 
@@ -631,7 +692,7 @@ main() {
 
     # Exit 1 without a package line is a dnf error, not the plugin's answer.
     if ! needs_restarting_gave_result "${needs_restarting_exit_code}"; then
-        log_err "needs-restarting exited ${needs_restarting_exit_code} without naming a package - cannot determine reboot state, not rebooting"
+        log_error "needs-restarting exited ${needs_restarting_exit_code} without naming a package - cannot determine reboot state, not rebooting"
         exit 2
     fi
 
@@ -644,9 +705,16 @@ main() {
     classify_flagged_packages
     apply_restart_state_learning
 
+    # Any reboot now would be an unrecorded kernel attempt, whichever package
+    # asked for it.
+    if [[ "${REBOOT_VETOED}" -eq 1 ]]; then
+        log_error "Reboot vetoed: a kernel reboot attempt could not be recorded - see errors above"
+        exit 2
+    fi
+
     if [[ "${#REBOOT_TRIGGER_PACKAGES[@]}" -eq 0 ]]; then
         if [[ "${REBOOT_WITHHELD}" -eq 1 ]]; then
-            log_err "Reboot withheld: a genuine kernel update is pending but rebooting would not boot it - see errors above"
+            log_error "Reboot withheld: a genuine kernel update is pending but rebooting would not boot it - see errors above"
             exit 2
         fi
         log "All triggers filtered as false positives - no reboot needed"
