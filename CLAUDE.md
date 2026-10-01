@@ -8,7 +8,10 @@ scripts packaged as a noarch RPM.
 
 Scope: hosts where `dnf-automatic`'s own `reboot = when-needed` does not work — observed
 on Oracle Linux 9 aarch64 booting through U-Boot (RPi4, CM5: no RTC, UEK `saved_entry`
-not advancing) and on RHEL 8. The stalls observed on RHEL 8 `x86_64` and OL9 `aarch64` all
+not advancing) and on RHEL 8. On RHEL 8.10 `dnf-automatic` has no reboot handling at all:
+`/usr/lib/python3.6/site-packages/dnf/automatic/main.py` does not contain the word `reboot`,
+and a run that installed a new kernel (2026-10-01, host mail) logged no reboot attempt, so a
+`reboot` key in `automatic.conf` is never read there. The stalls observed on RHEL 8 `x86_64` and OL9 `aarch64` all
 ran with `apply_updates = yes`, under both `upgrade_type = security` and `default`; the
 `apply_updates` check comes from dnf-automatic's defaults, not from an observed failure.
 The `automatic.conf` on both surveyed hosts carries `reboot` and `reboot_command`; with

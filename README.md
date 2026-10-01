@@ -18,7 +18,9 @@ through U-Boot, such as the Raspberry Pi 4 and the Compute Module 5:
 - A newly installed kernel is not chosen at the next boot, so a restart
   brings back the old kernel and asks for another restart.
 
-The same restart problem was seen on Red Hat Enterprise Linux 8.
+On Red Hat Enterprise Linux 8, `dnf-automatic` does not restart at all: it
+ignores the `reboot` setting, so every kernel update waits for a manual
+restart. This package does the restart there.
 
 This package filters out the false restart requests and restarts only when
 the restart applies an update. Before a kernel restart it checks that the new
