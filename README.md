@@ -5,11 +5,11 @@ update needs a restart to take effect.
 
 ## Who this is for
 
-On most Enterprise Linux 9 computers, `dnf-automatic` restarts after updates
+On most Enterprise Linux 9 systems, `dnf-automatic` restarts after updates
 by itself: set `reboot = when-needed` in `/etc/dnf/automatic.conf` and
 enable `dnf-automatic-install.timer`. Use that there, not this package.
 
-This package is for computers where that built-in restart does not work
+This package is for systems where that built-in restart does not work
 reliably. The problem is seen on Oracle Linux 9 on `aarch64` boards that boot
 through U-Boot, such as the Raspberry Pi 4 and the Compute Module 5:
 
@@ -18,13 +18,12 @@ through U-Boot, such as the Raspberry Pi 4 and the Compute Module 5:
 - A newly installed kernel is not chosen at the next boot, so a restart
   brings back the old kernel and asks for another restart.
 
-On Red Hat Enterprise Linux 8, `dnf-automatic` does not restart at all: it
-ignores the `reboot` setting, so every kernel update waits for a manual
-restart. This package does the restart there.
+On Red Hat Enterprise Linux 8, `dnf-automatic` does not restart after
+updates at all.
 
 This package filters out the false restart requests and restarts only when
 the restart applies an update. Before a kernel restart it checks that the new
-kernel is the one the computer will boot; if not, it does not restart and
+kernel is the one that will boot; if not, it does not restart and
 logs why.
 
 It installs on Enterprise Linux 8 and 9 (Red Hat Enterprise Linux, Oracle
@@ -35,7 +34,7 @@ Linux, Rocky Linux, AlmaLinux) with the standard GRUB boot menu.
 ```bash
 sudo dnf install dnf-automatic
 sudoedit /etc/dnf/automatic.conf
-sudo dnf install ./dnf-automatic-reboot-1.4.0-*.el9.noarch.rpm
+sudo dnf install ./dnf-automatic-reboot-1.5.0-*.el9.noarch.rpm
 sudo systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
 ```
 
@@ -57,7 +56,7 @@ download them; `reboot = never` leaves the restart decision to this package.
 If `dnf-automatic` is already set up, keep your other settings as they are.
 This package reads the file and does not change it.
 
-The third command installs this package. It first checks that the computer
+The third command installs this package. It first checks that the system
 is one it can restart safely; if not, it stops before installing any files
 and prints what to fix, as explained under
 [If the installer refuses](#if-the-installer-refuses).
@@ -65,7 +64,7 @@ The last command turns on the nightly run and the watchdog that looks after it.
 
 ## What happens every night
 
-Between 03:00 and 03:10 the computer:
+Between 03:00 and 03:10 the package:
 
 1. Blocks shutdown and restart, so an update is never cut off halfway.
 2. Installs the available updates with `dnf-automatic`.
@@ -76,7 +75,7 @@ Between 03:00 and 03:10 the computer:
    off during that minute and allow updates again:
    `sudo /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh`.
    If none does, restarts only the background services whose programs were
-   updated, and the computer keeps running.
+   updated, and the system keeps running.
 5. Ends with one line in the log and on logged-in terminals: updates
    installed, whether a restart is scheduled, and which services were
    restarted, failed to restart, or are left on the old program. A failed
@@ -87,7 +86,7 @@ install packages without checking their signatures, are reported in the log.
 
 A separate watchdog checks every five minutes. If an update run is still going
 after three hours, the watchdog stops it and alerts you; it does not restart
-the computer while packages may be half-installed.
+while packages may be half-installed.
 
 When something goes wrong, logged-in users get a message on their terminal and
 the details go to `/var/log/dnf-automatic-reboot.log`.
@@ -105,8 +104,7 @@ happened:
 sudo tail -n 30 /var/log/dnf-automatic-reboot.log
 ```
 
-To run an update now, which installs updates and restarts the computer if
-one needs it:
+To run an update now, which installs updates and restarts if one needs it:
 
 ```bash
 sudo systemctl start dnf-automatic-reboot.service
@@ -127,10 +125,10 @@ files. Fix each one and run `sudo dnf install dnf-automatic-reboot` again.
 
 | The message says | What to do |
 |---|---|
-| `... not platform:el8 or platform:el9` | This computer runs a Linux version the package does not support. |
-| `systemd is not the running init` | Install on the computer itself, not inside a container. |
+| `... not platform:el8 or platform:el9` | This system runs a Linux version the package does not support. |
+| `systemd is not the running init` | Install on the host itself, not inside a container. |
 | `<package> is not installed` | `sudo dnf install <package>` |
-| `GRUB_ENABLE_BLSCFG=true is not set` or `holds no BLS entry` | The computer does not use the standard GRUB boot menu, which this package needs. |
+| `GRUB_ENABLE_BLSCFG=true is not set` or `holds no BLS entry` | The system does not use the standard GRUB boot menu, which this package needs. |
 | `grubby --default-kernel gave ...` | `sudo grubby --set-default /boot/vmlinuz-$(uname -r)` |
 | `does not boot saved_entry` or `GRUB_DEFAULT=saved is not set` | Set `GRUB_DEFAULT=saved` in `/etc/default/grub`, then run the `grub2-mkconfig` command the message shows, with `sudo` |
 | `kernel updates will not advance the GRUB default` | Add each line the message shows to the file it names. On Oracle Linux 9 with UEK these are `GRUB_UPDATE_DEFAULT_KERNEL=true` in `/etc/default/grub` and `DEFAULTKERNEL=kernel-uek-core` in `/etc/sysconfig/kernel`. |
@@ -209,8 +207,7 @@ sudo dnf remove dnf-automatic-reboot
 Your settings file is kept as `/etc/dnf/automatic-reboot.conf.rpmsave`; copy
 any changes you made back into the new `/etc/dnf/automatic-reboot.conf`. The
 log and what the old version had learned about false alarms are deleted, so
-the first night after the upgrade may restart the computer once more than
-needed.
+the first night after the upgrade may restart once more than needed.
 
 ## Uninstalling
 
@@ -243,17 +240,17 @@ started with `podman`, and leaves it in
 `./rpmbuild/dnf-automatic-reboot/el9/RPMS/noarch/`. `EL=8` builds for
 Enterprise Linux 8 into the `el8` folder beside it; each build replaces only
 its own folder. Building in the container gives the file the
-right `.el8` or `.el9` tag whatever the build computer runs, and keeps the
-test suite off the build computer. The file carries a local snapshot version,
-`1.4.0-0.local.git<commit>`, which a released `1.4.0-1` replaces as an
-ordinary upgrade. Copy it to the computer it is for and install it as in
+right `.el8` or `.el9` tag whatever the build host runs, and keeps the
+test suite off that host. The file carries a local snapshot version,
+`1.5.0-0.local.git<commit>`, which a released `1.5.0-1` replaces as an
+ordinary upgrade. Copy it to the system it is for and install it as in
 [Quick start](#quick-start).
 
 `make check` runs the syntax checks, `shellcheck` and the test suite on any
-computer with `bash`; the suite does not need root and stubs every system
+system with `bash`; the suite does not need root and stubs every system
 command. Tests that execute a stub skip themselves where the temporary
 directory is mounted `noexec`; the container build runs them. On an EL8 or
-EL9 computer with `rpm-build` installed, `make rpm` builds directly into
+EL9 system with `rpm-build` installed, `make rpm` builds directly into
 `./rpmbuild/dnf-automatic-reboot/local`. [CLAUDE.md](CLAUDE.md) describes the
 design and the conventions for changes.
 

@@ -6,20 +6,17 @@
 developed on Oracle Linux 9 `aarch64` (UEK R8, RPi4, CM5) and RHEL 8 `x86_64`. Shell
 scripts packaged as a noarch RPM.
 
-Scope: hosts where `dnf-automatic`'s own `reboot = when-needed` does not work — observed
-on Oracle Linux 9 aarch64 booting through U-Boot (RPi4, CM5: no RTC, UEK `saved_entry`
-not advancing) and on RHEL 8. On RHEL 8.10 `dnf-automatic` has no reboot handling at all:
-`/usr/lib/python3.6/site-packages/dnf/automatic/main.py` does not contain the word `reboot`,
-and a run that installed a new kernel (2026-10-01, host mail) logged no reboot attempt, so a
-`reboot` key in `automatic.conf` is never read there. The stalls observed on RHEL 8 `x86_64` and OL9 `aarch64` all
-ran with `apply_updates = yes`, under both `upgrade_type = security` and `default`; the
-`apply_updates` check comes from dnf-automatic's defaults, not from an observed failure.
-The `automatic.conf` on both surveyed hosts carries `reboot` and `reboot_command`; with
-this package installed `reboot = never` is required, so `reboot_command` is not used.
-The `%pre` gate accepts
-`PLATFORM_ID` `platform:el8` and `platform:el9` and refuses any other. User-facing docs
-do not recommend the package for an EL9 host where the built-in reboot works; they point
-there instead.
+Scope: EL8 and EL9 hosts on which `dnf-automatic` does not reboot when an update needs it.
+On EL8 it cannot: RHEL 8.10's `dnf-automatic` has no reboot handling (see
+[`dnf-automatic` on EL8](#dnf-automatic-on-el8)). On EL9 it has `reboot = when-needed`,
+which fails on Oracle Linux 9 aarch64 booting through U-Boot (RPi4, CM5: no RTC, UEK
+`saved_entry` not advancing). The failures observed on both ran with `apply_updates = yes`,
+under both `upgrade_type = security` and `default`; the `apply_updates` check comes from
+dnf-automatic's defaults, not from an observed failure. The `automatic.conf` on both surveyed
+hosts carries `reboot` and `reboot_command`; with this package installed `reboot = never` is
+required, so `reboot_command` is not used. The `%pre` gate accepts `PLATFORM_ID`
+`platform:el8` and `platform:el9` and refuses any other. User-facing docs do not recommend
+the package for an EL9 host where the built-in reboot works; they point there instead.
 
 `tools/verify-el-prerequisites.sh` surveys every platform fact the package relies on.
 The EL8/EL9 differences recorded in this file come from its runs on RHEL 8.10 (systemd 239, dnf 4.7)
@@ -571,6 +568,38 @@ each fails the run. An excluded unit does not: it is left running by design. The
 ends with one line naming the update, reboot and restart outcome, for example
 `Updates installed; no reboot needed; restart still pending for sshd.service. Check:
 systemctl status sshd.service`, logged and sent through `wall`.
+
+## `dnf-automatic` on EL8
+
+RHEL 8.10's `dnf-automatic` (dnf 4.7) installs updates and never reboots.
+`/usr/lib/python3.6/site-packages/dnf/automatic/main.py` does not contain the word `reboot`,
+and a run that installed a newer kernel logged no reboot attempt. A `reboot` or
+`reboot_command` key in `automatic.conf` is accepted and never read, so on EL8 every kernel
+update waits for a manual reboot unless this package performs it. `%pre` and `check_conflicts`
+still require `reboot = never` on EL8: the key is inert there and is honoured on EL9, and one
+rule for both keeps the file's meaning the same across platforms.
+
+With a correct clock, `needs-restarting -r` flagging a kernel means a kernel package was
+installed during this boot, which under unattended updates is a newer kernel awaiting a
+reboot: genuine. A kernel is never applied without one. The only cause of a false kernel flag
+is a boot time recorded before the clock was set (see
+[Root cause](#root-cause-of-every-false-positive-a-wrong-clock-at-boot)); the version
+comparison in `needs-reboot.sh` exists for that case.
+
+### kpatch
+
+kpatch loads live patches (`kpatch-patch-<kernel version>` packages) into the running kernel.
+They cover selected CVEs of that kernel, not the whole content of a later kernel erratum, and
+they install no kernel package. `needs-restarting -r` does not consider them, and neither does
+`needs-reboot.sh`: a newer installed kernel is a genuine reboot whether or not live patches are
+loaded. `kpatch.service` in `active (exited)` only says it ran at boot; `kpatch list` shows
+what is loaded.
+
+The package has no kpatch exemption, by design. That a loaded live patch covers every fix in
+the installed kernel cannot be established from package data, and that is the "cannot tell"
+case [fail-closed verification](#fail-closed-verification) keeps. On a kpatch host the lever is
+when the reboot happens: an `OnCalendar=` override of `dnf-automatic-reboot.timer` for a
+maintenance window. Deferring kernel reboots on such hosts would be a separate design decision.
 
 ## Unsigned repositories
 
