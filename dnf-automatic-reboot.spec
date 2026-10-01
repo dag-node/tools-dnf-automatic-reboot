@@ -154,6 +154,18 @@ if [[ "$1" -gt 1 ]]; then
             FAIL=1
         fi
     done
+    # 1.4.0 holds update runs during a watchdog-requested reboot with this
+    # file alone.  This version's watchdog unit removes it unconditionally and
+    # holds a pending reboot with another file, so an upgrade inside that
+    # window would let update runs start before the reboot.  Nothing migrates.
+    if [[ -e "${PREFLIGHT_ROOT}/run/dnf-automatic-reboot.recovery" ]]; then
+        echo "ERROR: /run/dnf-automatic-reboot.recovery exists: the installed watchdog is" >&2
+        echo "       recovering a run, or holding update runs until a reboot it requested." >&2
+        echo "       Upgrade after that reboot.  To cancel the reboot instead:" >&2
+        echo "         systemctl stop dnf-automatic-reboot-scheduled-reboot.timer" >&2
+        echo "         rm -f /run/dnf-automatic-reboot.recovery" >&2
+        FAIL=1
+    fi
 fi
 
 # EL8 and EL9.  Every rebuild of them (RHEL, Oracle Linux, Rocky, Alma) sets
@@ -467,6 +479,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   the reboots run.sh schedules as well as the watchdog's, so no update run starts in
   reboot_delay_sec before either. /run/dnf-automatic-reboot.recovery now covers only the
   watchdog's recovery and is always removed when the watchdog ends.
+- CHANGE: Upgrading from 1.4.0 is refused while /run/dnf-automatic-reboot.recovery exists;
+  upgrade after the reboot the 1.4.0 watchdog requested.
 - CHANGE: The scheduled reboot's transient service stays active after systemctl reboot
   succeeds (RemainAfterExit=yes), as the record that the reboot was accepted.
 - NEW: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels a pending reboot and allows

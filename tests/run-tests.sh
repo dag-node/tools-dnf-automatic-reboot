@@ -2380,6 +2380,18 @@ test_preflight_refuses_upgrade_from_pre_1_4() {
     assert_contains "${output}" "dnf remove dnf-automatic-reboot" "names the removal"
 }
 
+test_preflight_refuses_upgrade_during_1_4_recovery() {
+    make_preflight_host
+    export STUB_INSTALLED_VERSION="1.4.0"
+    # 1.4.0 holds update runs until its watchdog's reboot with this file
+    # alone; this version's watchdog unit removes it.
+    : > "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.recovery"
+    local output exit_code=0
+    output=$(run_preflight 2) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "upgrade inside a 1.4 recovery refused"
+    assert_contains "${output}" "Upgrade after that reboot" "names the way forward"
+}
+
 test_preflight_allows_upgrade_from_1_4() {
     make_preflight_host
     export STUB_INSTALLED_VERSION="1.4.0"
@@ -2572,6 +2584,7 @@ run_test "preflight: accepts operator automatic.conf" test_preflight_accepts_ope
 run_test "preflight: GRUB_SAVEDEFAULT only warns"    test_preflight_savedefault_only_warns         needs-rpmspec
 run_test "preflight: refuses upgrade from pre-1.4"   test_preflight_refuses_upgrade_from_pre_1_4   needs-rpmspec
 run_test "preflight: allows upgrade from 1.4"        test_preflight_allows_upgrade_from_1_4        needs-rpmspec
+run_test "preflight: refuses upgrade during 1.4 recovery" test_preflight_refuses_upgrade_during_1_4_recovery needs-rpmspec
 
 printf '\n'
 if [[ "${TESTS_SKIPPED}" -gt 0 ]]; then
