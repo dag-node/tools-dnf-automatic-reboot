@@ -40,7 +40,8 @@ CONTAINER_BUILD_SCRIPT = .github/scripts/build-in-container.sh
 TESTS = tests/run-tests.sh
 # Operator diagnostics: linted with the scripts, never installed.
 TOOLS = tools/verify-grub-boot-flags.sh \
-        tools/verify-el-prerequisites.sh
+        tools/verify-el-prerequisites.sh \
+        tools/verify-reboot-protocol.sh
 
 # rpmbuild output goes to rpmbuild/$(NAME)/<target>/, one folder per target:
 # el8 or el9 from DIST, local without it.  A build empties only its own folder,

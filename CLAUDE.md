@@ -64,6 +64,7 @@ doc/README                      Operational reference (installed to /usr/share/d
 LICENSE, LICENSES/, REUSE.toml  GPL-2.0-or-later; the spec alone is MIT
 tools/verify-grub-boot-flags.sh Read-only host check: can grubenv flags pick the boot entry?
 tools/verify-el-prerequisites.sh Read-only host survey of every platform fact the package relies on
+tools/verify-reboot-protocol.sh Host check of the systemd behaviour the reboot protocol relies on (probe units only, never reboots)
 ```
 
 **Licensing.** Every script, test and the Makefile carries
@@ -382,6 +383,8 @@ whose `ExecStopPost=` removes the 1.4.0 hold. Nothing migrates from 1.4.0.
 The `systemctl show` output format (no `Job=` line, or `Job=` with an id),
 `SubState=waiting` on a transient `--on-active` timer, and `PreparingForShutdown` under a
 delay inhibitor are read from systemd 239 and 252 sources, not yet observed on a host.
+`tools/verify-reboot-protocol.sh` checks all but the last against real systemd, through the
+library's own readers, with transient probe units that run `/bin/true` or `sleep`.
 
 After the kill, the watchdog waits up to `watchdog_kill_confirm_sec` for systemd to report
 the unit `inactive` or `failed`. A failed `systemctl kill`, or a unit still active then,
