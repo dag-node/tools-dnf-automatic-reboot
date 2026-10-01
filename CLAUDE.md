@@ -238,7 +238,7 @@ leaves a host running known-vulnerable code, so it is never the default.
 |------|---------|
 | 0 | No reboot needed |
 | 1 | Reboot needed |
-| 2 | Undecidable: tool error, or a genuine kernel update that rebooting would not apply |
+| 2 | Undecidable: tool error, a genuine kernel update that rebooting would not apply, or a kernel reboot attempt that could not be recorded (this one vetoes the reboot even when another package needs one) |
 
 `needs-restarting -r` exits 1 both for "reboot required" and for any error dnf
 handles, such as a missing cache. Only exit 1 with at least one `  * <name>` line is a

@@ -483,7 +483,9 @@ run_needs_restarting() {
 # ---------------------------------------------------------------------------
 # Classify every flagged package into REBOOT_TRIGGER_PACKAGES.
 # Sets REBOOT_WITHHELD when a genuine requirement exists that rebooting would
-# not satisfy.
+# not satisfy, and REBOOT_VETOED when a kernel reboot attempt could not be
+# recorded: kernel_reboot_attempt_limit cannot be enforced then, so no reboot
+# may be requested at all, whatever else triggers one.
 # ---------------------------------------------------------------------------
 classify_flagged_packages() {
     local flagged_package_name target_kernel_version
@@ -504,6 +506,7 @@ classify_flagged_packages() {
     REBOOT_TRIGGER_PACKAGES=()
     LEARNABLE_PACKAGE_NAMES=()
     REBOOT_WITHHELD=0
+    REBOOT_VETOED=0
 
     for flagged_package_name in "${FLAGGED_PACKAGE_NAMES[@]}"; do
 
@@ -559,8 +562,8 @@ classify_flagged_packages() {
                     # attempt that cannot be recorded is not made.
                     if ! write_kernel_reboot_attempts "${flagged_package_name}" \
                             "${target_kernel_version}" $(( kernel_reboot_attempts + 1 )) "${current_boot_id}"; then
-                        log_error "${flagged_package_name}: cannot record reboot attempt $(( kernel_reboot_attempts + 1 )) in ${KERNEL_REBOOT_ATTEMPT_FILE} - withholding the reboot, kernel_reboot_attempt_limit could not be enforced"
-                        REBOOT_WITHHELD=1
+                        log_error "${flagged_package_name}: cannot record reboot attempt $(( kernel_reboot_attempts + 1 )) in ${KERNEL_REBOOT_ATTEMPT_FILE} - withholding every reboot, kernel_reboot_attempt_limit could not be enforced"
+                        REBOOT_VETOED=1
                         continue
                     fi
                 fi
@@ -701,6 +704,13 @@ main() {
 
     classify_flagged_packages
     apply_restart_state_learning
+
+    # Any reboot now would be an unrecorded kernel attempt, whichever package
+    # asked for it.
+    if [[ "${REBOOT_VETOED}" -eq 1 ]]; then
+        log_error "Reboot vetoed: a kernel reboot attempt could not be recorded - see errors above"
+        exit 2
+    fi
 
     if [[ "${#REBOOT_TRIGGER_PACKAGES[@]}" -eq 0 ]]; then
         if [[ "${REBOOT_WITHHELD}" -eq 1 ]]; then

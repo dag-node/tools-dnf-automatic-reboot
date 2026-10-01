@@ -519,8 +519,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 - FIX: Restart-state learning no longer drops a package that the build-id check found running
   stale code, or could not verify. A systemd flag with a stale daemon could be recorded as a
   confirmed false positive and the reboot skipped.
-- FIX: A kernel reboot is withheld, and the run fails, when its attempt cannot be recorded in
-  /var/lib/dnf-automatic-reboot/kernel-reboot-attempts. A failed write was ignored, so
+- FIX: No reboot is requested, and the run fails, when a kernel reboot attempt cannot be recorded
+  in /var/lib/dnf-automatic-reboot/kernel-reboot-attempts, even when another package needs one. A failed write was ignored, so
   kernel_reboot_attempt_limit stopped counting and a kernel that never boots could be rebooted
   for without end.
 - FIX: A number in automatic-reboot.conf with a leading zero, such as reboot_delay_sec = 08, is
