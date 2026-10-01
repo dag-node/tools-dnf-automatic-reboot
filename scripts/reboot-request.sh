@@ -166,12 +166,12 @@ reset_failed_units() {
     "${SYSTEMCTL_BIN}" reset-failed "$@" 2>/dev/null || true
 }
 
-# start_reboot_unit DELAY_SECONDS FORCE_ALLOWED LOCK_WAIT_SECONDS DESCRIPTION
+# start_reboot_unit DELAY_SECONDS LOCK_WAIT_SECONDS INHIBITED_WAIT_SECONDS DESCRIPTION
 # -> systemd-run's exit code.  The transient service runs reboot-if-pending.sh
 # after DELAY_SECONDS through a timer, or at once with DELAY_SECONDS 0.
 # OnFailure= reports a reboot that did not happen.
 start_reboot_unit() {
-    local delay_seconds="$1" force_allowed="$2" lock_wait_seconds="$3" description="$4"
+    local delay_seconds="$1" lock_wait_seconds="$2" inhibited_wait_seconds="$3" description="$4"
     local timer_options=()
     if [[ "${delay_seconds}" -gt 0 ]]; then
         timer_options=(--on-active="${delay_seconds}" --timer-property=AccuracySec=1s)
@@ -181,17 +181,25 @@ start_reboot_unit() {
         "${timer_options[@]}" \
         --property="OnFailure=dnf-automatic-reboot-notify@${SCHEDULED_REBOOT_UNIT}.service.service" \
         --description="${description}" \
-        "${REBOOT_IF_PENDING_COMMAND}" "${force_allowed}" "${lock_wait_seconds}"
+        "${REBOOT_IF_PENDING_COMMAND}" "${lock_wait_seconds}" "${inhibited_wait_seconds}"
 }
 
-# reboot_host [--force] -> systemctl reboot's exit code.
+# reboot_host -> systemctl reboot's exit code.  Run from a service, outside a
+# terminal, systemctl does not check shutdown inhibitors unless asked to, and
+# would reboot under a package transaction that holds one.
 reboot_host() {
-    "${SYSTEMCTL_BIN}" reboot "$@"
+    "${SYSTEMCTL_BIN}" reboot --check-inhibitors=yes
 }
 
-# submit_reboot DELAY_SECONDS FORCE_ALLOWED LOCK_WAIT_SECONDS DESCRIPTION
-# A dispatch function for request_reboot.  FORCE_ALLOWED (yes/no) lets
-# reboot-if-pending.sh fall back to systemctl reboot --force.
+# systemctl_checks_inhibitors - 0 when systemctl accepts --check-inhibitors.
+# systemctl parses every option before it acts on --version.
+systemctl_checks_inhibitors() {
+    "${SYSTEMCTL_BIN}" --check-inhibitors=yes --version >/dev/null 2>&1
+}
+
+# submit_reboot DELAY_SECONDS LOCK_WAIT_SECONDS INHIBITED_WAIT_SECONDS DESCRIPTION
+# A dispatch function for request_reboot.  INHIBITED_WAIT_SECONDS is how long
+# reboot-if-pending.sh retries a reboot a shutdown inhibitor refuses.
 # Returns: 0 = accepted: the unit exists, or a reboot was already waiting,
 #              queued, running or dispatched (SCHEDULED_REBOOT_ALREADY_PRESENT=1)
 #          1 = rejected: nothing was submitted
@@ -200,11 +208,11 @@ reboot_host() {
 # shellcheck disable=SC2034  # read by the sourcing script
 SCHEDULED_REBOOT_ALREADY_PRESENT=0
 submit_reboot() {
-    local delay_seconds="$1" force_allowed="$2" lock_wait_seconds="$3" description="$4"
+    local delay_seconds="$1" lock_wait_seconds="$2" inhibited_wait_seconds="$3" description="$4"
     local status systemd_run_exit_code=0 numeric_argument
     # shellcheck disable=SC2034
     SCHEDULED_REBOOT_ALREADY_PRESENT=0
-    for numeric_argument in "${delay_seconds}" "${lock_wait_seconds}"; do
+    for numeric_argument in "${delay_seconds}" "${lock_wait_seconds}" "${inhibited_wait_seconds}"; do
         if [[ ! "${numeric_argument}" =~ ^[0-9]{1,9}$ ]]; then
             log_error "reboot request with a non-numeric delay or wait '${numeric_argument}' - reboot not requested"
             return 1
@@ -212,6 +220,7 @@ submit_reboot() {
     done
     delay_seconds=$(( 10#${delay_seconds} ))
     lock_wait_seconds=$(( 10#${lock_wait_seconds} ))
+    inhibited_wait_seconds=$(( 10#${inhibited_wait_seconds} ))
     status=$(read_scheduled_reboot_status)
     case "${status}" in
         waiting|in_progress|dispatched)
@@ -229,7 +238,7 @@ submit_reboot() {
     # keeps the unit name taken until it is stopped and reset.
     stop_unit "${SCHEDULED_REBOOT_UNIT}.timer" || true
     reset_failed_units "${SCHEDULED_REBOOT_UNIT}.service" "${SCHEDULED_REBOOT_UNIT}.timer"
-    start_reboot_unit "${delay_seconds}" "${force_allowed}" "${lock_wait_seconds}" "${description}" \
+    start_reboot_unit "${delay_seconds}" "${lock_wait_seconds}" "${inhibited_wait_seconds}" "${description}" \
         || systemd_run_exit_code=$?
     [[ "${systemd_run_exit_code}" -eq 0 ]] && return 0
     # systemd-run can fail after systemd accepted the unit, and a request it

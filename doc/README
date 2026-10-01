@@ -385,6 +385,12 @@ Scheduled reboots
   called systemctl reboot, while the host is shutting down, and when
   systemd's state cannot be read.  In the last two cases, reboot the host.
 
+  The reboot respects shutdown inhibitors, such as the one a package
+  transaction started by hand holds.  While one refuses it, the reboot is
+  tried again every 30 seconds for reboot_inhibited_wait_sec (default 1800),
+  and can be cancelled in between; systemd-inhibit --list shows what holds
+  it.  The reboot is never forced.
+
   If the reboot does not happen, dnf-automatic-reboot-notify@ reports the
   failed dnf-automatic-reboot-scheduled-reboot.service and says whether
   update runs are still held, and how to release them.

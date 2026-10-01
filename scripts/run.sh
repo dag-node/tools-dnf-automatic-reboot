@@ -226,6 +226,7 @@ check_conflicts() {
 # ---------------------------------------------------------------------------
 REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300 1 86400)
 REBOOT_REQUEST_LOCK_WAIT_SEC=$(get_config_integer reboot_request_lock_wait_sec 60 1 600)
+REBOOT_INHIBITED_WAIT_SEC=$(get_config_integer reboot_inhibited_wait_sec 1800 0 86400)
 ALWAYS_REBOOT=$(get_config_value always_reboot no)
 DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 60 1)
 KILL_GRACE_SEC=$(get_config_integer kill_grace_sec 30)
@@ -496,7 +497,8 @@ schedule_reboot() {
     local reboot_time submit_result=0
     reboot_time=$(date -d "@$(( $(date +%s) + REBOOT_DELAY_SEC ))" '+%F %T %Z')
     log "scheduling reboot in ${REBOOT_DELAY_SEC}s"
-    submit_reboot "${REBOOT_DELAY_SEC}" no "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "dnf-automatic-reboot scheduled reboot" \
+    submit_reboot "${REBOOT_DELAY_SEC}" "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "${REBOOT_INHIBITED_WAIT_SEC}" \
+        "dnf-automatic-reboot scheduled reboot" \
         || submit_result=$?
     case "${submit_result}" in
         0)

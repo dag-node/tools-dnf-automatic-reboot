@@ -115,6 +115,12 @@ if bash -c 'set -u; empty_options=(); printf "%s" "${empty_options[@]}"' >/dev/n
 else
     report_fail start_reboot_unit "bash ${BASH_VERSION} fails on an empty array under set -u"
 fi
+if systemctl_checks_inhibitors; then
+    report_pass reboot-if-pending.sh "systemctl accepts --check-inhibitors=yes"
+else
+    report_fail reboot-if-pending.sh "systemctl rejects --check-inhibitors=yes; reboot-if-pending.sh refuses every reboot here"
+fi
+report_info reboot-if-pending.sh "block inhibitors now: $(systemd-inhibit --list --mode=block --no-pager --no-legend 2>/dev/null | wc -l)"
 report_info lock "$(flock --version 2>&1 | head -n 1)"
 # The invocations acquire_reboot_request_lock uses, on a scratch file: -n and
 # -w on a free lock succeed; held by another process, -n fails at once and

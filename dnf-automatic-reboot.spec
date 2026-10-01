@@ -502,6 +502,11 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 - FIX: The kernel reboot attempt count is cleared once the target kernel runs, also on a host
   with a correct clock. There needs-restarting stops flagging the kernel after the reboot, and
   the count stayed until the next kernel update replaced it.
+- FIX: The reboot respects shutdown inhibitors. From a service, systemctl reboot skipped the
+  inhibitor check, so a package transaction started by hand during reboot_delay_sec could be cut
+  off. A refused reboot is retried every 30 seconds for reboot_inhibited_wait_sec (new, default
+  1800) and can be cancelled meanwhile. The watchdog no longer falls back to
+  systemctl reboot --force.
 - FIX: The watchdog no longer removes the state file of a run it did not inspect. run.sh wrote the
   file in place, and a watchdog reading it at that moment found it empty and deleted it as
   malformed; cleanup after a dead run could delete the state of the run that started next. Either

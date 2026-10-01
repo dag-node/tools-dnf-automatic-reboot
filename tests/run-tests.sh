@@ -386,7 +386,8 @@ test_config_every_key_resolves() {
                       restart_services_exclude watchdog_soft_timeout_min \
                       watchdog_hard_timeout_min force_reboot_on_hard_timeout \
                       enable_chrony_wait wall_messages reboot_request_lock_wait_sec \
-                      watchdog_kill_confirm_sec restart_service_timeout_sec; do
+                      watchdog_kill_confirm_sec restart_service_timeout_sec \
+                      reboot_inhibited_wait_sec; do
         resolved_value=$(get_config_value "${config_key}" "MISSING")
         if [[ "${resolved_value}" == "MISSING" ]]; then
             fail "shipped config does not define ${config_key}"
@@ -1068,8 +1069,8 @@ test_reboot_is_scheduled_on_a_named_unit() {
     assert_contains "${dispatch_call}" "OnFailure=dnf-automatic-reboot-notify@dnf-automatic-reboot-scheduled-reboot.service.service" \
         "a reboot that fails to start is reported"
     assert_contains "${dispatch_call}" "--on-active=300" "after the configured delay"
-    assert_contains "${dispatch_call}" "reboot-if-pending.sh no 60" \
-        "through the pending check, never --force, waiting the configured lock time"
+    assert_contains "${dispatch_call}" "reboot-if-pending.sh 60 1800" \
+        "through the pending check, with the configured lock and inhibitor waits"
     assert_contains "${SCHEDULED_REBOOT_SUMMARY}" "cancel with: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh" \
         "the summary says how to cancel it"
 }
@@ -1432,7 +1433,7 @@ test_watchdog_hard_timeout_while_updating_can_be_forced() {
     write_watchdog_state updating 200 "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
-    assert_contains "$(cat "${STUB_LOG}")" "reboot-if-pending.sh yes" "opt-in override still works"
+    assert_contains "$(cat "${STUB_LOG}")" "reboot-if-pending.sh 60 1800" "opt-in override still works"
 }
 
 test_watchdog_hard_timeout_while_checking_reboots() {
@@ -1445,7 +1446,7 @@ test_watchdog_hard_timeout_while_checking_reboots() {
     local recorded_calls
     recorded_calls=$(cat "${STUB_LOG}")
     assert_contains "${recorded_calls}" "kill --kill-whom=all" "whole cgroup is killed"
-    assert_contains "${recorded_calls}" "reboot-if-pending.sh yes" "safe to reboot after a clean dnf"
+    assert_contains "${recorded_calls}" "reboot-if-pending.sh 60 1800" "safe to reboot after a clean dnf"
 }
 
 test_watchdog_kill_option_follows_systemd_version() {
@@ -1523,8 +1524,8 @@ stub_watchdog_kill_path() {
         return 0
     }
     submit_reboot() {
-        printf 'submit_reboot delay=%s force=%s recovery_file=%s state_file=%s reboot_pending_file=%s\n' \
-            "$1" "$2" "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${STATE_FILE}")" \
+        printf 'submit_reboot delay=%s recovery_file=%s state_file=%s reboot_pending_file=%s\n' \
+            "$1" "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${STATE_FILE}")" \
             "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
     }
     schedule_reboot() {
@@ -1593,7 +1594,7 @@ test_watchdog_no_run_starts_during_the_kill() {
         "the main unit is blocked from starting while its run is killed"
     # A run starting after the kill would have its state file removed and
     # be rebooted under; the marker must outlast the reboot request.
-    assert_contains "$(cat "${STUB_LOG}")" "submit_reboot delay=0 force=yes recovery_file=present state_file=absent reboot_pending_file=present" \
+    assert_contains "$(cat "${STUB_LOG}")" "submit_reboot delay=0 recovery_file=present state_file=absent reboot_pending_file=present" \
         "no run can start between the state cleanup and the reboot"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the reboot-pending marker must stay until the reboot"
     [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery marker ends with recovery"
@@ -1899,7 +1900,7 @@ test_watchdog_reboots_through_the_pending_check() {
 # logind STUB_PREPARING_FOR_SHUTDOWN ("b false").  systemd-run exits
 # STUB_SYSTEMD_RUN_RC (0) and, with STUB_TIMER_SUB_STATE_AFTER_SUBMIT, leaves
 # the timer loaded in that state.  systemctl reboot exits STUB_REBOOT_RC (0),
-# --force STUB_FORCE_REBOOT_RC (0).  State changes go through files, since
+# systemctl_checks_inhibitors fails with STUB_NO_CHECK_INHIBITORS=yes.  State changes go through files, since
 # each read runs in a command substitution.
 stub_reboot_unit_state() {
     stub_property() {
@@ -1949,11 +1950,16 @@ stub_reboot_unit_state() {
         return "${STUB_SYSTEMD_RUN_RC:-0}"
     }
     reboot_host() {
-        printf 'reboot %s\n' "$*" >> "${STUB_LOG}"
-        if [[ "${1:-}" == "--force" ]]; then
-            return "${STUB_FORCE_REBOOT_RC:-0}"
-        fi
+        printf 'reboot attempt\n' >> "${STUB_LOG}"
         return "${STUB_REBOOT_RC:-0}"
+    }
+    systemctl_checks_inhibitors() { [[ "${STUB_NO_CHECK_INHIBITORS:-}" != "yes" ]]; }
+    systemd-inhibit() { printf 'dnf  0 root 4242 dnf shutdown:sleep update block\n'; }
+    # A sleep that only moves the clock; STUB_DURING_SLEEP runs inside it.
+    sleep() {
+        printf 'sleep %s\n' "$1" >> "${STUB_LOG}"
+        if [[ -n "${STUB_DURING_SLEEP:-}" ]]; then "${STUB_DURING_SLEEP}"; fi
+        SECONDS=$(( SECONDS + $1 ))
     }
 }
 
@@ -2006,12 +2012,17 @@ load_reboot_if_pending_library() {
     stub_reboot_unit_state
 }
 
-# run_reboot_if_pending FORCE_ALLOWED -> its exit code; output goes to
-# ${TEST_ROOT_DIR}/reboot.out.
+# run_reboot_if_pending [INHIBITED_WAIT_SECONDS] -> its exit code, with a
+# 1-second lock wait; output goes to ${TEST_ROOT_DIR}/reboot.out.
 run_reboot_if_pending() {
     local exit_code=0
-    ( main "$1" 1 ) > "${TEST_ROOT_DIR}/reboot.out" 2>&1 || exit_code=$?
+    ( main 1 "${1:-0}" ) > "${TEST_ROOT_DIR}/reboot.out" 2>&1 || exit_code=$?
     return "${exit_code}"
+}
+
+# reboot_attempt_count -> how many times systemctl reboot was called.
+reboot_attempt_count() {
+    grep -c '^reboot attempt' "${STUB_LOG}" || true
 }
 
 test_cancel_stops_the_timer_and_allows_runs() {
@@ -2031,9 +2042,9 @@ test_cancel_then_a_late_firing_does_not_reboot() {
     ) || fail "cancellation"
     load_reboot_if_pending_library
     local exit_code=0
-    run_reboot_if_pending no || exit_code=$?
+    run_reboot_if_pending || exit_code=$?
     assert_exit_code 0 "${exit_code}" "a cancelled reboot is no failure"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot " "and does not reboot"
+    assert_equals "0" "$(reboot_attempt_count)" "and does not reboot"
     [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "nothing was dispatched"
     return 0
 }
@@ -2122,9 +2133,9 @@ test_reboot_pending_reboots_and_records_it() {
     load_reboot_if_pending_library
     : > "${REBOOT_PENDING_FILE}"
     local exit_code=0
-    run_reboot_if_pending no || exit_code=$?
+    run_reboot_if_pending || exit_code=$?
     assert_exit_code 0 "${exit_code}" "the reboot is submitted"
-    assert_contains "$(cat "${STUB_LOG}")" "reboot " "systemctl reboot is called"
+    assert_equals "1" "$(reboot_attempt_count)" "systemctl reboot is called once"
     [[ -f "${REBOOT_DISPATCHED_FILE}" ]] || fail "the dispatch is recorded for cancel-reboot.sh"
     return 0
 }
@@ -2135,9 +2146,9 @@ test_reboot_accepted_by_logind_is_not_forced() {
     # The client failed, but logind accepted the shutdown and delays it.
     export STUB_REBOOT_RC=1 STUB_PREPARING_FOR_SHUTDOWN="b true"
     local exit_code=0
-    run_reboot_if_pending yes || exit_code=$?
+    run_reboot_if_pending || exit_code=$?
     assert_exit_code 0 "${exit_code}" "an accepted shutdown is success"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot --force" "an orderly shutdown under way is never forced"
+    assert_equals "1" "$(reboot_attempt_count)" "a shutdown under way is not requested again"
 }
 
 test_reboot_unknown_shutdown_state_is_not_forced() {
@@ -2145,34 +2156,90 @@ test_reboot_unknown_shutdown_state_is_not_forced() {
     : > "${REBOOT_PENDING_FILE}"
     export STUB_REBOOT_RC=1 STUB_LOGIND_READ_FAILS=yes
     local exit_code=0
-    run_reboot_if_pending yes || exit_code=$?
+    run_reboot_if_pending || exit_code=$?
     assert_exit_code 1 "${exit_code}" "an unknown outcome fails the unit"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot --force" "unknown is not a refusal"
+    assert_equals "1" "$(reboot_attempt_count)" "unknown is not a refusal to retry"
     [[ -f "${REBOOT_DISPATCHED_FILE}" ]] || fail "an unknown outcome keeps cancellation refused"
     return 0
 }
 
-test_reboot_refused_on_a_running_host_is_forced_when_allowed() {
+test_reboot_refused_releases_the_dispatch() {
     load_reboot_if_pending_library
     : > "${REBOOT_PENDING_FILE}"
     export STUB_REBOOT_RC=1
     local exit_code=0
-    run_reboot_if_pending yes || exit_code=$?
-    assert_exit_code 0 "${exit_code}" "the forced reboot is submitted"
-    assert_contains "$(cat "${STUB_LOG}")" "reboot --force" "a leaked inhibitor lock is overridden"
-}
-
-test_reboot_refused_without_force_releases_the_dispatch() {
-    load_reboot_if_pending_library
-    : > "${REBOOT_PENDING_FILE}"
-    export STUB_REBOOT_RC=1
-    local exit_code=0
-    run_reboot_if_pending no || exit_code=$?
+    run_reboot_if_pending 0 || exit_code=$?
     assert_exit_code 1 "${exit_code}" "a refused reboot fails the unit, so OnFailure= reports it"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot --force" "never forced unless allowed"
+    assert_equals "1" "$(reboot_attempt_count)" "with no wait configured, one attempt"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "shutdown inhibitor" "the likely cause is named"
     [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a refused reboot can be cancelled"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "update runs stay held until a reboot or cancellation"
     return 0
+}
+
+test_reboot_inhibited_is_retried_until_the_wait_ends() {
+    load_reboot_if_pending_library
+    : > "${REBOOT_PENDING_FILE}"
+    # A package transaction started by hand holds a block inhibitor throughout.
+    export STUB_REBOOT_RC=1
+    local exit_code=0
+    run_reboot_if_pending 60 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "still refused when the wait ends"
+    assert_equals "3" "$(reboot_attempt_count)" "attempts at 0, 30 and 60 seconds"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "dnf shutdown:sleep update block" \
+        "the blocking inhibitor is named"
+    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a refused reboot can be cancelled"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "update runs stay held"
+    return 0
+}
+
+test_reboot_inhibited_proceeds_once_released() {
+    load_reboot_if_pending_library
+    : > "${REBOOT_PENDING_FILE}"
+    # The inhibitor is released during the first wait.
+    reboot_host() {
+        printf 'reboot attempt\n' >> "${STUB_LOG}"
+        [[ -f "${TEST_ROOT_DIR}/inhibitor-released" ]]
+    }
+    release_inhibitor() { : > "${TEST_ROOT_DIR}/inhibitor-released"; }
+    export STUB_DURING_SLEEP=release_inhibitor
+    local exit_code=0
+    run_reboot_if_pending 1800 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the reboot goes ahead"
+    assert_equals "2" "$(reboot_attempt_count)" "refused once, then accepted"
+    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] || fail "the accepted reboot is recorded"
+    return 0
+}
+
+test_reboot_can_be_cancelled_while_inhibited() {
+    load_reboot_if_pending_library
+    : > "${REBOOT_PENDING_FILE}"
+    export STUB_REBOOT_RC=1
+    # Between attempts the lock is free: cancel-reboot.sh takes it and
+    # removes the marker.
+    cancel_between_attempts() {
+        if ( exec {probe_descriptor}>>"${REBOOT_REQUEST_LOCK_FILE}" && flock -n "${probe_descriptor}" ); then
+            printf 'lock free between attempts\n' >> "${STUB_LOG}"
+            rm -f "${REBOOT_PENDING_FILE}"
+        fi
+    }
+    export STUB_DURING_SLEEP=cancel_between_attempts
+    local exit_code=0
+    run_reboot_if_pending 1800 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a cancelled reboot is no failure"
+    assert_contains "$(cat "${STUB_LOG}")" "lock free between attempts" "the lock was released while waiting"
+    assert_equals "1" "$(reboot_attempt_count)" "no attempt after the cancellation"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "the reboot was cancelled" "and it says so"
+}
+
+test_reboot_refuses_without_inhibitor_checking() {
+    load_reboot_if_pending_library
+    : > "${REBOOT_PENDING_FILE}"
+    export STUB_NO_CHECK_INHIBITORS=yes
+    local exit_code=0
+    run_reboot_if_pending || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "a systemctl that cannot check inhibitors fails the unit"
+    assert_equals "0" "$(reboot_attempt_count)" "rather than reboot under an inhibitor"
 }
 
 test_reboot_waits_for_a_cancellation_in_progress() {
@@ -2181,9 +2248,9 @@ test_reboot_waits_for_a_cancellation_in_progress() {
     exec {held_lock_descriptor}>>"${REBOOT_REQUEST_LOCK_FILE}"
     flock "${held_lock_descriptor}"
     local exit_code=0
-    run_reboot_if_pending no || exit_code=$?
+    run_reboot_if_pending || exit_code=$?
     assert_exit_code 1 "${exit_code}" "no lock, no reboot"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot " "nothing is rebooted"
+    assert_equals "0" "$(reboot_attempt_count)" "nothing is rebooted"
 }
 
 # ---------------------------------------------------------------------------
@@ -2371,7 +2438,7 @@ test_invariant_only_reboot_if_pending_reboots() {
     reboot_calls=$(script_lines '"\$\{SYSTEMCTL_BIN\}" reboot')
     assert_equals "${REPO_ROOT}/scripts/reboot-request.sh" "$(printf '%s\n' "${reboot_calls}" | cut -d: -f1 | sort -u)" \
         "systemctl reboot is called from reboot_host only"
-    caller_lines=$(script_lines '(^|[^_[:alnum:]])reboot_host( |$)' | grep -v 'reboot_host() {' || true)
+    caller_lines=$(script_lines '(^|[^_[:alnum:]])reboot_host([^_[:alnum:]]|$)' | grep -v 'reboot_host() {' || true)
     assert_equals "${REPO_ROOT}/scripts/reboot-if-pending.sh" "$(printf '%s\n' "${caller_lines}" | cut -d: -f1 | sort -u)" \
         "reboot_host is called from reboot-if-pending.sh only"
 }
@@ -2398,6 +2465,13 @@ test_invariant_lock_file_is_never_removed() {
         && fail "a removed or replaced lock file splits holders across two inodes"
     grep -E '^[rRD] .*reboot-request.lock' "${REPO_ROOT}/tmpfiles/dnf-automatic-reboot.conf" \
         && fail "tmpfiles.d must not remove the lock"
+    return 0
+}
+
+test_invariant_reboots_check_inhibitors_and_never_force() {
+    script_lines '\-\-force' | grep -q . && fail "no script may override inhibitors with --force"
+    script_lines '"\$\{SYSTEMCTL_BIN\}" reboot' | grep -vq -- '--check-inhibitors=yes' \
+        && fail "every systemctl reboot must check inhibitors"
     return 0
 }
 
@@ -2526,42 +2600,9 @@ test_reboot_without_dispatched_record_does_not_reboot() {
     # A directory in its place makes the record impossible to write.
     mkdir "${REBOOT_DISPATCHED_FILE}"
     local exit_code=0
-    run_reboot_if_pending no || exit_code=$?
+    run_reboot_if_pending || exit_code=$?
     assert_exit_code 1 "${exit_code}" "an unrecorded reboot is refused"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot " "cancellation could not see it, so no reboot"
-}
-
-test_reboot_failed_force_on_a_running_host_releases_the_dispatch() {
-    load_reboot_if_pending_library
-    : > "${REBOOT_PENDING_FILE}"
-    export STUB_REBOOT_RC=1 STUB_FORCE_REBOOT_RC=1
-    local exit_code=0
-    run_reboot_if_pending yes || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "neither reboot was accepted"
-    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a host still up after both refusals can be cancelled"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "update runs stay held"
-    return 0
-}
-
-test_reboot_failed_force_with_unknown_state_keeps_the_dispatch() {
-    load_reboot_if_pending_library
-    : > "${REBOOT_PENDING_FILE}"
-    export STUB_REBOOT_RC=1 STUB_FORCE_REBOOT_RC=1
-    # Up when --force is considered, unreadable after it failed.
-    get_logind_preparing_for_shutdown() {
-        if [[ -f "${TEST_ROOT_DIR}/forced" ]]; then return 1; fi
-        printf 'b false'
-    }
-    reboot_host() {
-        printf 'reboot %s\n' "$*" >> "${STUB_LOG}"
-        [[ "${1:-}" == "--force" ]] && : > "${TEST_ROOT_DIR}/forced"
-        return 1
-    }
-    local exit_code=0
-    run_reboot_if_pending yes || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "an unknown outcome fails the unit"
-    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] || fail "a forced reboot that may be under way keeps cancellation refused"
-    return 0
+    assert_equals "0" "$(reboot_attempt_count)" "cancellation could not see it, so no reboot"
 }
 
 test_cancel_with_unstoppable_timer_still_cancels() {
@@ -3173,8 +3214,11 @@ run_test "cancel: nothing pending is a noop"         test_cancel_with_nothing_pe
 run_test "reboot: pending reboots and records it"   test_reboot_pending_reboots_and_records_it
 run_test "reboot: accepted by logind is not forced"  test_reboot_accepted_by_logind_is_not_forced
 run_test "reboot: unknown shutdown state is not forced" test_reboot_unknown_shutdown_state_is_not_forced
-run_test "reboot: refused on a running host is forced when allowed" test_reboot_refused_on_a_running_host_is_forced_when_allowed
-run_test "reboot: refused without force releases the dispatch" test_reboot_refused_without_force_releases_the_dispatch
+run_test "reboot: refused releases the dispatch"    test_reboot_refused_releases_the_dispatch
+run_test "reboot: inhibited is retried until the wait ends" test_reboot_inhibited_is_retried_until_the_wait_ends
+run_test "reboot: inhibited proceeds once released" test_reboot_inhibited_proceeds_once_released
+run_test "reboot: can be cancelled while inhibited" test_reboot_can_be_cancelled_while_inhibited
+run_test "reboot: refuses without inhibitor checking" test_reboot_refuses_without_inhibitor_checking
 run_test "reboot: waits for a cancellation in progress" test_reboot_waits_for_a_cancellation_in_progress
 run_test "lock: created owner-only"                  test_lock_is_created_owner_only
 run_test "lock: permissions corrected in place"      test_lock_permissions_are_corrected_in_place
@@ -3194,6 +3238,7 @@ run_test "invariant: only reboot-if-pending reboots" test_invariant_only_reboot_
 run_test "invariant: marker removers are known"     test_invariant_marker_removers_are_known
 run_test "invariant: dispatched file removed only on refusal" test_invariant_dispatched_file_is_removed_only_on_refusal
 run_test "invariant: lock file is never removed"    test_invariant_lock_file_is_never_removed
+run_test "invariant: reboots check inhibitors and never force" test_invariant_reboots_check_inhibitors_and_never_force
 run_test "invariant: flock uses documented short options" test_invariant_flock_uses_documented_short_options
 run_test "invariant: state file written only by rename" test_invariant_state_file_written_only_by_rename
 run_test "invariant: every script is shipped"       test_invariant_every_script_is_shipped
@@ -3202,8 +3247,6 @@ run_test "reader: unit snapshot job forms"          test_reader_unit_snapshot_jo
 run_test "reader: scheduled reboot status table"    test_reader_scheduled_reboot_status_table
 run_test "reader: host shutdown state table"        test_reader_host_shutdown_state_table
 run_test "reboot: no dispatched record, no reboot"  test_reboot_without_dispatched_record_does_not_reboot
-run_test "reboot: failed force on a running host releases the dispatch" test_reboot_failed_force_on_a_running_host_releases_the_dispatch
-run_test "reboot: failed force with unknown state keeps the dispatch" test_reboot_failed_force_with_unknown_state_keeps_the_dispatch
 run_test "cancel: unstoppable timer still cancels"  test_cancel_with_unstoppable_timer_still_cancels
 run_test "cancel: running service before dispatch cancels" test_cancel_with_running_reboot_service_before_dispatch_cancels
 run_test "request: dispatched reboot is not requested again" test_request_dispatched_reboot_is_not_requested_again

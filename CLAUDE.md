@@ -361,14 +361,19 @@ unit; a late reboot still happens, because the marker is there. A run killed by 
 mid-request has no trap: when the watchdog then decides no reboot is needed, it fails its
 unit if `.reboot-pending` exists with no reboot waiting or under way.
 
-**Reboot outcomes.** `reboot-if-pending.sh` exits 0 when `systemctl reboot` succeeds, and
-when no reboot is pending. When the orderly reboot fails it reads the shutdown state first:
-`yes` (logind accepted, perhaps delaying for an inhibitor) is success and is never escalated;
-`unknown` fails with the dispatched file kept. Only `no` counts as a refusal: with force
-allowed (the watchdog's hard timeout, for a leaked inhibitor lock) it tries `--force`; without,
-or when `--force` fails on a host still up, it removes the dispatched file and fails. Its
-`OnFailure=` notice says whether update runs are still held, and names `cancel-reboot.sh`
-unless the dispatched file makes cancellation refuse.
+**Reboot outcomes.** `reboot-if-pending.sh` calls `systemctl reboot --check-inhibitors=yes`.
+Run from a service, outside a terminal, `systemctl` otherwise skips the inhibitor check and
+reboots under a package transaction that holds a block inhibitor. A `systemctl` that rejects
+the option makes the script fail without rebooting. It exits 0 when the reboot is accepted,
+and when no reboot is pending. When the call fails it reads the shutdown state first: `yes`
+(logind accepted, perhaps delaying for an inhibitor) is success and is never requested again;
+`unknown` fails with the dispatched file kept. Only `no` counts as a refusal, most likely by a
+block inhibitor: the script removes the dispatched file, releases the lock, and tries again
+every 30 seconds until `reboot_inhibited_wait_sec` (default 1800) has passed, then fails,
+naming the block inhibitors logind lists. Between attempts the reboot can be cancelled. Nothing
+in the package uses `--force`: the watchdog's kill ends the stuck run's own inhibitor, and any
+other inhibitor belongs to somebody else. Its `OnFailure=` notice says whether update runs are
+still held, and names `cancel-reboot.sh` unless the dispatched file makes cancellation refuse.
 
 **Reading systemd.** `read_unit_snapshot` reads `LoadState`, `ActiveState`, `SubState` and
 `Job` of one unit from one `systemctl show`, so the values describe one moment; a missing
@@ -445,9 +450,9 @@ transaction running while the caller proceeds to reboot.
 
 At hard timeout in `phase=updating` an rpm transaction may be half-applied. That is
 the same uncertainty for which the dead-PID path already refuses to reboot, so the
-default is to kill and alert. `systemctl reboot` is preferred over `--force`, which
-remounts filesystems read-only under running processes and risks the rootfs on a
-flash-backed host.
+default is to kill and alert. The reboot never uses `--force`, which remounts filesystems
+read-only under running processes, risks the rootfs on a flash-backed host, and overrides
+other users' inhibitors.
 
 ### State files under `/var/lib/dnf-automatic-reboot/`
 
@@ -902,8 +907,8 @@ tail -f /var/log/dnf-automatic-reboot.log
   check is their sole, more authoritative, source of truth.
 - Do not kill the run by PID — `systemctl kill` the whole unit, or
   `dnf-automatic` survives behind `timeout(1)`.
-- Do not reach for `systemctl reboot --force` as the first option; it remounts
-  filesystems read-only under running processes.
+- Do not use `systemctl reboot --force`, and do not call `systemctl reboot` without
+  `--check-inhibitors=yes`; reboot only through `reboot-if-pending.sh`.
 - Do not install anything under `/usr/local` from the RPM.
 - Do not edit `/etc/dnf/automatic.conf` from a scriptlet, a script or the docs'
   commands. It belongs to the operator and may predate this package: check it and

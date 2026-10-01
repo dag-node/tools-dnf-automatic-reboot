@@ -127,6 +127,7 @@ FORCE_REBOOT_ON_HARD_TIMEOUT=$(get_config_value force_reboot_on_hard_timeout no)
 KILL_CONFIRM_SEC=$(get_config_integer watchdog_kill_confirm_sec 30)
 NEEDS_RESTARTING_TIMEOUT_SEC=$(get_config_integer needs_restarting_timeout_sec 120)
 REBOOT_REQUEST_LOCK_WAIT_SEC=$(get_config_integer reboot_request_lock_wait_sec 60 1 600)
+REBOOT_INHIBITED_WAIT_SEC=$(get_config_integer reboot_inhibited_wait_sec 1800 0 86400)
 
 # ---------------------------------------------------------------------------
 # Independent reboot check, bounded.
@@ -341,7 +342,8 @@ schedule_reboot() {
     local reboot_time submit_result=0
     reboot_time=$(date -d "@$(( $(date +%s) + REBOOT_DELAY_SEC ))" '+%F %T %Z')
     log "Watchdog scheduling reboot in ${REBOOT_DELAY_SEC}s"
-    submit_reboot "${REBOOT_DELAY_SEC}" no "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "dnf-automatic-reboot watchdog reboot" \
+    submit_reboot "${REBOOT_DELAY_SEC}" "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "${REBOOT_INHIBITED_WAIT_SEC}" \
+        "dnf-automatic-reboot watchdog reboot" \
         || submit_result=$?
     case "${submit_result}" in
         0)
@@ -453,11 +455,11 @@ main() {
         if [[ "${run_phase}" == "checking" || "${FORCE_REBOOT_ON_HARD_TIMEOUT}" == "yes" ]]; then
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded." \
                      "Killed the stuck run and rebooting now."
-            # At once (delay 0) through reboot-if-pending.sh, which may fall
-            # back to --force: a leaked inhibitor lock is a likely cause of
-            # the stuck run.
+            # At once (delay 0) through reboot-if-pending.sh.  The kill ended
+            # the run's own inhibitor; any other one is respected.
             if ! request_reboot "${REBOOT_REQUEST_LOCK_WAIT_SEC}" submit_reboot \
-                    0 yes "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "dnf-automatic-reboot watchdog reboot"; then
+                    0 "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "${REBOOT_INHIBITED_WAIT_SEC}" \
+                    "dnf-automatic-reboot watchdog reboot"; then
                 log_error "reboot request failed - the host was not rebooted"
                 exit 1
             fi
