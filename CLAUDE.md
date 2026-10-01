@@ -415,6 +415,9 @@ library's own readers, with transient probe units that run `/bin/true` or `sleep
 
 - On both hosts `flock -n` and `flock -w` behave as the library expects, free and held, and
   bash expands an empty array under `set -u`.
+- `systemctl` accepts `--check-inhibitors=yes` on both: systemd 252 has it, and RHEL 8.10's
+  239-82.el8_10 carries the backport.
+- `chronyc waitsync` confirms the clock on both, with `rtcsync` set on one and not the other.
 
 `PreparingForShutdown` under a delay inhibitor needs a real shutdown, and is read from the
 systemd 239 and 252 sources only.
