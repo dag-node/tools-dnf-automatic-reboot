@@ -5,17 +5,19 @@
 # Cancels a reboot that run.sh or the watchdog requested, and allows update
 # runs again.
 #
-# Stops dnf-automatic-reboot-scheduled-reboot.timer, then removes
-# /run/dnf-automatic-reboot.reboot-pending.  It reports success only when the
-# reboot is known not to happen:
+# Under the reboot request lock, stops dnf-automatic-reboot-scheduled-reboot
+# .timer, then removes /run/dnf-automatic-reboot.reboot-pending.  It reports
+# success only on positive evidence that the reboot will not happen:
 #
-#   - the timer was stopped before it started the reboot command
-#   - the reboot command ran and failed
-#   - no reboot was scheduled and the host is not shutting down: a request cut
-#     short before its outcome was known, or a reboot systemd did not carry out
+#   - the timer was stopped before it fired, and the reboot service has no
+#     queued job
+#   - the reboot service ran and failed
+#   - no reboot was scheduled, PID 1 is not stopping and logind is not
+#     preparing a shutdown
 #
-# Once the reboot command is running, or the host is shutting down, the
-# marker stays and the helper exits 1.
+# It exits 1 and changes nothing while a reboot request holds the lock, once
+# the reboot service is queued, running or has succeeded, while the host is
+# shutting down, and whenever systemd's state cannot be read.
 #
 # Exit: 0 = cancelled, or nothing was pending; 1 = not cancelled.
 #
@@ -30,77 +32,79 @@ export LC_ALL=C
 # temporary tree so every path and helper binary below resolves inside it.
 readonly TEST_ROOT="${DNF_AUTOMATIC_REBOOT_TEST_ROOT:-}"
 
-readonly REBOOT_PENDING_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-pending"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
+# shellcheck disable=SC2034  # read by reboot-request.sh
 readonly SYSTEMCTL_BIN="${TEST_ROOT}/usr/bin/systemctl"
-readonly SCHEDULED_REBOOT_UNIT=dnf-automatic-reboot-scheduled-reboot
 readonly SCRIPT_NAME=cancel-reboot
+
+# REBOOT_PENDING_FILE, the request lock, and the systemd state readers.
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/reboot-request.sh"
 
 log() {
     printf '<6>%s: %s\n' "${SCRIPT_NAME}" "$*"
     printf '%s %s: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
+}
+log_warning() {
+    printf '<4>%s: %s\n' "${SCRIPT_NAME}" "$*"
+    printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
 log_error() {
     printf '<3>%s: %s\n' "${SCRIPT_NAME}" "$*"
     printf '%s %s: ERROR: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
-# get_unit_property UNIT PROPERTY -> the property's value, empty when systemctl
-# does not answer.  An unknown unit reports LoadState=not-found and
-# ActiveState=inactive.
-get_unit_property() {
-    "${SYSTEMCTL_BIN}" show --property="$2" --value "$1" 2>/dev/null || true
-}
-
-# get_system_state -> systemctl is-system-running's output; "stopping" once a
-# shutdown or reboot has begun.  The command exits non-zero for every state
-# but running, so only the output is read.
-get_system_state() {
-    "${SYSTEMCTL_BIN}" is-system-running 2>/dev/null || true
-}
-
-# stop_scheduled_reboot_timer -> systemctl stop's exit code.
-stop_scheduled_reboot_timer() {
-    "${SYSTEMCTL_BIN}" stop "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null
+# refuse_cancellation REASON - logs why and exits 1; the marker stays.
+refuse_cancellation() {
+    log_error "$1 - reboot NOT cancelled; ${REBOOT_PENDING_FILE} kept"
+    exit 1
 }
 
 main() {
-    local timer_active_state reboot_service_state
-    timer_active_state=$(get_unit_property "${SCHEDULED_REBOOT_UNIT}.timer" ActiveState)
-    if [[ ! -e "${REBOOT_PENDING_FILE}" && "${timer_active_state}" != "active" ]]; then
+    local scheduled_reboot_status shutdown_state
+    # A request holds the lock from before it creates the marker until its
+    # outcome is known; a marker seen without the lock may not have reached
+    # systemd yet.
+    acquire_reboot_request_lock 0 \
+        || refuse_cancellation "a reboot request is in progress; retry in a minute"
+
+    scheduled_reboot_status=$(read_scheduled_reboot_status)
+    case "${scheduled_reboot_status}" in
+        in_progress) refuse_cancellation "the reboot service is queued or running" ;;
+        dispatched)  refuse_cancellation "systemd already accepted the reboot" ;;
+        unknown)     refuse_cancellation "the state of ${SCHEDULED_REBOOT_UNIT} cannot be read" ;;
+    esac
+    if [[ ! -e "${REBOOT_PENDING_FILE}" && "${scheduled_reboot_status}" == "none" ]]; then
         log "no reboot is pending"
         exit 0
     fi
 
-    # Once stopped, the timer cannot start the reboot, so the state of the
-    # reboot service read after this is final.
-    if [[ "$(get_unit_property "${SCHEDULED_REBOOT_UNIT}.timer" LoadState)" == "loaded" ]] \
-       && ! stop_scheduled_reboot_timer; then
-        log_error "cannot stop ${SCHEDULED_REBOOT_UNIT}.timer - reboot NOT cancelled"
-        exit 1
+    if [[ "${scheduled_reboot_status}" == "waiting" ]]; then
+        stop_unit "${SCHEDULED_REBOOT_UNIT}.timer" \
+            || refuse_cancellation "cannot stop ${SCHEDULED_REBOOT_UNIT}.timer"
+        # The timer may have queued the reboot service just before it stopped;
+        # stopping a timer does not cancel a job it queued.
+        scheduled_reboot_status=$(read_scheduled_reboot_status)
+        case "${scheduled_reboot_status}" in
+            none|failed) ;;
+            *) refuse_cancellation "after stopping the timer, ${SCHEDULED_REBOOT_UNIT} is ${scheduled_reboot_status}" ;;
+        esac
+    fi
+    if [[ "${scheduled_reboot_status}" == "failed" ]]; then
+        log "the scheduled reboot had already failed: systemctl status ${SCHEDULED_REBOOT_UNIT}.service"
+        reset_failed_units "${SCHEDULED_REBOOT_UNIT}.service"
     fi
 
-    reboot_service_state=$(get_unit_property "${SCHEDULED_REBOOT_UNIT}.service" ActiveState)
-    case "${reboot_service_state}" in
-        activating|active|deactivating|reloading)
-            log_error "the reboot command is already running - reboot NOT cancelled"
-            exit 1
-            ;;
-        failed)
-            log "the scheduled reboot had already failed: systemctl status ${SCHEDULED_REBOOT_UNIT}.service"
-            "${SYSTEMCTL_BIN}" reset-failed "${SCHEDULED_REBOOT_UNIT}.service" 2>/dev/null || true
-            ;;
+    # An immediate reboot, or one logind accepted and delays for an inhibitor,
+    # leaves no unit to inspect.
+    shutdown_state=$(read_host_shutdown_state)
+    case "${shutdown_state}" in
+        yes)     refuse_cancellation "the host is already shutting down" ;;
+        unknown) refuse_cancellation "whether the host is shutting down cannot be read" ;;
     esac
 
-    if [[ "$(get_system_state)" == "stopping" ]]; then
-        log_error "the host is already shutting down - reboot NOT cancelled"
-        exit 1
-    fi
-
-    if ! rm -f "${REBOOT_PENDING_FILE}"; then
-        log_error "cannot remove ${REBOOT_PENDING_FILE} - no reboot is scheduled, but update runs stay blocked"
-        exit 1
-    fi
+    rm -f "${REBOOT_PENDING_FILE}" \
+        || refuse_cancellation "cannot remove ${REBOOT_PENDING_FILE}; no reboot is scheduled, but update runs stay blocked"
     log "reboot cancelled; update runs are allowed again"
     exit 0
 }

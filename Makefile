@@ -18,6 +18,8 @@ SCRIPTS = scripts/run.sh \
           scripts/needs-reboot.sh \
           scripts/notify-failure.sh \
           scripts/cancel-reboot.sh
+# Sourced, never executed.
+LIBRARIES = scripts/reboot-request.sh
 UNITS   = units/dnf-automatic-reboot.service \
           units/dnf-automatic-reboot.timer \
           units/dnf-automatic-watchdog.service \
@@ -74,13 +76,13 @@ all:
 check: lint test
 
 lint:
-	@for script in $(SCRIPTS) $(TESTS) $(TOOLS); do bash -n $$script || exit 1; echo "syntax OK  $$script"; done
+	@for script in $(SCRIPTS) $(LIBRARIES) $(TESTS) $(TOOLS); do bash -n $$script || exit 1; echo "syntax OK  $$script"; done
 	@if command -v shellcheck >/dev/null 2>&1; then \
-	    shellcheck -S warning $(SCRIPTS) $(TOOLS) && echo "shellcheck OK"; \
+	    shellcheck -S warning $(SCRIPTS) $(LIBRARIES) $(TOOLS) && echo "shellcheck OK"; \
 	else \
 	    echo "shellcheck not installed - skipping lint"; \
 	fi
-	@if LC_ALL=C grep -nP '[^\x00-\x7F]' $(SCRIPTS) $(TOOLS) $(CONF) $(UNITS) $(TMPFILES) $(LOGROTATE); then \
+	@if LC_ALL=C grep -nP '[^\x00-\x7F]' $(SCRIPTS) $(LIBRARIES) $(TOOLS) $(CONF) $(UNITS) $(TMPFILES) $(LOGROTATE); then \
 	    echo "ERROR: non-ASCII characters found (scripts and config must be ASCII only)"; exit 1; \
 	else \
 	    echo "ascii OK"; \
@@ -98,6 +100,7 @@ install:
 	install -d -m 0755 $(DESTDIR)$(LOGROTATEDIR)
 	install -d -m 0750 $(DESTDIR)$(STATEDIR)
 	install -m 0750 $(SCRIPTS)   $(DESTDIR)$(LIBEXECDIR)/
+	install -m 0640 $(LIBRARIES) $(DESTDIR)$(LIBEXECDIR)/
 	install -m 0644 $(UNITS)     $(DESTDIR)$(UNITDIR)/
 	install -m 0640 $(CONF)      $(DESTDIR)$(CONFDIR)/automatic-reboot.conf
 	install -m 0644 $(TMPFILES)  $(DESTDIR)$(TMPFILESDIR)/$(NAME).conf
@@ -119,7 +122,7 @@ uninstall:
 
 dist: check
 	tar czf $(TARBALL) --transform 's,^,$(NAME)-$(VERSION)/,' \
-	    Makefile $(SCRIPTS) $(UNITS) $(CONF) $(TMPFILES) $(LOGROTATE) \
+	    Makefile $(SCRIPTS) $(LIBRARIES) $(UNITS) $(CONF) $(TMPFILES) $(LOGROTATE) \
 	    $(TESTS) $(TOOLS) $(DOC) $(LICENSE) $(LICENSE_METADATA) $(NAME).spec \
 	    $(CONTAINER_BUILD_SCRIPT)
 	@echo "Created $(TARBALL)"
