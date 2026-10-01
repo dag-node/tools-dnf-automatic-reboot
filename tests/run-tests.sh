@@ -992,7 +992,7 @@ test_reboot_is_scheduled_on_a_named_unit() {
     assert_contains "${dispatch_call}" "--unit=dnf-automatic-reboot-scheduled-reboot" "an operator can find the reboot"
     assert_contains "${dispatch_call}" "OnFailure=dnf-automatic-reboot-notify@dnf-automatic-reboot-scheduled-reboot.service.service" \
         "a reboot that fails to start is reported"
-    assert_contains "${dispatch_call}" "--on-active=60" "after the configured delay"
+    assert_contains "${dispatch_call}" "--on-active=300" "after the configured delay"
     assert_contains "${dispatch_call}" "reboot-if-pending.sh no 60" \
         "through the pending check, never --force, waiting the configured lock time"
     assert_contains "${SCHEDULED_REBOOT_SUMMARY}" "cancel with: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh" \

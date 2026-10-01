@@ -210,7 +210,7 @@ check_conflicts() {
 # ---------------------------------------------------------------------------
 # Read config
 # ---------------------------------------------------------------------------
-REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 60)
+REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300)
 REBOOT_REQUEST_LOCK_WAIT_SEC=$(get_config_integer reboot_request_lock_wait_sec 60)
 ALWAYS_REBOOT=$(get_config_value always_reboot no)
 DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 60)

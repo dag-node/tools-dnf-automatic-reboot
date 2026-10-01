@@ -476,6 +476,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   pending.
 - CHANGE: run.sh does not update while a scheduled reboot is waiting or under way. This also
   holds when upgrading from 1.4.0 while its watchdog has a reboot scheduled.
+- CHANGE: reboot_delay_sec defaults to 300, giving five minutes between the warning and the
+  reboot to cancel it. An edited automatic-reboot.conf keeps its own value.
 - NEW: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels a pending reboot and allows
   update runs again; a timer that fires afterwards does not reboot. It exits 1 without
   changing anything while a reboot is being requested or carried out, once systemctl reboot

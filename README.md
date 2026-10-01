@@ -71,8 +71,8 @@ Between 03:00 and 03:10 the package:
 3. Checks whether any update needs a restart: a new kernel, or a core
    component such as `glibc` or `systemd`.
 4. If one does, warns everyone logged in with the restart time and restarts
-   one minute later. No further update runs until then. To call the restart
-   off during that minute and allow updates again:
+   five minutes later. No further update runs until then. To call the restart
+   off in those five minutes and allow updates again:
    `sudo /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh`.
    If none does, restarts only the background services whose programs were
    updated, and the system keeps running.
@@ -155,7 +155,7 @@ file. The ones people change most:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `reboot_delay_sec` | `60` | Seconds between the warning and the restart |
+| `reboot_delay_sec` | `300` | Seconds between the warning and the restart |
 | `always_reboot` | `no` | `yes` restarts after every update, needed or not |
 | `restart_services` | `yes` | `no` leaves updated background services running the old program |
 | `wall_messages` | `yes` | `no` stops the messages to logged-in users |
