@@ -359,11 +359,6 @@ leaves anything but `none` or `failed`, and when the host shutdown state is `yes
 `dnf-automatic-reboot-notify@`, whose message says whether `.reboot-pending` still holds
 update runs and names `cancel-reboot.sh`.
 
-**Upgrade from 1.4.0.** 1.4.0 held update runs during a watchdog reboot with `.recovery`
-alone, which this version's watchdog unit removes. `%pre` refuses an upgrade while
-`/run/dnf-automatic-reboot.recovery` exists, and names the reboot or the 1.4 cancel
-commands; nothing migrates.
-
 The `Job` format of `systemctl show --value` (empty with no job), `SubState=waiting` on a
 transient timer, and `PreparingForShutdown` under a delay inhibitor are read from systemd
 239 and 252 sources, not yet observed on a host.
