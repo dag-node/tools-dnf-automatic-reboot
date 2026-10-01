@@ -575,7 +575,10 @@ RHEL 8.10's `dnf-automatic` (dnf 4.7) installs updates and never reboots.
 `/usr/lib/python3.6/site-packages/dnf/automatic/main.py` does not contain the word `reboot`,
 and a run that installed a newer kernel logged no reboot attempt. A `reboot` or
 `reboot_command` key in `automatic.conf` is accepted and never read, so on EL8 every kernel
-update waits for a manual reboot unless this package performs it. `%pre` and `check_conflicts`
+update waits for a manual reboot unless this package performs it. On Oracle Linux 9.8,
+`/usr/lib/python3.9/site-packages/dnf/automatic/main.py` defines both options and reboots
+when `reboot` is `when-changed`, or `when-needed` and `base.reboot_needed()` is true; it runs
+`reboot_command` through `os.system` and raises an error on a non-zero exit code. `%pre` and `check_conflicts`
 still require `reboot = never` on EL8: the key is inert there and is honoured on EL9, and one
 rule for both keeps the file's meaning the same across platforms.
 
