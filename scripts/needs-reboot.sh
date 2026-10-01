@@ -84,12 +84,23 @@ get_config_value() {
 # As get_config_value, but falls back to DEFAULT_VALUE when the configured value is
 # not a plain non-negative integer.  Keeps a typo in the config from aborting
 # the run inside an arithmetic comparison.
+# get_config_integer KEY DEFAULT_VALUE [MINIMUM [MAXIMUM]] -> the value as a
+# decimal integer.  Leading zeros are dropped: bash arithmetic reads 08 as an
+# invalid octal number.  A value that is not 1 to 9 digits, or lies outside
+# MINIMUM..MAXIMUM (default 0..999999999), is reported and DEFAULT_VALUE used.
 get_config_integer() {
-    local config_key="$1" default_value="$2" config_value
+    local config_key="$1" default_value="$2" minimum_value="${3:-0}" maximum_value="${4:-999999999}"
+    local config_value
     config_value=$(get_config_value "${config_key}" "${default_value}")
     config_value="${config_value//[[:space:]]/}"
-    if [[ ! "${config_value}" =~ ^[0-9]+$ ]]; then
+    if [[ ! "${config_value}" =~ ^[0-9]{1,9}$ ]]; then
         log_warning "${config_key}='${config_value}' is not a non-negative integer - using default ${default_value}" >&2
+        printf '%s' "${default_value}"
+        return 0
+    fi
+    config_value=$(( 10#${config_value} ))
+    if (( config_value < minimum_value || config_value > maximum_value )); then
+        log_warning "${config_key}=${config_value} is outside ${minimum_value}..${maximum_value} - using default ${default_value}" >&2
         config_value="${default_value}"
     fi
     printf '%s' "${config_value}"

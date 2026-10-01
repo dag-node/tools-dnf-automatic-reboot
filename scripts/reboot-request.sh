@@ -201,9 +201,17 @@ reboot_host() {
 SCHEDULED_REBOOT_ALREADY_PRESENT=0
 submit_reboot() {
     local delay_seconds="$1" force_allowed="$2" lock_wait_seconds="$3" description="$4"
-    local status systemd_run_exit_code=0
+    local status systemd_run_exit_code=0 numeric_argument
     # shellcheck disable=SC2034
     SCHEDULED_REBOOT_ALREADY_PRESENT=0
+    for numeric_argument in "${delay_seconds}" "${lock_wait_seconds}"; do
+        if [[ ! "${numeric_argument}" =~ ^[0-9]{1,9}$ ]]; then
+            log_error "reboot request with a non-numeric delay or wait '${numeric_argument}' - reboot not requested"
+            return 1
+        fi
+    done
+    delay_seconds=$(( 10#${delay_seconds} ))
+    lock_wait_seconds=$(( 10#${lock_wait_seconds} ))
     status=$(read_scheduled_reboot_status)
     case "${status}" in
         waiting|in_progress|dispatched)

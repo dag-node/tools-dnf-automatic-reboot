@@ -413,6 +413,33 @@ test_config_int_rejects_non_numeric() {
         "non-numeric falls back to a clean default"
 }
 
+test_config_int_reads_leading_zeros_as_decimal() {
+    load_run_library
+    printf '[reboot]\nreboot_delay_sec = 08\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    assert_equals "8" "$(get_config_integer reboot_delay_sec 300 1 86400 2>/dev/null)" \
+        "08 is eight seconds, not an invalid octal number"
+}
+
+test_config_int_enforces_bounds() {
+    load_run_library
+    printf '[reboot]\nreboot_delay_sec = 0\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    assert_equals "300" "$(get_config_integer reboot_delay_sec 300 1 86400 2>/dev/null)" \
+        "a zero delay would reboot at once"
+    printf '[reboot]\nreboot_delay_sec = 99999999999999999999\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    assert_equals "300" "$(get_config_integer reboot_delay_sec 300 1 86400 2>/dev/null)" \
+        "a number bash arithmetic would wrap"
+}
+
+test_request_malformed_delay_submits_nothing() {
+    load_request_library
+    local exit_code=0
+    submit_reboot 08x 60 0 "test" >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "rejected"
+    submit_reboot 08 60 0 "test" >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "systemd-run 8 " "08 is submitted as an eight-second delay"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run 08x" "the malformed one never reached systemd-run"
+}
+
 test_config_int_rejects_negative() {
     load_needs_reboot_library
     printf '[kernel]\nkernel_reboot_attempt_limit = -1\n' \
@@ -2895,6 +2922,9 @@ run_test "config: every documented key resolves"     test_config_every_key_resol
 run_test "config: prefix keys do not collide"        test_config_prefix_keys_do_not_collide
 run_test "config: int rejects non-numeric"           test_config_int_rejects_non_numeric
 run_test "config: int rejects negative"              test_config_int_rejects_negative
+run_test "config: int reads leading zeros as decimal" test_config_int_reads_leading_zeros_as_decimal
+run_test "config: int enforces bounds"               test_config_int_enforces_bounds
+run_test "request: malformed delay submits nothing"  test_request_malformed_delay_submits_nothing
 
 printf 'kernel\n'
 run_test "kernel: running is newest is a false positive" test_kernel_running_is_newest_is_false_positive

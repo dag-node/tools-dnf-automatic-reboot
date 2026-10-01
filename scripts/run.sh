@@ -91,12 +91,23 @@ get_config_value() {
     printf '%s' "${config_value:-${default_value}}"
 }
 
+# get_config_integer KEY DEFAULT_VALUE [MINIMUM [MAXIMUM]] -> the value as a
+# decimal integer.  Leading zeros are dropped: bash arithmetic reads 08 as an
+# invalid octal number.  A value that is not 1 to 9 digits, or lies outside
+# MINIMUM..MAXIMUM (default 0..999999999), is reported and DEFAULT_VALUE used.
 get_config_integer() {
-    local config_key="$1" default_value="$2" config_value
+    local config_key="$1" default_value="$2" minimum_value="${3:-0}" maximum_value="${4:-999999999}"
+    local config_value
     config_value=$(get_config_value "${config_key}" "${default_value}")
     config_value="${config_value//[[:space:]]/}"
-    if [[ ! "${config_value}" =~ ^[0-9]+$ ]]; then
+    if [[ ! "${config_value}" =~ ^[0-9]{1,9}$ ]]; then
         log_warning "${config_key}='${config_value}' is not a non-negative integer - using default ${default_value}" >&2
+        printf '%s' "${default_value}"
+        return 0
+    fi
+    config_value=$(( 10#${config_value} ))
+    if (( config_value < minimum_value || config_value > maximum_value )); then
+        log_warning "${config_key}=${config_value} is outside ${minimum_value}..${maximum_value} - using default ${default_value}" >&2
         config_value="${default_value}"
     fi
     printf '%s' "${config_value}"
@@ -210,10 +221,10 @@ check_conflicts() {
 # ---------------------------------------------------------------------------
 # Read config
 # ---------------------------------------------------------------------------
-REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300)
-REBOOT_REQUEST_LOCK_WAIT_SEC=$(get_config_integer reboot_request_lock_wait_sec 60)
+REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300 1 86400)
+REBOOT_REQUEST_LOCK_WAIT_SEC=$(get_config_integer reboot_request_lock_wait_sec 60 1 600)
 ALWAYS_REBOOT=$(get_config_value always_reboot no)
-DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 60)
+DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 60 1)
 KILL_GRACE_SEC=$(get_config_integer kill_grace_sec 30)
 WARN_UNSIGNED_REPOSITORIES=$(get_config_value warn_unsigned_repositories yes)
 WARN_UNAPPLIED_ADVISORIES=$(get_config_value warn_unapplied_advisories yes)

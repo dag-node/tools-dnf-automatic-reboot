@@ -499,6 +499,10 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 - FIX: The kernel reboot attempt count is cleared once the target kernel runs, also on a host
   with a correct clock. There needs-restarting stops flagging the kernel after the reboot, and
   the count stayed until the next kernel update replaced it.
+- FIX: A number in automatic-reboot.conf with a leading zero, such as reboot_delay_sec = 08, is
+  read as decimal. Bash read it as an invalid octal number, and a reboot could be submitted with
+  no delay. reboot_delay_sec must lie between 1 and 86400 and reboot_request_lock_wait_sec
+  between 1 and 600; a value outside is logged and the default used.
 - FIX: A failed scheduled reboot's notice says whether update runs are still held and how to
   release them.
 
