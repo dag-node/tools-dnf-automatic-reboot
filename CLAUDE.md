@@ -731,11 +731,14 @@ The unit ordering does not require a successful synchronisation: `time-sync.targ
 reached even when `chrony-wait.service` fails (systemd issue 4880). `run.sh` therefore
 checks the clock itself before installing anything: `wait_for_clock_sync` runs
 `chronyc waitsync` (every 10 s, remaining correction below 0.1 s) for at most
-`clock_sync_wait_sec` (default 600), and a run whose clock chronyd has not confirmed by then
-installs nothing and fails. A missing `chronyc` fails it too. `require_clock_sync = no`
+`clock_sync_wait_sec` (default 600) under `timeout`, since each request adds its own time to
+the polling interval and the run is not yet supervised by the watchdog; a run whose clock
+chronyd has not confirmed by then installs nothing and fails. A missing `chronyc` fails it too. `require_clock_sync = no`
 turns the check off for a host without chrony. The check asks chronyd, not the kernel's
-synchronised flag (`timedatectl`'s `NTPSynchronized`), which chrony is understood to set only
-with `rtcsync`; hosts without an RTC do not use it. That is not yet confirmed on a host. `tools/verify-reboot-protocol.sh` reports whether
+synchronised flag (`timedatectl`'s `NTPSynchronized`). On Linux chrony clears `STA_UNSYNC`
+only with `rtcsync` (`sys_timex.c`, chrony 4.3), and the surveyed OL 9.8 aarch64 host, which
+has no RTC, has `rtcsync` commented out; the surveyed RHEL 8.10 host sets it. The kernel flag
+therefore does not tell whether chrony is synchronised; chronyd itself does. `tools/verify-reboot-protocol.sh` reports whether
 `chronyc waitsync` confirms the clock on a host.
 
 `/etc/chrony.conf` needs `makestep 1 -1` so the clock is stepped rather than slewed
@@ -792,6 +795,9 @@ compares ELF notes and does not read the clock, so skew does not affect it.
 - `BuildArch: noarch` — shell scripts only, no compiled artifacts.
 - `Requires: elfutils` — `eu-readelf` is required for the build-id check.
 - `Requires: logrotate` — the drop-in in `/etc/logrotate.d` needs a consumer.
+- `Requires: chrony` — `run.sh` runs `chronyc waitsync` before every update; `%pre` checks
+  it too, for `--nodeps`. Installed does not mean running or synchronised, so the runtime
+  check stays.
 - `Requires: systemd >= 239` — EL8's systemd. Every unit directive and systemctl
   option the package uses exists there; the one renamed option is chosen at runtime
   (see the state file section).

@@ -28,14 +28,18 @@ Requires:       systemd >= 239
 Requires:       util-linux
 # eu-readelf for systemd build-id comparison (false-positive detection)
 Requires:       elfutils
-# grubby reads and sets the GRUB BLS default: needs-reboot.sh verifies it
-# before a kernel reboot, %%post repairs it on UEK, and %%pre refuses a host
-# where it does not answer - hence also Requires(pre).
+# grubby reads the GRUB BLS default: needs-reboot.sh verifies it before a
+# kernel reboot, and %%pre refuses a host where it does not answer - hence
+# also Requires(pre).
 Requires:       grubby
 Requires(pre):  grubby
 # logrotate consumes the drop-in in %%{_sysconfdir}/logrotate.d; without it
 # /var/log/dnf-automatic-reboot.log grows without bound
 Requires:       logrotate
+# run.sh installs nothing until `chronyc waitsync` confirms the clock
+# (require_clock_sync = yes by default).  Installed is not running: the
+# runtime check stays.
+Requires:       chrony
 
 # We install systemd unit files
 BuildRequires:  systemd-rpm-macros
@@ -180,7 +184,7 @@ fi
 # The packages every decision depends on.  Requires: covers a normal install;
 # this catches `rpm -i --nodeps`, which would otherwise leave the build-id or
 # GRUB check silently disabled at runtime.
-for required_package in dnf-automatic yum-utils elfutils grubby; do
+for required_package in dnf-automatic yum-utils elfutils grubby chrony; do
     if ! rpm -q "${required_package}" >/dev/null 2>&1; then
         echo "ERROR: ${required_package} is not installed." >&2
         echo "       Install it first:  dnf install ${required_package}" >&2
@@ -503,7 +507,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   with a correct clock. There needs-restarting stops flagging the kernel after the reboot, and
   the count stayed until the next kernel update replaced it.
 - FIX: An update run installs nothing until chronyd confirms the clock synchronised, waiting at
-  most clock_sync_wait_sec (new, default 600); otherwise it fails. The unit's ordering after
+  most clock_sync_wait_sec (new, default 600, enforced with timeout); otherwise it fails. The
+  package now requires chrony. The unit's ordering after
   time-sync.target did not require synchronisation to succeed, so a failed chrony-wait.service
   let updates run with a wrong clock. require_clock_sync = no (new) turns the check off.
 - FIX: The reboot respects shutdown inhibitors. From a service, systemctl reboot skipped the

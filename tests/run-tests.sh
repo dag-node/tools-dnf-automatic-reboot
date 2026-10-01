@@ -970,8 +970,16 @@ stub_run_main() {
         while [[ "$1" == --* ]]; do shift; done
         "$@"
     }
+    # chronyc runs under timeout too: the stub passes it through, or reports
+    # it stopped at the deadline with STUB_CHRONYC_TIMED_OUT=yes.
     timeout() {
         printf 'timeout %s\n' "$*" >> "${STUB_LOG}"
+        if [[ "$*" == *chronyc* ]]; then
+            [[ "${STUB_CHRONYC_TIMED_OUT:-}" == "yes" ]] && return 124
+            while [[ "$1" != chronyc ]]; do shift; done
+            "$@"
+            return
+        fi
         return "${STUB_DNF_AUTOMATIC_RC:-0}"
     }
     run_reboot_check() { return "${STUB_NEEDS_REBOOT_RC:-0}"; }
@@ -1158,7 +1166,7 @@ test_run_refused_inhibitor_stops_the_update() {
     local exit_code=0
     ( main ) >/dev/null 2>&1 || exit_code=$?
     assert_exit_code 1 "${exit_code}" "the run fails"
-    assert_equals "0" "$(grep -c "^timeout" "${STUB_LOG}")" "dnf-automatic never starts without the lock"
+    assert_equals "0" "$(grep -c "^timeout .*dnf-automatic" "${STUB_LOG}")" "dnf-automatic never starts without the lock"
 }
 
 test_run_update_runs_inside_the_inhibitor() {
@@ -2435,6 +2443,21 @@ test_run_unsynchronised_clock_does_not_update() {
     assert_contains "${output}" "did not report a synchronised clock within 600s" "and says why"
 }
 
+test_run_clock_wait_has_a_hard_deadline() {
+    load_run_library
+    stub_run_main
+    # Each chronyc request adds its own time to the polling interval: only
+    # timeout(1) holds the configured deadline.
+    export STUB_CHRONYC_TIMED_OUT=yes
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "a client stopped at the deadline fails the run"
+    assert_contains "$(cat "${STUB_LOG}")" "timeout --kill-after=30s 600s chronyc waitsync" \
+        "SIGTERM at clock_sync_wait_sec, SIGKILL kill_grace_sec later"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "nothing is installed"
+    assert_contains "${output}" "still running at 600s" "and says why"
+}
+
 test_run_without_chronyc_does_not_update() {
     load_run_library
     stub_run_main
@@ -3087,12 +3110,13 @@ test_preflight_accepts_operator_automatic_conf() {
 test_preflight_refuses_missing_dependencies() {
     make_preflight_host
     # --nodeps without elfutils would disable the build-id check at runtime.
-    export STUB_MISSING_PACKAGES="dnf-automatic elfutils"
+    export STUB_MISSING_PACKAGES="dnf-automatic elfutils chrony"
     local output exit_code=0
     output=$(run_preflight 1) || exit_code=$?
     assert_exit_code 1 "${exit_code}" "--nodeps install refused"
     assert_contains "${output}" "dnf install dnf-automatic" "names each missing package"
     assert_contains "${output}" "dnf install elfutils" "names each missing package"
+    assert_contains "${output}" "dnf install chrony" "the clock check needs chronyc"
     assert_not_contains "${output}" "dnf install grubby" "installed packages not reported"
 }
 
@@ -3290,6 +3314,7 @@ run_test "request: elapsed timer is not a scheduled reboot" test_request_elapsed
 run_test "request: waiting timer is not scheduled twice" test_request_waiting_timer_is_not_scheduled_twice
 run_test "request: coherent snapshot sees a running service" test_request_coherent_snapshot_sees_a_running_service
 run_test "run: unsynchronised clock does not update" test_run_unsynchronised_clock_does_not_update
+run_test "run: clock wait has a hard deadline"      test_run_clock_wait_has_a_hard_deadline
 run_test "run: without chronyc does not update"      test_run_without_chronyc_does_not_update
 run_test "run: clock requirement can be turned off"  test_run_clock_requirement_can_be_turned_off
 run_test "run: does not update before a pending reboot" test_run_does_not_update_before_a_pending_reboot

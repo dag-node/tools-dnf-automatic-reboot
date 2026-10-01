@@ -539,9 +539,12 @@ chronyc_available() {
 # and is reached at once when nothing is ordered before it.  rpm INSTALLTIME
 # stamps written with a wrong clock skew every later reboot decision, so the
 # run checks the clock itself.  chronyc waitsync asks chronyd every 10 s and
-# succeeds once its remaining correction is below 0.1 s.
+# succeeds once its remaining correction is below 0.1 s.  Each request takes
+# time of its own on top of the interval, and the run is not yet supervised
+# by the watchdog, so timeout(1) enforces the deadline: SIGTERM at
+# CLOCK_SYNC_WAIT_SEC, SIGKILL KILL_GRACE_SEC later.
 wait_for_clock_sync() {
-    local waitsync_tries
+    local waitsync_tries waitsync_exit_code=0
     if [[ "${REQUIRE_CLOCK_SYNC}" == "no" ]]; then
         return 0
     fi
@@ -550,11 +553,18 @@ wait_for_clock_sync() {
         return 1
     fi
     waitsync_tries=$(( (CLOCK_SYNC_WAIT_SEC + 9) / 10 ))
-    if chronyc waitsync "${waitsync_tries}" 0.1 0 10 >/dev/null 2>&1; then
+    timeout --kill-after="${KILL_GRACE_SEC}s" "${CLOCK_SYNC_WAIT_SEC}s" \
+        chronyc waitsync "${waitsync_tries}" 0.1 0 10 >/dev/null 2>&1 || waitsync_exit_code=$?
+    if [[ "${waitsync_exit_code}" -eq 0 ]]; then
         log "clock synchronised (chronyc waitsync)"
         return 0
     fi
-    log_error "chronyd did not report a synchronised clock within ${CLOCK_SYNC_WAIT_SEC}s - check: chronyc tracking"
+    # 124: still waiting at the deadline; 137: killed after the grace.
+    if [[ "${waitsync_exit_code}" -eq 124 || "${waitsync_exit_code}" -eq 137 ]]; then
+        log_error "chronyc waitsync was still running at ${CLOCK_SYNC_WAIT_SEC}s and was stopped - check: chronyc tracking"
+    else
+        log_error "chronyd did not report a synchronised clock within ${CLOCK_SYNC_WAIT_SEC}s - check: chronyc tracking"
+    fi
     return 1
 }
 
