@@ -787,6 +787,24 @@ test_classify_withholds_at_attempt_limit() {
     assert_equals "1" "${REBOOT_WITHHELD}" "condition is recorded as withheld"
 }
 
+test_classify_unrecorded_attempt_withholds_the_reboot() {
+    load_needs_reboot_library
+    export STUB_UNAME_R="6.12.0-204.92.4.3.1.el9uek.aarch64"
+    export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.4.el9uek.aarch64"
+    export STUB_GRUBBY_DEFAULT="/boot/vmlinuz-6.12.0-204.92.4.4.el9uek.aarch64"
+    # A directory where the state lock belongs: every attempt write fails.
+    rm -f "${STATE_LOCK_FILE}"
+    mkdir -p "${STATE_LOCK_FILE}"
+    local boot_number
+    for boot_number in 1 2 3 4 5; do
+        printf 'boot-%s\n' "${boot_number}" > "${TEST_ROOT_DIR}/proc/sys/kernel/random/boot_id"
+        FLAGGED_PACKAGE_NAMES=(kernel-uek)
+        classify_flagged_packages >/dev/null 2>&1
+        assert_equals "0" "${#REBOOT_TRIGGER_PACKAGES[@]}" "boot ${boot_number}: no reboot without a recorded attempt"
+        assert_equals "1" "${REBOOT_WITHHELD}" "boot ${boot_number}: withheld, so the run fails and reports it"
+    done
+}
+
 test_classify_schedules_genuine_kernel_reboot() {
     load_needs_reboot_library
     export STUB_UNAME_R="6.12.0-204.92.4.3.1.el9uek.aarch64"
@@ -2967,6 +2985,7 @@ run_test "learning: new evr restarts the cycle"      test_learning_new_evr_resta
 printf 'classify\n'
 run_test "classify: withholds on stale grub default" test_classify_withholds_on_stale_grub_default
 run_test "classify: withholds at attempt limit"      test_classify_withholds_at_attempt_limit
+run_test "classify: unrecorded attempt withholds the reboot" test_classify_unrecorded_attempt_withholds_the_reboot
 run_test "classify: schedules genuine kernel reboot" test_classify_schedules_genuine_kernel_reboot
 run_test "classify: repeated checks in one boot count once" test_classify_repeated_checks_in_one_boot_count_once
 run_test "classify: keeps package when verifier missing" test_classify_keeps_package_when_verifier_missing

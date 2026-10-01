@@ -162,14 +162,16 @@ read_kernel_reboot_attempt_boot_id() {
 }
 
 # write_kernel_reboot_attempts PACKAGE_NAME TARGET_VERSION ATTEMPT_COUNT [BOOT_ID]
-# An ATTEMPT_COUNT of 0 clears the package's row.
+# An ATTEMPT_COUNT of 0 clears the package's row.  Returns 1 when the lock,
+# the temporary file or the replacement fails: the file then still holds the
+# previous count.
 write_kernel_reboot_attempts() {
     local package_name="$1" target_version="$2" attempt_count="$3" boot_id="${4:-}"
     mkdir -p "${STATE_DIRECTORY}" 2>/dev/null || true
     (
-        flock -w 10 9 || exit 0
+        flock -w 10 9 || exit 1
         local temporary_file
-        temporary_file=$(mktemp "${KERNEL_REBOOT_ATTEMPT_FILE}.XXXXXX") || exit 0
+        temporary_file=$(mktemp "${KERNEL_REBOOT_ATTEMPT_FILE}.XXXXXX") || exit 1
         # The `if` must not be the last command of the group: as a bare
         # `[[ ]] && printf`, a zero count made the group exit non-zero and the
         # rewritten file was discarded instead of clearing the row.
@@ -178,10 +180,11 @@ write_kernel_reboot_attempts() {
             if [[ "${attempt_count}" -gt 0 ]]; then
                 printf '%s\t%s\t%s\t%s\n' "${package_name}" "${target_version}" "${attempt_count}" "${boot_id}"
             fi
-        } > "${temporary_file}" 2>/dev/null || { rm -f "${temporary_file}"; exit 0; }
+        } > "${temporary_file}" 2>/dev/null || { rm -f "${temporary_file}"; exit 1; }
         chmod 0640 "${temporary_file}" 2>/dev/null || true
-        mv -f "${temporary_file}" "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || rm -f "${temporary_file}"
-    ) 9>>"${STATE_LOCK_FILE}" 2>/dev/null || true
+        mv -f "${temporary_file}" "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null \
+            || { rm -f "${temporary_file}"; exit 1; }
+    ) 9>>"${STATE_LOCK_FILE}" 2>/dev/null
 }
 
 # clear_kernel_reboot_attempts_for_running_kernel
@@ -507,7 +510,8 @@ classify_flagged_packages() {
 
             if running_kernel_is_newest "${flagged_package_name}"; then
                 log "${flagged_package_name} false positive: running kernel is the newest installed ($(uname -r))"
-                write_kernel_reboot_attempts "${flagged_package_name}" "-" 0
+                write_kernel_reboot_attempts "${flagged_package_name}" "-" 0 \
+                    || log_warning "${flagged_package_name}: could not clear ${KERNEL_REBOOT_ATTEMPT_FILE}"
                 continue
             fi
 
@@ -545,8 +549,14 @@ classify_flagged_packages() {
                     if [[ -z "${current_boot_id}" ]]; then
                         log_warning "could not read boot_id - counting this check as a reboot attempt"
                     fi
-                    write_kernel_reboot_attempts "${flagged_package_name}" \
-                        "${target_kernel_version}" $(( kernel_reboot_attempts + 1 )) "${current_boot_id}"
+                    # The limit only holds while each attempt is recorded; an
+                    # attempt that cannot be recorded is not made.
+                    if ! write_kernel_reboot_attempts "${flagged_package_name}" \
+                            "${target_kernel_version}" $(( kernel_reboot_attempts + 1 )) "${current_boot_id}"; then
+                        log_error "${flagged_package_name}: cannot record reboot attempt $(( kernel_reboot_attempts + 1 )) in ${KERNEL_REBOOT_ATTEMPT_FILE} - withholding the reboot, kernel_reboot_attempt_limit could not be enforced"
+                        REBOOT_WITHHELD=1
+                        continue
+                    fi
                 fi
             fi
 
