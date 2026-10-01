@@ -725,7 +725,18 @@ means nothing on its own.
 `chrony` ships `chrony-wait.service` — `chronyc waitsync`, ordered
 `Before=time-sync.target` — disabled by default. `%post` enables it when
 `[time] enable_chrony_wait = yes`. It is never disabled on erase: a synchronised
-clock is not this package's to take away.
+clock is not this package's to take away. `%post` does not start it for the current boot.
+
+The unit ordering does not require a successful synchronisation: `time-sync.target` is
+reached even when `chrony-wait.service` fails (systemd issue 4880). `run.sh` therefore
+checks the clock itself before installing anything: `wait_for_clock_sync` runs
+`chronyc waitsync` (every 10 s, remaining correction below 0.1 s) for at most
+`clock_sync_wait_sec` (default 600), and a run whose clock chronyd has not confirmed by then
+installs nothing and fails. A missing `chronyc` fails it too. `require_clock_sync = no`
+turns the check off for a host without chrony. The check asks chronyd, not the kernel's
+synchronised flag (`timedatectl`'s `NTPSynchronized`), which chrony is understood to set only
+with `rtcsync`; hosts without an RTC do not use it. That is not yet confirmed on a host. `tools/verify-reboot-protocol.sh` reports whether
+`chronyc waitsync` confirms the clock on a host.
 
 `/etc/chrony.conf` needs `makestep 1 -1` so the clock is stepped rather than slewed
 at boot. `rtcsync` is pointless on a host with no RTC and is not required.

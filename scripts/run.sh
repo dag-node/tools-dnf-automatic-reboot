@@ -227,6 +227,9 @@ check_conflicts() {
 REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300 1 86400)
 REBOOT_REQUEST_LOCK_WAIT_SEC=$(get_config_integer reboot_request_lock_wait_sec 60 1 600)
 REBOOT_INHIBITED_WAIT_SEC=$(get_config_integer reboot_inhibited_wait_sec 1800 0 86400)
+REQUIRE_CLOCK_SYNC=$(get_config_value require_clock_sync yes)
+REQUIRE_CLOCK_SYNC="${REQUIRE_CLOCK_SYNC//[[:space:]]/}"
+CLOCK_SYNC_WAIT_SEC=$(get_config_integer clock_sync_wait_sec 600 10 3600)
 ALWAYS_REBOOT=$(get_config_value always_reboot no)
 DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 60 1)
 KILL_GRACE_SEC=$(get_config_integer kill_grace_sec 30)
@@ -524,6 +527,37 @@ schedule_reboot() {
     return 2
 }
 
+# chronyc_available - 0 when chronyc can be run.
+chronyc_available() {
+    command -v chronyc >/dev/null 2>&1
+}
+
+# wait_for_clock_sync - 0 once chronyd reports the clock synchronised, within
+# CLOCK_SYNC_WAIT_SEC; 1 when it does not, or cannot be asked.
+# The unit's ordering on time-sync.target does not require a successful
+# synchronisation: the target is reached after chrony-wait.service fails,
+# and is reached at once when nothing is ordered before it.  rpm INSTALLTIME
+# stamps written with a wrong clock skew every later reboot decision, so the
+# run checks the clock itself.  chronyc waitsync asks chronyd every 10 s and
+# succeeds once its remaining correction is below 0.1 s.
+wait_for_clock_sync() {
+    local waitsync_tries
+    if [[ "${REQUIRE_CLOCK_SYNC}" == "no" ]]; then
+        return 0
+    fi
+    if ! chronyc_available; then
+        log_error "chronyc not found - cannot confirm the clock is synchronised; install chrony, or set require_clock_sync = no"
+        return 1
+    fi
+    waitsync_tries=$(( (CLOCK_SYNC_WAIT_SEC + 9) / 10 ))
+    if chronyc waitsync "${waitsync_tries}" 0.1 0 10 >/dev/null 2>&1; then
+        log "clock synchronised (chronyc waitsync)"
+        return 0
+    fi
+    log_error "chronyd did not report a synchronised clock within ${CLOCK_SYNC_WAIT_SEC}s - check: chronyc tracking"
+    return 1
+}
+
 # exit_if_reboot_pending - exits 0 without updating while a scheduled reboot
 # is waiting, queued, running or dispatched, and exits 1 when that cannot be
 # read.  ConditionPathExists=! on REBOOT_PENDING_FILE normally keeps this unit
@@ -558,6 +592,10 @@ main() {
     log "Starting (pid=${SERVICE_PID})"
     check_conflicts
     exit_if_reboot_pending
+    if ! wait_for_clock_sync; then
+        wall_msg "dnf-automatic-reboot: Updates NOT started - the clock is not confirmed synchronised."
+        exit 1
+    fi
     warn_on_unsigned_repositories
 
     # Detect concurrent dnf - warn but do not abort; dnf serialises via its

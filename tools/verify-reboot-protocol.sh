@@ -249,6 +249,21 @@ report_info read_host_shutdown_state "not probed: PreparingForShutdown=true unde
 report_info read_host_shutdown_state "delay inhibitors now: $(systemd-inhibit --list --no-pager 2>/dev/null | awk '$NF == "delay"' | wc -l)"
 
 # ---------------------------------------------------------------------------
+printf '== clock synchronisation\n'
+# ---------------------------------------------------------------------------
+if command -v chronyc >/dev/null 2>&1; then
+    if chronyc waitsync 1 0.1 0 1 >/dev/null 2>&1; then
+        report_pass run.sh "chronyc waitsync reports the clock synchronised"
+    else
+        report_fail run.sh "chronyc waitsync does not report the clock synchronised; run.sh would install nothing"
+    fi
+    report_info run.sh "chronyc tracking: $(chronyc tracking 2>&1 | grep -E '^(Reference ID|Leap status|System time)' | sed 's/[[:space:]]\{2,\}/ /g' | paste -sd';' -)"
+else
+    report_fail run.sh "chronyc not found; run.sh needs it unless require_clock_sync = no"
+fi
+report_info run.sh "chrony-wait.service: $(systemctl is-enabled chrony-wait.service 2>&1), $(systemctl is-active chrony-wait.service 2>&1)"
+
+# ---------------------------------------------------------------------------
 printf '== lock\n'
 # ---------------------------------------------------------------------------
 if [[ -e "${LOCK_FILE}" ]]; then

@@ -387,7 +387,7 @@ test_config_every_key_resolves() {
                       watchdog_hard_timeout_min force_reboot_on_hard_timeout \
                       enable_chrony_wait wall_messages reboot_request_lock_wait_sec \
                       watchdog_kill_confirm_sec restart_service_timeout_sec \
-                      reboot_inhibited_wait_sec; do
+                      reboot_inhibited_wait_sec require_clock_sync clock_sync_wait_sec; do
         resolved_value=$(get_config_value "${config_key}" "MISSING")
         if [[ "${resolved_value}" == "MISSING" ]]; then
             fail "shipped config does not define ${config_key}"
@@ -957,6 +957,8 @@ stub_run_main() {
     }
     run_reboot_check() { return "${STUB_NEEDS_REBOOT_RC:-0}"; }
     read_scheduled_reboot_status() { printf '%s' "${STUB_SCHEDULED_REBOOT_STATUS:-none}"; }
+    chronyc_available() { [[ "${STUB_CHRONYC_MISSING:-}" != "yes" ]]; }
+    chronyc() { printf 'chronyc %s\n' "$*" >> "${STUB_LOG}"; return "${STUB_CHRONYC_RC:-0}"; }
     schedule_reboot() {
         printf 'schedule_reboot reboot_pending_file=%s\n' "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
         [[ "${STUB_SCHEDULE_FAILS:-}" == "yes" ]] && return 1
@@ -2401,6 +2403,41 @@ test_request_coherent_snapshot_sees_a_running_service() {
 # ---------------------------------------------------------------------------
 # run: no update while a reboot is pending
 # ---------------------------------------------------------------------------
+test_run_unsynchronised_clock_does_not_update() {
+    load_run_library
+    stub_run_main
+    # chrony-wait.service failed, and time-sync.target was reached anyway.
+    export STUB_CHRONYC_RC=1
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "an unconfirmed clock fails the run"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "nothing is installed"
+    assert_contains "$(cat "${STUB_LOG}")" "chronyc waitsync 60 0.1 0 10" "bounded at clock_sync_wait_sec"
+    assert_contains "${output}" "did not report a synchronised clock within 600s" "and says why"
+}
+
+test_run_without_chronyc_does_not_update() {
+    load_run_library
+    stub_run_main
+    export STUB_CHRONYC_MISSING=yes
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "no way to confirm the clock"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "nothing is installed"
+}
+
+test_run_clock_requirement_can_be_turned_off() {
+    printf '\n[time]\nrequire_clock_sync = no\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    sed -i 's/^require_clock_sync = yes$//' "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    load_run_library
+    stub_run_main
+    export STUB_CHRONYC_MISSING=yes
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the operator opted out"
+    assert_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "and the update runs"
+}
+
 test_run_does_not_update_before_a_pending_reboot() {
     load_run_library
     stub_run_main
@@ -3232,6 +3269,9 @@ run_test "request: unreadable state before submission is rejected" test_request_
 run_test "request: elapsed timer is not a scheduled reboot" test_request_elapsed_timer_is_not_a_scheduled_reboot
 run_test "request: waiting timer is not scheduled twice" test_request_waiting_timer_is_not_scheduled_twice
 run_test "request: coherent snapshot sees a running service" test_request_coherent_snapshot_sees_a_running_service
+run_test "run: unsynchronised clock does not update" test_run_unsynchronised_clock_does_not_update
+run_test "run: without chronyc does not update"      test_run_without_chronyc_does_not_update
+run_test "run: clock requirement can be turned off"  test_run_clock_requirement_can_be_turned_off
 run_test "run: does not update before a pending reboot" test_run_does_not_update_before_a_pending_reboot
 run_test "run: unknown reboot state does not update" test_run_unknown_reboot_state_does_not_update
 run_test "invariant: only reboot-if-pending reboots" test_invariant_only_reboot_if_pending_reboots

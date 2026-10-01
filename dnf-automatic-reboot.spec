@@ -502,6 +502,10 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 - FIX: The kernel reboot attempt count is cleared once the target kernel runs, also on a host
   with a correct clock. There needs-restarting stops flagging the kernel after the reboot, and
   the count stayed until the next kernel update replaced it.
+- FIX: An update run installs nothing until chronyd confirms the clock synchronised, waiting at
+  most clock_sync_wait_sec (new, default 600); otherwise it fails. The unit's ordering after
+  time-sync.target did not require synchronisation to succeed, so a failed chrony-wait.service
+  let updates run with a wrong clock. require_clock_sync = no (new) turns the check off.
 - FIX: The reboot respects shutdown inhibitors. From a service, systemctl reboot skipped the
   inhibitor check, so a package transaction started by hand during reboot_delay_sec could be cut
   off. A refused reboot is retried every 30 seconds for reboot_inhibited_wait_sec (new, default
