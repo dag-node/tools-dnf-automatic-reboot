@@ -719,11 +719,38 @@ test_state_kernel_attempts_cleared() {
 # ---------------------------------------------------------------------------
 # learning: a confirmation must never outlive the EVR it was made for
 # ---------------------------------------------------------------------------
+test_learning_never_overrules_a_build_id_mismatch() {
+    load_needs_reboot_library
+    # systemd is in filter_packages; its build-id check finds journald stale.
+    # A restart-state row from an earlier boot says "confirmed" for this EVR.
+    export STUB_RPM_EVR="252-67.0.2.el9_8.6"
+    write_restart_state systemd "252-67.0.2.el9_8.6" "boot-old" confirmed
+    verify_build_id() { return 2; }
+    FLAGGED_PACKAGE_NAMES=(systemd)
+    classify_flagged_packages >/dev/null 2>&1
+    apply_restart_state_learning >/dev/null 2>&1
+    assert_equals "systemd" "${REBOOT_TRIGGER_PACKAGES[*]:-}" "a proven stale binary reboots"
+    assert_equals "boot-old" "$(read_restart_state systemd | cut -f3)" "and learning leaves its row untouched"
+}
+
+test_learning_does_not_confirm_an_unverifiable_package() {
+    load_needs_reboot_library
+    export STUB_RPM_EVR="252-67.0.2.el9_8.6"
+    write_restart_state systemd "252-67.0.2.el9_8.6" "boot-old" pending
+    verify_build_id() { return 1; }
+    FLAGGED_PACKAGE_NAMES=(systemd)
+    classify_flagged_packages >/dev/null 2>&1
+    apply_restart_state_learning >/dev/null 2>&1
+    assert_equals "systemd" "${REBOOT_TRIGGER_PACKAGES[*]:-}" "cannot tell keeps the package"
+    assert_equals "pending" "$(read_restart_state systemd | cut -f5)" "and is never promoted to confirmed"
+}
+
 test_learning_confirmed_same_evr_is_skipped() {
     load_needs_reboot_library
     export STUB_RPM_EVR="2.34-274"
     write_restart_state glibc "2.34-274" "boot-old" confirmed
     REBOOT_TRIGGER_PACKAGES=(glibc)
+    LEARNABLE_PACKAGE_NAMES=( ["glibc"]=1 )
     apply_restart_state_learning >/dev/null 2>&1
     assert_equals "0" "${#REBOOT_TRIGGER_PACKAGES[@]}" "confirmed false positive is dropped"
 }
@@ -735,6 +762,7 @@ test_learning_pending_after_reboot_is_confirmed() {
     # the package is still flagged, which proves the flag spurious.
     write_restart_state glibc "2.34-274" "boot-old" pending
     REBOOT_TRIGGER_PACKAGES=(glibc)
+    LEARNABLE_PACKAGE_NAMES=( ["glibc"]=1 )
     apply_restart_state_learning >/dev/null 2>&1
     assert_equals "0" "${#REBOOT_TRIGGER_PACKAGES[@]}" "dropped after confirmation"
     assert_contains "$(read_restart_state glibc)" "confirmed" "state promoted"
@@ -745,6 +773,7 @@ test_learning_pending_same_boot_still_reboots() {
     export STUB_RPM_EVR="2.34-274"
     write_restart_state glibc "2.34-274" "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" pending
     REBOOT_TRIGGER_PACKAGES=(glibc)
+    LEARNABLE_PACKAGE_NAMES=( ["glibc"]=1 )
     apply_restart_state_learning >/dev/null 2>&1
     assert_equals "1" "${#REBOOT_TRIGGER_PACKAGES[@]}" \
         "no reboot yet, so the flag is unproven and must still trigger one"
@@ -756,6 +785,7 @@ test_learning_new_evr_restarts_cycle() {
     # An old confirmation must never mask a genuine later update.
     write_restart_state glibc "2.34-274" "boot-old" confirmed
     REBOOT_TRIGGER_PACKAGES=(glibc)
+    LEARNABLE_PACKAGE_NAMES=( ["glibc"]=1 )
     apply_restart_state_learning >/dev/null 2>&1
     assert_equals "1" "${#REBOOT_TRIGGER_PACKAGES[@]}" "new evr must trigger a reboot"
     assert_contains "$(read_restart_state glibc)" "pending" "fresh unverified cycle"
@@ -2977,6 +3007,8 @@ run_test "state: attempts cleared for arch-stripped release" test_state_attempts
 run_test "state: attempts kept while old kernel runs" test_state_attempts_kept_while_old_kernel_runs
 
 printf 'learning\n'
+run_test "learning: never overrules a build-id mismatch" test_learning_never_overrules_a_build_id_mismatch
+run_test "learning: does not confirm an unverifiable package" test_learning_does_not_confirm_an_unverifiable_package
 run_test "learning: confirmed same evr is skipped"   test_learning_confirmed_same_evr_is_skipped
 run_test "learning: pending after reboot confirms"   test_learning_pending_after_reboot_is_confirmed
 run_test "learning: pending same boot still reboots" test_learning_pending_same_boot_still_reboots

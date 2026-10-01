@@ -267,6 +267,11 @@ parse_flagged_package_names() {
 # PROCESS_BINARY_TO_PIDS values are newline-separated PID lists.
 declare -gA PROCESS_BINARY_TO_PIDS=()
 declare -gA PROCESS_BINARY_TO_PACKAGE=()
+# Packages classify_flagged_packages handed to restart-state learning: those
+# outside filter_packages, which no verifier covers.  Learning never sees a
+# kernel or a package a build-id check examined, so history cannot overrule a
+# current result.
+declare -gA LEARNABLE_PACKAGE_NAMES=()
 PROCESS_MAP_BUILT=0
 
 build_process_binary_map() {
@@ -497,6 +502,7 @@ classify_flagged_packages() {
     fi
 
     REBOOT_TRIGGER_PACKAGES=()
+    LEARNABLE_PACKAGE_NAMES=()
     REBOOT_WITHHELD=0
 
     for flagged_package_name in "${FLAGGED_PACKAGE_NAMES[@]}"; do
@@ -580,6 +586,7 @@ classify_flagged_packages() {
 
         # -- everything else: restart-state learning -----------------------
         REBOOT_TRIGGER_PACKAGES+=("${flagged_package_name}")
+        LEARNABLE_PACKAGE_NAMES["${flagged_package_name}"]=1
     done
     return 0
 }
@@ -614,7 +621,9 @@ apply_restart_state_learning() {
     fi
 
     for trigger_package_name in "${REBOOT_TRIGGER_PACKAGES[@]}"; do
-        if [[ "${trigger_package_name}" == kernel* ]]; then
+        # A kernel, or a package whose build-id check found it stale or could
+        # not verify it, keeps its verdict.
+        if [[ -z "${LEARNABLE_PACKAGE_NAMES[${trigger_package_name}]:-}" ]]; then
             learned_trigger_packages+=("${trigger_package_name}")
             continue
         fi

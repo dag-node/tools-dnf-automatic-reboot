@@ -545,7 +545,10 @@ The first observation of a given package/EVR pair always triggers one reboot —
 reboot is what proves the flag spurious or genuine. A new EVR on an
 already-`confirmed` package starts a fresh, unverified cycle, so a real future update
 is never masked by an old confirmation. `kernel*` packages are exempt; the
-version-string check above remains their sole authority. Controlled by
+version-string check above remains their sole authority. Packages in `filter_packages` are
+exempt too: a build-id mismatch, or a build-id that cannot be verified, keeps the package, and
+no recorded `confirmed` row can overrule it. Only packages that reach the learning branch of
+`classify_flagged_packages` (`LEARNABLE_PACKAGE_NAMES`) are learned. Controlled by
 `learn_false_positives` in `automatic-reboot.conf`.
 
 ## What `needs-restarting -r` does not cover

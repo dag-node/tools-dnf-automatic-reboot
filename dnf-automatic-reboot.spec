@@ -499,6 +499,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 - FIX: The kernel reboot attempt count is cleared once the target kernel runs, also on a host
   with a correct clock. There needs-restarting stops flagging the kernel after the reboot, and
   the count stayed until the next kernel update replaced it.
+- FIX: Restart-state learning no longer drops a package that the build-id check found running
+  stale code, or could not verify. A systemd flag with a stale daemon could be recorded as a
+  confirmed false positive and the reboot skipped.
 - FIX: A kernel reboot is withheld, and the run fails, when its attempt cannot be recorded in
   /var/lib/dnf-automatic-reboot/kernel-reboot-attempts. A failed write was ignored, so
   kernel_reboot_attempt_limit stopped counting and a kernel that never boots could be rebooted
