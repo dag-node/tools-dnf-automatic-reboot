@@ -227,6 +227,8 @@ state. A settings file you changed is kept as
 - [doc/README](doc/README), installed as
   `/usr/share/doc/dnf-automatic-reboot/README`: every setting, the log, and
   how restart decisions are made.
+- [doc/END-TO-END-TEST.md](doc/END-TO-END-TEST.md): checking on a live host
+  that a reboot waits for shutdown inhibitors and can be cancelled.
 - Source and issues: <https://github.com/dag-node/tools-dnf-automatic-reboot>
 
 ## Building from source

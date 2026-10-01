@@ -62,6 +62,7 @@ tests/run-tests.sh              Test suite (bash only, run by make check and %ch
 tmpfiles/dnf-automatic-reboot.conf   Log + state path modes and labels
 logrotate/dnf-automatic-reboot       Log rotation drop-in
 doc/README                      Operational reference (installed to /usr/share/doc/)
+doc/END-TO-END-TEST.md          Live-host test of inhibitors, cancellation and the reboot (repository only)
 LICENSE, LICENSES/, REUSE.toml  GPL-2.0-or-later; the spec alone is MIT
 tools/verify-grub-boot-flags.sh Read-only host check: can grubenv flags pick the boot entry?
 tools/verify-el-prerequisites.sh Read-only host survey of every platform fact the package relies on

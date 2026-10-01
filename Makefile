@@ -31,6 +31,8 @@ CONF      = conf/automatic-reboot.conf
 TMPFILES  = tmpfiles/$(NAME).conf
 LOGROTATE = logrotate/$(NAME)
 DOC       = doc/README
+# Repository and source archive only; it drives tools/, which the RPM does not ship.
+E2E_DOC   = doc/END-TO-END-TEST.md
 LICENSE   = LICENSE
 # Licence texts and copyright metadata: the spec is MIT, so a source archive
 # carries the MIT text and REUSE.toml, which names the copyright holder.
@@ -126,7 +128,7 @@ uninstall:
 dist: check
 	tar czf $(TARBALL) --transform 's,^,$(NAME)-$(VERSION)/,' \
 	    Makefile $(SCRIPTS) $(LIBRARIES) $(UNITS) $(CONF) $(TMPFILES) $(LOGROTATE) \
-	    $(TESTS) $(TOOLS) $(DOC) $(LICENSE) $(LICENSE_METADATA) $(NAME).spec \
+	    $(TESTS) $(TOOLS) $(DOC) $(E2E_DOC) $(LICENSE) $(LICENSE_METADATA) $(NAME).spec \
 	    $(CONTAINER_BUILD_SCRIPT)
 	@echo "Created $(TARBALL)"
 
