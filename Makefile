@@ -20,7 +20,8 @@ SCRIPTS = scripts/run.sh \
           scripts/cancel-reboot.sh \
           scripts/reboot-if-pending.sh
 # Sourced, never executed.
-LIBRARIES = scripts/reboot-request.sh
+LIBRARIES = scripts/reboot-request.sh \
+            scripts/run-state.sh
 UNITS   = units/dnf-automatic-reboot.service \
           units/dnf-automatic-reboot.timer \
           units/dnf-automatic-watchdog.service \

@@ -52,6 +52,7 @@ scripts/notify-failure.sh       OnFailure= notifier (wall + log)
 scripts/cancel-reboot.sh        Cancels a pending reboot and allows update runs again
 scripts/reboot-if-pending.sh    The scheduled reboot's command: reboots only while one is pending
 scripts/reboot-request.sh       Reboot request/cancel protocol, sourced by the scripts that request, run or cancel reboots
+scripts/run-state.sh            State file protocol (atomic publish, snapshot, checked removal), sourced by run and watchdog
 units/dnf-automatic-reboot.service    Oneshot service wrapping run.sh
 units/dnf-automatic-reboot.timer      Daily 03:00, RandomizedDelaySec=10min, Persistent
 units/dnf-automatic-watchdog.service  Oneshot service wrapping watchdog.sh
@@ -254,6 +255,17 @@ than 0, 1 and 2, such as 127 from a missing helper, is handled as code 2: only 0
 Written by `run.sh`, consumed by `watchdog.sh`. It exists from before `dnf-automatic`
 starts until `run.sh` exits; `checking` covers the reboot decision and the service
 restarts after it.
+
+`scripts/run-state.sh`, sourced by both, holds the protocol. `run.sh` publishes the file by
+writing a temporary file beside it and renaming it over the old one, so a reader never sees it
+empty or half-written; a write that fails before the update aborts the run, since the
+watchdog could not supervise it. Every write and removal holds
+`/run/dnf-automatic-reboot.state.lock` (`flock`, `0600` like the request lock). The watchdog
+reads the file once per cycle and decides from that snapshot; the identity re-check before a
+kill compares the whole file with it. It removes the state and lock files only under the lock
+and only while the state file still holds that snapshot, so a run that started in the
+meantime keeps both. `run.sh` removes the file only while it holds the content it last
+published.
 
 ```
 phase=updating|checking

@@ -43,6 +43,7 @@ export LC_ALL=C
 readonly TEST_ROOT="${DNF_AUTOMATIC_REBOOT_TEST_ROOT:-}"
 
 readonly CONFIG_FILE="${TEST_ROOT}/etc/dnf/automatic-reboot.conf"
+# shellcheck disable=SC2034  # read by run-state.sh
 readonly STATE_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.state"
 readonly LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.lock"
 # Present while the watchdog kills a run; the main unit does not start then.
@@ -59,6 +60,9 @@ readonly SCRIPT_NAME=watchdog
 # REBOOT_PENDING_FILE, the request lock, and request_reboot.
 # shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/reboot-request.sh"
+# read_run_state, run_state_field and remove_run_state_if_unchanged.
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/run-state.sh"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -194,23 +198,31 @@ recorded_pid_identity() {
     return 0
 }
 
-# recorded_run_is_unchanged PHASE START_UPTIME PID
-# Returns: 0 = the state file still describes this run and PID is still the
-#              unit's MainPID
+# recorded_run_is_unchanged SNAPSHOT PID
+# Returns: 0 = the state file still holds SNAPSHOT and PID is still the unit's
+#              MainPID
 #          1 = the run ended, or another run replaced it
 #          2 = PID is alive but its identity cannot be established
 # The run can end, and another start, while the watchdog runs its own check;
 # acting on the old decision would kill the new run, possibly mid-transaction.
 recorded_run_is_unchanged() {
-    local expected_phase="$1" expected_start_uptime="$2" expected_pid="$3"
-    local current_phase current_start_uptime current_pid
-    current_phase=$(grep '^phase=' "${STATE_FILE}" 2>/dev/null | cut -d= -f2) || return 1
-    current_start_uptime=$(grep '^start_uptime=' "${STATE_FILE}" 2>/dev/null | cut -d= -f2) || return 1
-    current_pid=$(grep '^pid=' "${STATE_FILE}" 2>/dev/null | cut -d= -f2) || return 1
-    [[ "${current_phase}" == "${expected_phase}" \
-       && "${current_start_uptime}" == "${expected_start_uptime}" \
-       && "${current_pid}" == "${expected_pid}" ]] || return 1
+    local expected_snapshot="$1" expected_pid="$2" current_snapshot
+    current_snapshot=$(read_run_state) || return 1
+    [[ "${current_snapshot}" == "${expected_snapshot}" ]] || return 1
     recorded_pid_identity "${expected_pid}"
+}
+
+# remove_inspected_run_state SNAPSHOT - removes the state and lock files of
+# the run in SNAPSHOT, only while the state file still holds it.  A run that
+# started since keeps both.
+remove_inspected_run_state() {
+    local removal_result=0
+    remove_run_state_if_unchanged "$1" "${LOCK_FILE}" || removal_result=$?
+    case "${removal_result}" in
+        1) log "the state file changed since it was read - a new run started; its state is kept" ;;
+        2) log_error "the state file could not be locked - left alone this cycle" ;;
+    esac
+    return 0
 }
 
 # unit_active_state -> the service unit's ActiveState, empty when systemctl
@@ -275,7 +287,7 @@ report_reboot_pending_without_reboot() {
     return 1
 }
 
-# kill_service_cgroup PHASE START_UPTIME PID
+# kill_service_cgroup SNAPSHOT PID
 # Returns: 0 = the recorded run was killed and systemd reports the unit
 #              inactive or failed
 #          1 = the run ended or was replaced; no process signalled
@@ -286,9 +298,9 @@ report_reboot_pending_without_reboot() {
 # unit's cgroup only; the recorded PID is never signalled on its own, since by
 # then its number may belong to another process.
 kill_service_cgroup() {
-    local recorded_phase="$1" recorded_start_uptime="$2" recorded_pid="$3"
+    local recorded_snapshot="$1" recorded_pid="$2"
     local systemd_version kill_target_option run_check_result=0 active_state="" waited_seconds=0
-    recorded_run_is_unchanged "${recorded_phase}" "${recorded_start_uptime}" "${recorded_pid}" \
+    recorded_run_is_unchanged "${recorded_snapshot}" "${recorded_pid}" \
         || run_check_result=$?
     if [[ "${run_check_result}" -eq 1 ]]; then
         log "the run in the state file ended or was replaced - killing nothing, recovery abandoned"
@@ -361,24 +373,23 @@ main() {
     # ---------------------------------------------------------------------------
     # Scenario 1: no state file
     # ---------------------------------------------------------------------------
-    if [[ ! -f "${STATE_FILE}" ]]; then
+    # One read: every decision below is about this snapshot, and every
+    # removal checks that the file still holds it.
+    state_snapshot=""
+    if ! state_snapshot=$(read_run_state); then
         exit 0
     fi
 
     # ---------------------------------------------------------------------------
     # Parse state file
     # ---------------------------------------------------------------------------
-    run_phase=""
-    start_uptime_seconds=""
-    service_pid=0
-
-    run_phase=$(grep            '^phase=' "${STATE_FILE}" | cut -d= -f2) || true
-    start_uptime_seconds=$(grep '^start_uptime=' "${STATE_FILE}" | cut -d= -f2) || true
-    service_pid=$(grep            '^pid=' "${STATE_FILE}" | cut -d= -f2) || true
+    run_phase=$(run_state_field "${state_snapshot}" phase)
+    start_uptime_seconds=$(run_state_field "${state_snapshot}" start_uptime)
+    service_pid=$(run_state_field "${state_snapshot}" pid)
 
     if [[ ! "${start_uptime_seconds}" =~ ^[0-9]+$ || ! "${service_pid}" =~ ^[0-9]+$ ]]; then
         log "Malformed state file - removing"
-        rm -f "${STATE_FILE}" "${LOCK_FILE}"
+        remove_inspected_run_state "${state_snapshot}"
         exit 0
     fi
 
@@ -418,7 +429,7 @@ main() {
         wall_msg "dnf-automatic-reboot: WARNING - update process (PID ${service_pid})" \
                  "died unexpectedly in phase=${run_phase}." \
                  "Manual inspection required before rebooting."
-        rm -f "${STATE_FILE}" "${LOCK_FILE}"
+        remove_inspected_run_state "${state_snapshot}"
         exit 0
     fi
 
@@ -434,10 +445,10 @@ main() {
         log_error "hard timeout ${HARD_TIMEOUT_MIN}min exceeded - PID ${service_pid} still alive in phase=${run_phase}"
         begin_recovery
         kill_result=0
-        kill_service_cgroup "${run_phase}" "${start_uptime_seconds}" "${service_pid}" || kill_result=$?
+        kill_service_cgroup "${state_snapshot}" "${service_pid}" || kill_result=$?
         [[ "${kill_result}" -eq 1 ]] && exit 0
         [[ "${kill_result}" -eq 0 ]] || exit 1
-        rm -f "${STATE_FILE}" "${LOCK_FILE}"
+        remove_inspected_run_state "${state_snapshot}"
 
         if [[ "${run_phase}" == "checking" || "${FORCE_REBOOT_ON_HARD_TIMEOUT}" == "yes" ]]; then
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded." \
@@ -489,10 +500,10 @@ main() {
             # ended, or another run has started, its decision is not acted on.
             begin_recovery
             kill_result=0
-            kill_service_cgroup "${run_phase}" "${start_uptime_seconds}" "${service_pid}" || kill_result=$?
+            kill_service_cgroup "${state_snapshot}" "${service_pid}" || kill_result=$?
             [[ "${kill_result}" -eq 1 ]] && exit 0
             [[ "${kill_result}" -eq 0 ]] || exit 1
-            rm -f "${STATE_FILE}" "${LOCK_FILE}"
+            remove_inspected_run_state "${state_snapshot}"
 
             case "${needs_reboot_exit_code}" in
                 0)

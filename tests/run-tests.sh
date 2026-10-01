@@ -1600,6 +1600,61 @@ test_watchdog_no_run_starts_during_the_kill() {
     return 0
 }
 
+test_state_is_published_by_rename() {
+    load_run_library
+    START_TIMESTAMP=100 START_UPTIME_SECONDS=50
+    write_state updating || fail "first write"
+    local first_inode
+    first_inode=$(stat -c '%i' "${STATE_FILE}")
+    write_state checking || fail "second write"
+    assert_contains "$(cat "${STATE_FILE}")" "phase=checking" "the new content is published"
+    [[ "$(stat -c '%i' "${STATE_FILE}")" != "${first_inode}" ]] \
+        || fail "rewritten in place: a reader could see it empty"
+    compgen -G "${STATE_FILE}.??????" >/dev/null && fail "a temporary file was left behind"
+    assert_equals "600" "$(stat -c '%a' "${STATE_FILE_LOCK}")" "the state lock is owner-only"
+}
+
+test_state_removal_keeps_a_changed_file() {
+    load_watchdog_library
+    printf 'phase=updating\nstart=1\nstart_uptime=1\npid=4194304\n' > "${STATE_FILE}"
+    local inspected_snapshot
+    inspected_snapshot=$(read_run_state)
+    # A new run publishes its state between the read and the removal.
+    printf 'phase=updating\nstart=2\nstart_uptime=2\npid=%s\n' "$$" > "${STATE_FILE}"
+    local removal_result=0
+    remove_run_state_if_unchanged "${inspected_snapshot}" || removal_result=$?
+    assert_exit_code 1 "${removal_result}" "the inspected run is gone"
+    assert_contains "$(cat "${STATE_FILE}")" "pid=$$" "the new run's state is kept"
+    remove_run_state_if_unchanged "$(read_run_state)" || fail "an unchanged file is removed"
+    [[ -f "${STATE_FILE}" ]] && fail "removed"
+    return 0
+}
+
+test_watchdog_dead_run_cleanup_keeps_a_successor() {
+    load_watchdog_library
+    write_watchdog_state updating 200 4194304
+    export SUCCESSOR_PID=$$
+    # While the watchdog inspects the dead run, its successor starts.
+    recorded_pid_identity() {
+        printf 'phase=updating\nstart=9\nstart_uptime=9\npid=%s\n' "${SUCCESSOR_PID}" > "${STATE_FILE}"
+        : > "${LOCK_FILE}"
+        return 1
+    }
+    ( main ) >/dev/null 2>&1
+    assert_contains "$(cat "${STATE_FILE}" 2>/dev/null)" "pid=${SUCCESSOR_PID}" \
+        "the successor stays supervised"
+    [[ -f "${LOCK_FILE}" ]] || fail "the successor's lock file is kept"
+    return 0
+}
+
+test_run_cleanup_keeps_another_runs_state() {
+    load_run_library
+    PUBLISHED_RUN_STATE=$'phase=checking\nstart=1\nstart_uptime=1\npid=111'
+    printf 'phase=updating\nstart=2\nstart_uptime=2\npid=222\n' > "${STATE_FILE}"
+    ( cleanup ) >/dev/null 2>&1
+    assert_contains "$(cat "${STATE_FILE}" 2>/dev/null)" "pid=222" "only this run's state is removed"
+}
+
 test_watchdog_scheduled_reboot_keeps_runs_blocked() {
     sleep 60 &
     local background_pid=$! exit_code=0
@@ -2352,6 +2407,14 @@ test_invariant_flock_uses_documented_short_options() {
     return 0
 }
 
+test_invariant_state_file_written_only_by_rename() {
+    script_lines '> "\$\{STATE_FILE\}"|rm -f "\$\{STATE_FILE\}"' | grep -v '/run-state.sh:' | grep -q . \
+        && fail "the state file is written or removed outside run-state.sh"
+    grep -qx 'f /run/dnf-automatic-reboot.state.lock 0600 root root -' "${REPO_ROOT}/tmpfiles/dnf-automatic-reboot.conf" \
+        || fail "tmpfiles.d must create the state lock 0600 root"
+    return 0
+}
+
 test_invariant_every_script_is_shipped() {
     local script_path script_name
     for script_path in "${REPO_ROOT}"/scripts/*.sh; do
@@ -3084,6 +3147,10 @@ run_test "watchdog: replaced run is not killed"      test_watchdog_replaced_run_
 run_test "watchdog: failed kill keeps supervision"   test_watchdog_failed_kill_keeps_supervision
 run_test "watchdog: unconfirmed kill signals no pid" test_watchdog_unconfirmed_kill_signals_no_pid
 run_test "watchdog: no run starts during the kill"   test_watchdog_no_run_starts_during_the_kill
+run_test "state: published by rename"                test_state_is_published_by_rename
+run_test "state: removal keeps a changed file"       test_state_removal_keeps_a_changed_file
+run_test "watchdog: dead run cleanup keeps a successor" test_watchdog_dead_run_cleanup_keeps_a_successor
+run_test "run: cleanup keeps another run's state"    test_run_cleanup_keeps_another_runs_state
 run_test "watchdog: scheduled reboot keeps runs blocked" test_watchdog_scheduled_reboot_keeps_runs_blocked
 run_test "watchdog: recovery without reboot allows runs" test_watchdog_recovery_without_reboot_allows_runs_again
 run_test "watchdog: failed schedule allows runs again" test_watchdog_failed_schedule_allows_runs_again
@@ -3128,6 +3195,7 @@ run_test "invariant: marker removers are known"     test_invariant_marker_remove
 run_test "invariant: dispatched file removed only on refusal" test_invariant_dispatched_file_is_removed_only_on_refusal
 run_test "invariant: lock file is never removed"    test_invariant_lock_file_is_never_removed
 run_test "invariant: flock uses documented short options" test_invariant_flock_uses_documented_short_options
+run_test "invariant: state file written only by rename" test_invariant_state_file_written_only_by_rename
 run_test "invariant: every script is shipped"       test_invariant_every_script_is_shipped
 run_test "invariant: versions agree"                test_invariant_versions_agree
 run_test "reader: unit snapshot job forms"          test_reader_unit_snapshot_job_forms

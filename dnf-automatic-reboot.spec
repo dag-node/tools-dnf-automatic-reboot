@@ -91,6 +91,7 @@ install -m 0750 scripts/notify-failure.sh %{buildroot}%{pkglibexecdir}/notify-fa
 install -m 0750 scripts/cancel-reboot.sh  %{buildroot}%{pkglibexecdir}/cancel-reboot.sh
 install -m 0750 scripts/reboot-if-pending.sh %{buildroot}%{pkglibexecdir}/reboot-if-pending.sh
 install -m 0640 scripts/reboot-request.sh %{buildroot}%{pkglibexecdir}/reboot-request.sh
+install -m 0640 scripts/run-state.sh      %{buildroot}%{pkglibexecdir}/run-state.sh
 
 # systemd units
 install -d -m 0755 %{buildroot}%{_unitdir}
@@ -433,6 +434,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 # Sourced by run.sh, watchdog.sh, cancel-reboot.sh and reboot-if-pending.sh;
 # never executed.
 %attr(0640, root, root) %{pkglibexecdir}/reboot-request.sh
+# Sourced by run.sh and watchdog.sh; never executed.
+%attr(0640, root, root) %{pkglibexecdir}/run-state.sh
 
 # systemd units
 %{_unitdir}/dnf-automatic-reboot.service
@@ -499,6 +502,11 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 - FIX: The kernel reboot attempt count is cleared once the target kernel runs, also on a host
   with a correct clock. There needs-restarting stops flagging the kernel after the reboot, and
   the count stayed until the next kernel update replaced it.
+- FIX: The watchdog no longer removes the state file of a run it did not inspect. run.sh wrote the
+  file in place, and a watchdog reading it at that moment found it empty and deleted it as
+  malformed; cleanup after a dead run could delete the state of the run that started next. Either
+  left that run unsupervised. The file is now published by rename and removed, under a lock,
+  only while it holds what the watchdog read.
 - FIX: Restart-state learning no longer drops a package that the build-id check found running
   stale code, or could not verify. A systemd flag with a stale daemon could be recorded as a
   confirmed false positive and the reboot skipped.

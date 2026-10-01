@@ -55,6 +55,9 @@ readonly SCRIPT_NAME=run
 # REBOOT_PENDING_FILE, the request lock, and request_reboot.
 # shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/reboot-request.sh"
+# write_run_state and remove_run_state_if_unchanged.
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/run-state.sh"
 SERVICE_PID=$$
 
 # ---------------------------------------------------------------------------
@@ -241,15 +244,21 @@ PENDING_SERVICE_NAMES=()
 EXCLUDED_SERVICE_NAMES=()
 SERVICE_RESTART_SUMMARY="stale services not checked"
 SCHEDULED_REBOOT_SUMMARY=""
+# The state file content this run last published; empty before the first.
+PUBLISHED_RUN_STATE=""
 
 # ---------------------------------------------------------------------------
 # Cleanup handler - run by the EXIT trap
-# Removes state/lock files, and reports a reboot request cut short.
+# Removes this run's state file and the lock file, and reports a reboot
+# request cut short.  A state file another run has written since is kept.
 # ---------------------------------------------------------------------------
 cleanup() {
     local exit_code=$?
     report_interrupted_reboot_request
-    rm -f "${STATE_FILE}" "${LOCK_FILE}"
+    if [[ -n "${PUBLISHED_RUN_STATE}" ]]; then
+        remove_run_state_if_unchanged "${PUBLISHED_RUN_STATE}" || true
+    fi
+    rm -f "${LOCK_FILE}"
     log "Exiting rc=${exit_code}"
     exit "${exit_code}"
 }
@@ -257,11 +266,14 @@ cleanup() {
 # ---------------------------------------------------------------------------
 # State file writer
 # ---------------------------------------------------------------------------
+# write_state PHASE - publishes the state file through write_run_state.
+# Returns 1 when it could not, and the previous file stays.
 write_state() {
-    local run_phase="$1"
-    printf 'phase=%s\nstart=%s\nstart_uptime=%s\npid=%s\n' \
-        "${run_phase}" "${START_TIMESTAMP}" "${START_UPTIME_SECONDS}" "${SERVICE_PID}" \
-        > "${STATE_FILE}"
+    local run_phase="$1" state_content
+    state_content=$(printf 'phase=%s\nstart=%s\nstart_uptime=%s\npid=%s\n' \
+        "${run_phase}" "${START_TIMESTAMP}" "${START_UPTIME_SECONDS}" "${SERVICE_PID}")
+    write_run_state "${state_content}" || return 1
+    PUBLISHED_RUN_STATE="${state_content}"
 }
 
 # uptime_seconds -> whole seconds since boot, empty when unreadable.
@@ -555,7 +567,10 @@ main() {
                  "will wait for the dnf lock. Do not reboot manually until this completes."
     fi
 
-    write_state "updating"
+    if ! write_state "updating"; then
+        log_error "cannot publish ${STATE_FILE} - the watchdog could not supervise this run, not updating"
+        exit 1
+    fi
 
     wall_msg "dnf-automatic-reboot: Starting automatic updates. Reboot is inhibited until they complete."
     log "Running dnf-automatic under the inhibitor lock (timeout=${DNF_TIMEOUT_MIN}m kill_grace=${KILL_GRACE_SEC}s)"
@@ -570,7 +585,9 @@ main() {
 
     log "dnf-automatic completed successfully"
     warn_on_unapplied_security_advisories
-    write_state "checking"
+    # Still supervised when this fails: the file keeps phase=updating, which
+    # the watchdog treats the more cautiously of the two.
+    write_state "checking" || log_warning "cannot publish phase=checking to ${STATE_FILE}; it still reads phase=updating"
 
     # Decide whether a reboot is required.  Exit 0 = no reboot, 1 = reboot
     # needed; 2 = undecidable, and any other status is a helper failure.
