@@ -16,8 +16,11 @@ Wants=network-online.target
 Requires=time-sync.target
 # Prevent a second instance starting if one is already running.
 ConditionPathExists=!/run/dnf-automatic-reboot.lock
+# The watchdog holds this file while it checks and kills a stuck run, so no
+# new run can start in between and be killed in its place.
+ConditionPathExists=!/run/dnf-automatic-reboot.recovery
 # A failed run is otherwise visible only in the journal; %n names the unit.
-OnFailure=dnf-automatic-reboot-failure@%n.service
+OnFailure=dnf-automatic-reboot-notify@%n.service
 
 [Service]
 Type=oneshot

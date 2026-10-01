@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # notify-failure.sh
 # ---------------------------------------------------------------------------
 # Failure notifier, started by OnFailure= from the service units.
@@ -9,7 +10,7 @@
 # no operator-facing signal at all.
 #
 # Argument 1 is the name of the unit that failed, passed as %I from the
-# templated dnf-automatic-reboot-failure@.service.
+# templated dnf-automatic-reboot-notify@.service.
 #
 # Configuration: /etc/dnf/automatic-reboot.conf
 # Log:           /var/log/dnf-automatic-reboot.log
@@ -31,8 +32,9 @@ log_err() {
 
 wall_msg() {
     local wall_messages_enabled
+    # A trailing comment is not part of the value: `wall_messages = no  # quiet`.
     wall_messages_enabled=$(grep -E "^\s*wall_messages\s*=" "${CONFIG_FILE}" 2>/dev/null \
-                            | tail -1 | sed 's/^[^=]*=\s*//' | tr -d ' ') || true
+                            | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' | tr -d ' ') || true
     [[ "${wall_messages_enabled:-yes}" == "no" ]] && return 0
     wall "$*" 2>/dev/null || true
 }

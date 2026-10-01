@@ -3,12 +3,22 @@ Description=dnf-automatic-reboot watchdog check
 Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
 # Intentionally has no After= dependency on the main service so it runs
 # independently even when the main service is hung.
-OnFailure=dnf-automatic-reboot-failure@%n.service
+OnFailure=dnf-automatic-reboot-notify@%n.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/libexec/dnf-automatic-reboot/watchdog.sh
 RemainAfterExit=no
+# A oneshot has no start timeout by default.  A watchdog that hangs never
+# exits, so the timer cannot start the next cycle and the hard timeout is
+# never reached.  watchdog.sh bounds its own reboot check to less than this
+# at the default needs_restarting_timeout_sec.
+TimeoutStartSec=15min
+# watchdog.sh removes its recovery file itself, and keeps it after success
+# only while the reboot it requested is pending.  This covers a watchdog that
+# failed or was stopped at the timeout, which would otherwise keep the main
+# unit from starting until the next boot.  $$ leaves the variable to sh.
+ExecStopPost=/usr/bin/sh -c 'if [ "$$SERVICE_RESULT" != success ]; then rm -f /run/dnf-automatic-reboot.recovery; fi'
 # needs-restarting output is translated; the parsers match C strings.
 Environment=LC_ALL=C
 StandardOutput=journal

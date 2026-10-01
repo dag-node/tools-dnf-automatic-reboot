@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # needs-reboot.sh
 # ---------------------------------------------------------------------------
 # Determines whether a reboot is required after package updates.
@@ -47,7 +48,8 @@ readonly STATE_DIRECTORY="${TEST_ROOT}/var/lib/dnf-automatic-reboot"
 readonly RESTART_STATE_FILE="${STATE_DIRECTORY}/restart-state"
 readonly KERNEL_REBOOT_ATTEMPT_FILE="${STATE_DIRECTORY}/kernel-reboot-attempts"
 readonly STATE_LOCK_FILE="${STATE_DIRECTORY}/.state.lock"
-readonly BOOT_ID_FILE="${TEST_ROOT}/proc/sys/kernel/random/boot_id"
+readonly PROC_DIRECTORY="${TEST_ROOT}/proc"
+readonly BOOT_ID_FILE="${PROC_DIRECTORY}/sys/kernel/random/boot_id"
 readonly DNF_BIN="${TEST_ROOT}/usr/bin/dnf"
 
 # ---------------------------------------------------------------------------
@@ -138,10 +140,20 @@ read_kernel_reboot_attempts() {
         "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || printf '0'
 }
 
-# write_kernel_reboot_attempts PACKAGE_NAME TARGET_VERSION ATTEMPT_COUNT
+# read_kernel_reboot_attempt_boot_id PACKAGE_NAME TARGET_VERSION
+# Prints the boot_id of the boot that counted the last attempt, empty when
+# none is recorded.
+read_kernel_reboot_attempt_boot_id() {
+    local package_name="$1" target_version="$2"
+    awk -F'\t' -v name="${package_name}" -v target="${target_version}" \
+        '$1 == name && $2 == target { boot_id = $4 } END { print boot_id }' \
+        "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || true
+}
+
+# write_kernel_reboot_attempts PACKAGE_NAME TARGET_VERSION ATTEMPT_COUNT [BOOT_ID]
 # An ATTEMPT_COUNT of 0 clears the package's row.
 write_kernel_reboot_attempts() {
-    local package_name="$1" target_version="$2" attempt_count="$3"
+    local package_name="$1" target_version="$2" attempt_count="$3" boot_id="${4:-}"
     mkdir -p "${STATE_DIRECTORY}" 2>/dev/null || true
     (
         flock -w 10 9 || exit 0
@@ -153,7 +165,7 @@ write_kernel_reboot_attempts() {
         {
             awk -F'\t' -v name="${package_name}" '$1 != name' "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || true
             if [[ "${attempt_count}" -gt 0 ]]; then
-                printf '%s\t%s\t%s\n' "${package_name}" "${target_version}" "${attempt_count}"
+                printf '%s\t%s\t%s\t%s\n' "${package_name}" "${target_version}" "${attempt_count}" "${boot_id}"
             fi
         } > "${temporary_file}" 2>/dev/null || { rm -f "${temporary_file}"; exit 0; }
         chmod 0640 "${temporary_file}" 2>/dev/null || true
@@ -204,28 +216,31 @@ parse_flagged_package_names() {
 # ---------------------------------------------------------------------------
 # Process/binary ownership map, built once and only when needed.
 #
-# Deduplicating /proc/*/exe targets before querying rpm keeps this to one
-# rpm -qf per distinct binary instead of one per process.
+# Every PID is kept per binary: one binary can run as several processes on
+# different images - PID 1 re-execs onto the new systemd while each
+# `systemd --user` manager keeps the old one - so a single sample per binary
+# can clear a package that still has stale code resident.  Only the rpm
+# query is deduplicated, to one `rpm -qf` per distinct binary.
 # ---------------------------------------------------------------------------
 # -g so the arrays stay script-global even when this file is sourced from
 # inside a function, as tests/run-tests.sh does.
-declare -gA PROCESS_BINARY_TO_PID=()
+# PROCESS_BINARY_TO_PIDS values are newline-separated PID lists.
+declare -gA PROCESS_BINARY_TO_PIDS=()
 declare -gA PROCESS_BINARY_TO_PACKAGE=()
 PROCESS_MAP_BUILT=0
 
 build_process_binary_map() {
     [[ "${PROCESS_MAP_BUILT}" -eq 1 ]] && return 0
     local process_exe_link process_id binary_path owning_package_name
-    for process_exe_link in /proc/[0-9]*/exe; do
-        process_id="${process_exe_link#/proc/}"
+    for process_exe_link in "${PROC_DIRECTORY}"/[0-9]*/exe; do
+        process_id="${process_exe_link#"${PROC_DIRECTORY}/"}"
         process_id="${process_id%/exe}"
         binary_path=$(readlink "${process_exe_link}" 2>/dev/null) || continue
         binary_path="${binary_path% (deleted)}"
         [[ -f "${binary_path}" ]] || continue
-        [[ -n "${PROCESS_BINARY_TO_PID[${binary_path}]:-}" ]] && continue
-        PROCESS_BINARY_TO_PID["${binary_path}"]="${process_id}"
+        PROCESS_BINARY_TO_PIDS["${binary_path}"]+="${process_id}"$'\n'
     done
-    for binary_path in "${!PROCESS_BINARY_TO_PID[@]}"; do
+    for binary_path in "${!PROCESS_BINARY_TO_PIDS[@]}"; do
         owning_package_name=$(rpm -qf "${binary_path}" --qf '%{NAME}' 2>/dev/null) || owning_package_name=""
         PROCESS_BINARY_TO_PACKAGE["${binary_path}"]="${owning_package_name}"
     done
@@ -241,39 +256,71 @@ build_process_binary_map() {
 # while journald, udevd and logind can still be running the old image.
 #
 # Returns: 0 = false positive confirmed  1 = cannot verify  2 = genuine update
+# A process whose build-id cannot be read while it still runs the binary is
+# "cannot verify", whatever the other processes show.
 # ---------------------------------------------------------------------------
+
+# process_runs_binary PID BINARY_PATH
+# Returns: 0 = PID still runs BINARY_PATH, the replaced image included
+#          1 = PID has exited, is a zombie, or now runs another binary
+#          2 = PID exists but readlink fails on its executable link
+process_runs_binary() {
+    local process_id="$1" binary_path="$2" current_binary_path process_status=""
+    if current_binary_path=$(readlink "${PROC_DIRECTORY}/${process_id}/exe" 2>/dev/null); then
+        [[ "${current_binary_path% (deleted)}" == "${binary_path}" ]] || return 1
+        return 0
+    fi
+    [[ -d "${PROC_DIRECTORY}/${process_id}" ]] || return 1
+    # Field 3 of /proc/PID/stat, after the parenthesised command name.
+    process_status=$(cat "${PROC_DIRECTORY}/${process_id}/stat" 2>/dev/null) || return 2
+    process_status="${process_status##*) }"
+    [[ "${process_status%% *}" == "Z" ]] && return 1
+    return 2
+}
+
 verify_build_id() {
     local package_name="$1"
-    local binary_path process_id running_build_id on_disk_build_id
+    local binary_path process_id running_build_id on_disk_build_id process_runs_binary_result
     local verified_process_count=0 unreadable_build_id=0
 
     build_process_binary_map
 
     for binary_path in "${!PROCESS_BINARY_TO_PACKAGE[@]}"; do
         [[ "${PROCESS_BINARY_TO_PACKAGE[${binary_path}]}" == "${package_name}" ]] || continue
-        process_id="${PROCESS_BINARY_TO_PID[${binary_path}]}"
-        running_build_id=$(eu-readelf -n "/proc/${process_id}/exe" 2>/dev/null \
-                           | awk '/Build ID/ {print $NF}') || true
         on_disk_build_id=$(eu-readelf -n "${binary_path}" 2>/dev/null \
                            | awk '/Build ID/ {print $NF}') || true
-        if [[ -z "${running_build_id}" || -z "${on_disk_build_id}" ]]; then
-            log_warn "${package_name}: could not read build-ids for ${binary_path} (pid ${process_id})"
-            unreadable_build_id=1
-            continue
-        fi
-        verified_process_count=$(( verified_process_count + 1 ))
-        if [[ "${running_build_id}" != "${on_disk_build_id}" ]]; then
-            log "${package_name} genuine: build-id mismatch on ${binary_path} (pid ${process_id})"
-            return 2
-        fi
+        while IFS= read -r process_id; do
+            [[ -n "${process_id}" ]] || continue
+            running_build_id=$(eu-readelf -n "${PROC_DIRECTORY}/${process_id}/exe" 2>/dev/null \
+                               | awk '/Build ID/ {print $NF}') || true
+            if [[ -z "${running_build_id}" || -z "${on_disk_build_id}" ]]; then
+                # A process that exited after the /proc walk does not run any code.
+                # One still running on this binary blocks the verdict, even
+                # when every other process matches.
+                process_runs_binary_result=0
+                process_runs_binary "${process_id}" "${binary_path}" || process_runs_binary_result=$?
+                if [[ "${process_runs_binary_result}" -eq 1 ]]; then
+                    log "${package_name}: pid ${process_id} of ${binary_path} exited before its build-id was read"
+                    continue
+                fi
+                log_warn "${package_name}: could not read build-ids for ${binary_path} (pid ${process_id})"
+                unreadable_build_id=1
+                continue
+            fi
+            verified_process_count=$(( verified_process_count + 1 ))
+            if [[ "${running_build_id}" != "${on_disk_build_id}" ]]; then
+                log "${package_name} genuine: build-id mismatch on ${binary_path} (pid ${process_id})"
+                return 2
+            fi
+        done <<< "${PROCESS_BINARY_TO_PIDS[${binary_path}]:-}"
     done
 
+    if [[ "${unreadable_build_id}" -eq 1 ]]; then
+        log_warn "${package_name}: a running process could not be verified - keeping the package"
+        return 1
+    fi
     if [[ "${verified_process_count}" -eq 0 ]]; then
-        if [[ "${unreadable_build_id}" -eq 1 ]]; then
-            log_warn "${package_name}: no readable build-id for any running process"
-        else
-            log_warn "${package_name}: no running process owned by this package"
-        fi
+        log_warn "${package_name}: no running process owned by this package"
         return 1
     fi
 
@@ -325,7 +372,9 @@ grub_default_is_newest_kernel() {
     newest_kernel_version=$(newest_installed_kernel_version "${package_name}")
     [[ -n "${newest_kernel_version}" ]] || return 2
     grub_default_kernel_path=$(grubby --default-kernel 2>/dev/null) || return 2
-    [[ -n "${grub_default_kernel_path}" ]] || return 2
+    # grubby prints "/boot" and exits 0 when it cannot read grubenv.  Anything
+    # that is not a kernel image path is no reading at all, not a stale default.
+    [[ "${grub_default_kernel_path}" == /boot/vmlinuz-* ]] || return 2
     [[ "${grub_default_kernel_path}" == "/boot/vmlinuz-${newest_kernel_version}" ]]
 }
 
@@ -334,21 +383,39 @@ grub_default_is_newest_kernel() {
 #
 # Invoked through dnf so -C (cache only) can be passed: needs-restarting asks
 # for filelists metadata it does not use in -r mode, and dnf-automatic has
-# just populated the cache.  A cache miss falls back to a refreshing run
-# rather than being reported as a tool error.
+# just populated the cache.  A cache-only run without a plugin result falls
+# back to a refreshing run rather than being reported as a tool error.
 #
-# Sets NEEDS_RESTARTING_OUTPUT and returns needs-restarting's exit code.
+# Sets NEEDS_RESTARTING_OUTPUT and returns needs-restarting's exit code, or 2
+# when no temporary file for its stderr can be created.
 # ---------------------------------------------------------------------------
+
+# needs_restarting_gave_result EXIT_CODE - succeeds when EXIT_CODE and
+# NEEDS_RESTARTING_OUTPUT form a plugin result: 0, or 1 with at least one
+# package line.  dnf also exits 1 for errors it handles, such as a missing
+# cache, so exit 1 alone is no reboot requirement.
+needs_restarting_gave_result() {
+    local exit_code="$1"
+    [[ "${exit_code}" -eq 0 ]] && return 0
+    [[ "${exit_code}" -eq 1 ]] || return 1
+    [[ -n "$(printf '%s\n' "${NEEDS_RESTARTING_OUTPUT}" | parse_flagged_package_names)" ]]
+}
+
 run_needs_restarting() {
     local stderr_capture_file stderr_line exit_code=0
 
-    stderr_capture_file=$(mktemp) || stderr_capture_file=/dev/null
+    # No fallback path: this function removes the file when needs-restarting
+    # returns, and a fixed path such as /dev/null would be removed with it.
+    if ! stderr_capture_file=$(mktemp); then
+        log_err "cannot create a temporary file for needs-restarting stderr"
+        return 2
+    fi
 
     NEEDS_RESTARTING_OUTPUT=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
         "${DNF_BIN}" -q -C needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?
 
-    if [[ "${exit_code}" -gt 1 ]]; then
-        log_warn "cache-only needs-restarting exited ${exit_code} - retrying with a metadata refresh"
+    if ! needs_restarting_gave_result "${exit_code}"; then
+        log_warn "cache-only needs-restarting exited ${exit_code} without a result - retrying with a metadata refresh"
         exit_code=0
         NEEDS_RESTARTING_OUTPUT=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
             "${DNF_BIN}" -q needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?
@@ -376,7 +443,10 @@ run_needs_restarting() {
 classify_flagged_packages() {
     local flagged_package_name target_kernel_version
     local grub_default_check_result build_id_check_result kernel_reboot_attempts
+    local attempt_boot_id current_boot_id
     local build_id_verifier_available=1
+
+    current_boot_id=$(cat "${BOOT_ID_FILE}" 2>/dev/null) || current_boot_id=""
 
     if ! command -v eu-readelf >/dev/null 2>&1; then
         # elfutils is a hard dependency; if it is gone the build-id path cannot
@@ -419,16 +489,28 @@ classify_flagged_packages() {
                 fi
             fi
 
+            # One attempt per boot: every check in a boot that still runs the
+            # old kernel - by hand, from the watchdog, or a repeated run -
+            # belongs to the same attempt, so only reboots use the budget.
             if [[ "${KERNEL_REBOOT_ATTEMPT_LIMIT}" -gt 0 ]]; then
                 kernel_reboot_attempts=$(read_kernel_reboot_attempts \
                     "${flagged_package_name}" "${target_kernel_version}")
-                if [[ "${kernel_reboot_attempts}" -ge "${KERNEL_REBOOT_ATTEMPT_LIMIT}" ]]; then
-                    log_err "${flagged_package_name}: ${kernel_reboot_attempts} consecutive reboots already scheduled for ${target_kernel_version} without it becoming the running kernel - giving up, manual intervention required"
-                    REBOOT_WITHHELD=1
-                    continue
+                attempt_boot_id=$(read_kernel_reboot_attempt_boot_id \
+                    "${flagged_package_name}" "${target_kernel_version}")
+                if [[ -n "${current_boot_id}" && "${attempt_boot_id}" == "${current_boot_id}" ]]; then
+                    log "${flagged_package_name}: attempt ${kernel_reboot_attempts} of ${KERNEL_REBOOT_ATTEMPT_LIMIT} for ${target_kernel_version} is already counted in this boot"
+                else
+                    if [[ "${kernel_reboot_attempts}" -ge "${KERNEL_REBOOT_ATTEMPT_LIMIT}" ]]; then
+                        log_err "${flagged_package_name}: ${kernel_reboot_attempts} consecutive reboots for ${target_kernel_version} did not make it the running kernel - giving up, manual intervention required"
+                        REBOOT_WITHHELD=1
+                        continue
+                    fi
+                    if [[ -z "${current_boot_id}" ]]; then
+                        log_warn "could not read boot_id - counting this check as a reboot attempt"
+                    fi
+                    write_kernel_reboot_attempts "${flagged_package_name}" \
+                        "${target_kernel_version}" $(( kernel_reboot_attempts + 1 )) "${current_boot_id}"
                 fi
-                write_kernel_reboot_attempts "${flagged_package_name}" \
-                    "${target_kernel_version}" $(( kernel_reboot_attempts + 1 ))
             fi
 
             REBOOT_TRIGGER_PACKAGES+=("${flagged_package_name}")
@@ -547,21 +629,15 @@ main() {
         exit 0
     fi
 
-    if [[ "${needs_restarting_exit_code}" -gt 1 ]]; then
-        log_err "needs-restarting exited ${needs_restarting_exit_code} - cannot determine reboot state, not rebooting"
+    # Exit 1 without a package line is a dnf error, not the plugin's answer.
+    if ! needs_restarting_gave_result "${needs_restarting_exit_code}"; then
+        log_err "needs-restarting exited ${needs_restarting_exit_code} without naming a package - cannot determine reboot state, not rebooting"
         exit 2
     fi
 
     FLAGGED_PACKAGE_NAMES=()
     mapfile -t FLAGGED_PACKAGE_NAMES < <(printf '%s\n' "${NEEDS_RESTARTING_OUTPUT}" \
         | parse_flagged_package_names)
-
-    if [[ "${#FLAGGED_PACKAGE_NAMES[@]}" -eq 0 ]]; then
-        # needs-restarting said "reboot required" but named nothing we can
-        # parse.  Honour its exit code rather than discarding the signal.
-        log_err "needs-restarting reported a reboot requirement with no parseable package list - rebooting on its exit code"
-        exit 1
-    fi
 
     log "Packages flagged by needs-restarting: $(printf '%s,' "${FLAGGED_PACKAGE_NAMES[@]}" | sed 's/,$//')"
 

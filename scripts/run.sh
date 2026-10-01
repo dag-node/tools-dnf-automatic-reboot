@@ -1,24 +1,25 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # run.sh
 # ---------------------------------------------------------------------------
 # Main orchestration script for dnf-automatic-reboot.
 #
 # Sequence:
 #   1. Detect concurrent dnf processes and warn via wall(1).
-#   2. Acquire a systemd inhibitor lock so shutdown/reboot is blocked
-#      for the duration of the update.
-#   3. Write a state file consumed by watchdog.sh.
-#   4. Run dnf-automatic under a hard wall-clock timeout.
-#   5. On completion (or timeout), call needs-reboot.sh to decide whether
-#      a reboot is required, filtering known false positives.
-#   6. Release the inhibitor lock.
-#   7. Schedule a reboot if needed; otherwise restart the services whose
+#   2. Write a state file consumed by watchdog.sh.
+#   3. Run dnf-automatic under a hard wall-clock timeout, as the child of a
+#      systemd inhibitor lock that blocks shutdown and reboot until it exits.
+#   4. Call needs-reboot.sh to decide whether a reboot is required,
+#      filtering known false positives.
+#   5. Schedule a reboot if needed; otherwise restart the services whose
 #      running processes still map pre-update files.
 #
 # State file /run/dnf-automatic-reboot.state
-#   phase=  updating | checking | failed
-#   start=  unix timestamp
-#   pid=    PID of this script
+#   phase=         updating | checking
+#   start=         unix timestamp, for operators
+#   start_uptime=  seconds since boot; the watchdog times the run from this
+#                  because a host with no RTC steps its wall clock mid-run
+#   pid=           PID of this script
 #
 # Sourcing this file defines its functions without running the update, so
 # tests/run-tests.sh can exercise them directly.
@@ -41,15 +42,16 @@ readonly DNF_CONFIG_FILE="${TEST_ROOT}/etc/dnf/dnf.conf"
 readonly REPOSITORY_CONFIG_DIRECTORY="${TEST_ROOT}/etc/yum.repos.d"
 readonly STATE_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.state"
 readonly LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.lock"
+readonly UPTIME_FILE="${TEST_ROOT}/proc/uptime"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
 readonly DNF_BIN="${TEST_ROOT}/usr/bin/dnf"
 readonly DNF_AUTOMATIC_BIN="${TEST_ROOT}/usr/bin/dnf-automatic"
 readonly SYSTEMD_RUN_BIN="${TEST_ROOT}/usr/bin/systemd-run"
 readonly SYSTEMCTL_BIN="${TEST_ROOT}/usr/bin/systemctl"
-readonly SLEEP_BIN="${TEST_ROOT}/usr/bin/sleep"
 readonly SCRIPT_NAME=run
-INHIBITOR_PID=0
+# Transient unit that carries a scheduled reboot; the watchdog uses the same.
+readonly SCHEDULED_REBOOT_UNIT=dnf-automatic-reboot-scheduled-reboot
 SERVICE_PID=$$
 
 # ---------------------------------------------------------------------------
@@ -70,8 +72,8 @@ log_err() {
 
 wall_msg() {
     local wall_messages_enabled
-    wall_messages_enabled=$(grep -E "^\s*wall_messages\s*=" "${CONFIG_FILE}" 2>/dev/null \
-                            | tail -1 | sed 's/^[^=]*=\s*//' | tr -d ' ') || true
+    wall_messages_enabled=$(conf_get wall_messages yes)
+    wall_messages_enabled="${wall_messages_enabled//[[:space:]]/}"
     [[ "${wall_messages_enabled:-yes}" == "no" ]] && return 0
     wall "$*" 2>/dev/null || true
 }
@@ -155,10 +157,15 @@ warn_on_unsigned_repositories() {
 }
 
 # ---------------------------------------------------------------------------
-# Pre-flight: abort if conflicting services would cause double-reboots
+# Pre-flight: abort if conflicting services would cause double-reboots, or if
+# dnf-automatic would not install anything.
+#
+# Repeats the %pre checks on /etc/dnf/automatic.conf at every start, so an
+# edit made after install fails the run through OnFailure= instead of
+# producing silent successes.  The file is the operator's and is only read.
 # ---------------------------------------------------------------------------
 check_conflicts() {
-    local conflict_found=0 conflicting_timer automatic_reboot_value
+    local conflict_found=0 conflicting_timer automatic_reboot_value apply_updates_value
 
     for conflicting_timer in dnf-automatic.timer dnf-automatic-install.timer; do
         if systemctl is-enabled --quiet "${conflicting_timer}" 2>/dev/null || \
@@ -178,6 +185,19 @@ check_conflicts() {
         fi
     fi
 
+    # dnf-automatic defaults apply_updates to false and then exits 0 after
+    # downloading.  True values are those libdnf's OptionBool accepts.
+    apply_updates_value=$(grep -E '^\s*apply_updates\s*=' "${AUTOMATIC_CONFIG_FILE}" 2>/dev/null \
+                          | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
+                          | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]') || true
+    case "${apply_updates_value}" in
+        yes|true|1|on) ;;
+        *)
+            log_err "/etc/dnf/automatic.conf has apply_updates = ${apply_updates_value:-<unset>}; dnf-automatic would download updates without installing them; set 'apply_updates = yes'"
+            conflict_found=1
+            ;;
+    esac
+
     if [[ "${conflict_found}" -ne 0 ]]; then
         log_err "Aborting: resolve the conflicts above, then restart the service"
         exit 1
@@ -195,19 +215,24 @@ WARN_UNSIGNED_REPOSITORIES=$(conf_get warn_unsigned_repositories yes)
 WARN_UNAPPLIED_ADVISORIES=$(conf_get warn_unapplied_advisories yes)
 RESTART_SERVICES=$(conf_get restart_services yes)
 RESTART_SERVICES_EXCLUDE=$(conf_get restart_services_exclude \
-    "dbus.service,dbus-broker.service,systemd-logind.service,dnf-automatic-reboot.service,dnf-automatic-watchdog.service")
+    "dbus.service,dbus-broker.service,systemd-logind.service,user@*.service,getty@*.service,serial-getty@*.service,autovt@*.service,dnf-automatic-reboot.service,dnf-automatic-watchdog.service")
 NEEDS_RESTARTING_TIMEOUT_SEC=$(conf_get_int needs_restarting_timeout_sec 120)
+RESTART_SERVICE_TIMEOUT_SEC=$(conf_get_int restart_service_timeout_sec 300)
+
+# Outcome of restart_stale_services, read by report_completion.
+RESTARTED_SERVICE_NAMES=()
+FAILED_SERVICE_NAMES=()
+PENDING_SERVICE_NAMES=()
+EXCLUDED_SERVICE_NAMES=()
+SERVICE_RESTART_SUMMARY="stale services not checked"
+SCHEDULED_REBOOT_SUMMARY=""
 
 # ---------------------------------------------------------------------------
-# Cleanup handler - always runs on exit
-# Releases inhibitor lock and removes state/lock files.
+# Cleanup handler - run by the EXIT trap
+# Removes state/lock files.
 # ---------------------------------------------------------------------------
 cleanup() {
     local exit_code=$?
-    if [[ "${INHIBITOR_PID}" -gt 0 ]]; then
-        kill "${INHIBITOR_PID}" 2>/dev/null || true
-        wait "${INHIBITOR_PID}" 2>/dev/null || true
-    fi
     rm -f "${STATE_FILE}" "${LOCK_FILE}"
     log "Exiting rc=${exit_code}"
     exit "${exit_code}"
@@ -218,8 +243,17 @@ cleanup() {
 # ---------------------------------------------------------------------------
 write_state() {
     local run_phase="$1"
-    printf 'phase=%s\nstart=%s\npid=%s\n' "${run_phase}" "${START_TIMESTAMP}" "${SERVICE_PID}" \
+    printf 'phase=%s\nstart=%s\nstart_uptime=%s\npid=%s\n' \
+        "${run_phase}" "${START_TIMESTAMP}" "${START_UPTIME_SECONDS}" "${SERVICE_PID}" \
         > "${STATE_FILE}"
+}
+
+# uptime_seconds -> whole seconds since boot, empty when unreadable.
+# CLOCK_BOOTTIME, which chrony stepping the wall clock does not move.
+uptime_seconds() {
+    local uptime_value=""
+    read -r uptime_value _ < "${UPTIME_FILE}" 2>/dev/null || true
+    printf '%s' "${uptime_value%%.*}"
 }
 
 # ---------------------------------------------------------------------------
@@ -233,25 +267,54 @@ write_state() {
 #
 # Only reached when no reboot is scheduled - a reboot supersedes it.
 # ---------------------------------------------------------------------------
+# is_excluded_unit UNIT_NAME - succeeds when UNIT_NAME matches an entry of
+# restart_services_exclude.  An entry is a unit name or a bash glob such as
+# user@*.service, which covers every instance of a template unit.
+is_excluded_unit() {
+    local unit_name="$1" excluded_unit_pattern previous_ifs
+    local excluded_unit_patterns=()
+    previous_ifs="${IFS}"
+    IFS=',' read -ra excluded_unit_patterns <<< "${RESTART_SERVICES_EXCLUDE}"
+    IFS="${previous_ifs}"
+    for excluded_unit_pattern in "${excluded_unit_patterns[@]:-}"; do
+        excluded_unit_pattern="${excluded_unit_pattern//[[:space:]]/}"
+        [[ -n "${excluded_unit_pattern}" ]] || continue
+        # shellcheck disable=SC2053  # the entry is a glob by design
+        if [[ "${unit_name}" == ${excluded_unit_pattern} ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# restart_stale_services
+# Sets SERVICE_RESTART_SUMMARY to one clause naming every outcome, and the
+# RESTARTED_, FAILED_, PENDING_ and EXCLUDED_SERVICE_NAMES arrays.  Returns 1
+# when a restart failed or had not finished within restart_service_timeout_sec,
+# or when `dnf needs-restarting -s` failed to list the services: each leaves
+# pre-update code running that the run was meant to replace.  Excluded units
+# are left running by design and do not fail the run.
 restart_stale_services() {
-    local stale_service_output stale_service_name excluded_unit_name
-    local restarted_service_names=() skipped_service_names=()
-    local previous_ifs excluded_unit_names
+    local stale_service_output stale_service_name restart_exit_code
+    local summary_clauses=()
+    RESTARTED_SERVICE_NAMES=()
+    FAILED_SERVICE_NAMES=()
+    PENDING_SERVICE_NAMES=()
+    EXCLUDED_SERVICE_NAMES=()
+    SERVICE_RESTART_SUMMARY=""
 
     if [[ "${RESTART_SERVICES}" != "yes" ]]; then
         log "restart_services=no - not restarting stale services"
+        SERVICE_RESTART_SUMMARY="stale services not checked (restart_services = no)"
         return 0
     fi
-
-    previous_ifs="${IFS}"
-    IFS=',' read -ra excluded_unit_names <<< "${RESTART_SERVICES_EXCLUDE}"
-    IFS="${previous_ifs}"
 
     stale_service_output=""
     if ! stale_service_output=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
             "${DNF_BIN}" -q -C needs-restarting -s 2>/dev/null); then
-        log_warn "needs-restarting -s failed - stale services not restarted this run"
-        return 0
+        log_err "needs-restarting -s failed - stale services not restarted this run"
+        SERVICE_RESTART_SUMMARY="stale services could not be listed (needs-restarting -s failed)"
+        return 1
     fi
 
     while IFS= read -r stale_service_name; do
@@ -259,33 +322,59 @@ restart_stale_services() {
         [[ -n "${stale_service_name}" ]] || continue
         [[ "${stale_service_name}" == *.service ]] || continue
 
-        for excluded_unit_name in "${excluded_unit_names[@]:-}"; do
-            excluded_unit_name="${excluded_unit_name//[[:space:]]/}"
-            if [[ -n "${excluded_unit_name}" && "${excluded_unit_name}" == "${stale_service_name}" ]]; then
-                skipped_service_names+=("${stale_service_name}")
-                continue 2
-            fi
-        done
+        if is_excluded_unit "${stale_service_name}"; then
+            EXCLUDED_SERVICE_NAMES+=("${stale_service_name}")
+            continue
+        fi
 
-        if "${SYSTEMCTL_BIN}" try-restart "${stale_service_name}" 2>/dev/null; then
-            restarted_service_names+=("${stale_service_name}")
+        # Bounded: a unit that hangs in stop or start must not hold the run.
+        # Stopping the systemctl client leaves the restart job to systemd.
+        restart_exit_code=0
+        timeout "${RESTART_SERVICE_TIMEOUT_SEC}s" \
+            "${SYSTEMCTL_BIN}" try-restart "${stale_service_name}" 2>/dev/null \
+            || restart_exit_code=$?
+        if [[ "${restart_exit_code}" -eq 0 ]]; then
+            RESTARTED_SERVICE_NAMES+=("${stale_service_name}")
+        elif [[ "${restart_exit_code}" -eq 124 ]]; then
+            PENDING_SERVICE_NAMES+=("${stale_service_name}")
+            log_warn "restart of ${stale_service_name} did not finish within ${RESTART_SERVICE_TIMEOUT_SEC}s - the job continues in systemd"
         else
+            FAILED_SERVICE_NAMES+=("${stale_service_name}")
             log_warn "failed to restart ${stale_service_name} - it is still running pre-update code"
         fi
     done <<< "${stale_service_output}"
 
-    if [[ "${#restarted_service_names[@]}" -gt 0 ]]; then
-        log "Restarted stale services: $(printf '%s,' "${restarted_service_names[@]}" | sed 's/,$//')"
-        wall_msg "dnf-automatic-reboot: restarted updated services:" \
-                 "$(printf '%s ' "${restarted_service_names[@]}")"
-    else
-        log "No stale services needed restarting"
+    if [[ "${#RESTARTED_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        summary_clauses+=("restarted $(join_with ', ' "${RESTARTED_SERVICE_NAMES[@]}")")
     fi
+    if [[ "${#FAILED_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        summary_clauses+=("restart FAILED for $(join_with ', ' "${FAILED_SERVICE_NAMES[@]}")")
+    fi
+    if [[ "${#PENDING_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        summary_clauses+=("restart still pending for $(join_with ', ' "${PENDING_SERVICE_NAMES[@]}")")
+    fi
+    if [[ "${#EXCLUDED_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        summary_clauses+=("excluded from restart, still on pre-update code: $(join_with ', ' "${EXCLUDED_SERVICE_NAMES[@]}")")
+    fi
+    if [[ "${#summary_clauses[@]}" -eq 0 ]]; then
+        summary_clauses=("no service needed a restart")
+    fi
+    SERVICE_RESTART_SUMMARY=$(join_with '; ' "${summary_clauses[@]}")
 
-    if [[ "${#skipped_service_names[@]}" -gt 0 ]]; then
-        log_warn "Excluded from automatic restart, still running pre-update code: $(printf '%s,' "${skipped_service_names[@]}" | sed 's/,$//')"
+    if [[ "${#FAILED_SERVICE_NAMES[@]}" -gt 0 || "${#PENDING_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        return 1
     fi
     return 0
+}
+
+# join_with SEPARATOR ITEM... -> the items joined with SEPARATOR
+join_with() {
+    local separator="$1" joined_items="" item
+    shift
+    for item in "$@"; do
+        joined_items+="${joined_items:+${separator}}${item}"
+    done
+    printf '%s' "${joined_items}"
 }
 
 # ---------------------------------------------------------------------------
@@ -307,11 +396,14 @@ warn_on_unapplied_security_advisories() {
 
     [[ "${WARN_UNAPPLIED_ADVISORIES}" == "yes" ]] || return 0
 
-    # Advisory IDs are matched by shape (PREFIX-YEAR-NUMBER), not by excluding
-    # header text, so nothing unexpected in the output becomes an "advisory".
+    # Advisory IDs are matched by shape, PREFIX-YEAR-NUMBER or PREFIX-YEAR:NUMBER
+    # with an optional `-REVISION`, the prefix one or more dash-joined words and
+    # the number alphanumeric (Oracle ELSA-2026-26533 and ELSA-2026-60226-0,
+    # Red Hat RHSA-2020:3011, EPEL FEDORA-EPEL-2024-bf31852fe0), not by excluding
+    # header text, so a line of any other shape is not reported as an advisory.
     pending_advisory_ids=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
         "${DNF_BIN}" -q -C updateinfo list --updates --security 2>/dev/null \
-        | awk 'NF >= 3 && $1 ~ /^[A-Za-z]+-[0-9]+-[0-9]+$/ { print $1 }' \
+        | awk 'NF >= 3 && $1 ~ /^[A-Za-z]+(-[A-Za-z]+)*-[0-9]+[-:][0-9A-Za-z]+(-[0-9]+)?$/ { print $1 }' \
         | sort -u | paste -sd, -) || true
 
     [[ -n "${pending_advisory_ids}" ]] || return 0
@@ -339,19 +431,65 @@ warn_on_unapplied_security_advisories() {
 }
 
 # ---------------------------------------------------------------------------
+# Run dnf-automatic under the inhibitor lock and a hard timeout.
+#
+# systemd-inhibit takes a block-mode shutdown:sleep lock from logind before it
+# starts its command, holds it for exactly as long as that command runs, and
+# exits non-zero without starting the command when the lock is refused.  No
+# update runs unprotected, and the lock is gone before any reboot is
+# scheduled.  An admin can still force-reboot with: systemctl reboot --force
+#
+# timeout sends SIGTERM at DNF_TIMEOUT_MIN minutes, then SIGKILL after
+# KILL_GRACE_SEC seconds; 124 = timed out.  Returns dnf-automatic's exit code,
+# or systemd-inhibit's when the lock was refused.
+# ---------------------------------------------------------------------------
+run_dnf_automatic_under_inhibitor() {
+    systemd-inhibit \
+        --what="shutdown:sleep" \
+        --who="dnf-automatic-reboot" \
+        --why="dnf-automatic update in progress - do not reboot" \
+        --mode="block" \
+        timeout --kill-after="${KILL_GRACE_SEC}s" "${DNF_TIMEOUT_MIN}m" "${DNF_AUTOMATIC_BIN}"
+}
+
+# run_reboot_check -> needs-reboot.sh's exit code.
+run_reboot_check() {
+    "${LIBRARY_DIRECTORY}/needs-reboot.sh"
+}
+
+# ---------------------------------------------------------------------------
 # Schedule a reboot through a transient systemd timer.
+#
+# Sets SCHEDULED_REBOOT_SUMMARY to the reboot time and the command that
+# cancels it.  An active timer of the same name is an already scheduled
+# reboot, from the watchdog or an earlier run, and is left as it is.
 # ---------------------------------------------------------------------------
 schedule_reboot() {
-    local systemd_run_exit_code=0
-    log "Scheduling reboot in ${REBOOT_DELAY_SEC}s"
-    wall_msg "dnf-automatic-reboot: Updates complete. System will reboot in ${REBOOT_DELAY_SEC} seconds."
+    local systemd_run_exit_code=0 reboot_time
+    reboot_time=$(date -d "@$(( $(date +%s) + REBOOT_DELAY_SEC ))" '+%F %T %Z')
+    SCHEDULED_REBOOT_SUMMARY="reboot scheduled for ${reboot_time}; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+    if "${SYSTEMCTL_BIN}" is-active --quiet "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null; then
+        SCHEDULED_REBOOT_SUMMARY="reboot already scheduled; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+        log "${SCHEDULED_REBOOT_UNIT}.timer is already active - not scheduling a second reboot"
+        return 0
+    fi
+    # A transient unit left failed by an earlier attempt in this boot keeps
+    # its name taken until reset.
+    "${SYSTEMCTL_BIN}" reset-failed "${SCHEDULED_REBOOT_UNIT}.service" "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null || true
+    log "scheduling reboot in ${REBOOT_DELAY_SEC}s"
+    wall_msg "dnf-automatic-reboot: Updates installed. System will reboot at ${reboot_time}." \
+             "Cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+    # A named unit an operator can find and stop; OnFailure= reports a reboot
+    # that systemctl could not start, such as one blocked by an inhibitor.
     "${SYSTEMD_RUN_BIN}" \
+        --unit="${SCHEDULED_REBOOT_UNIT}" \
         --on-active="${REBOOT_DELAY_SEC}" \
         --timer-property=AccuracySec=1s \
+        --property="OnFailure=dnf-automatic-reboot-notify@${SCHEDULED_REBOOT_UNIT}.service.service" \
         --description="dnf-automatic-reboot scheduled reboot" \
         "${SYSTEMCTL_BIN}" reboot || systemd_run_exit_code=$?
     if [[ "${systemd_run_exit_code}" -eq 0 ]]; then
-        log "Reboot dispatch confirmed: systemd-run accepted the transient timer"
+        log "Reboot dispatch confirmed: ${SCHEDULED_REBOOT_UNIT}.timer fires at ${reboot_time}; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
         return 0
     fi
     log_err "Reboot dispatch FAILED: systemd-run exited ${systemd_run_exit_code} - system will NOT reboot"
@@ -364,11 +502,12 @@ schedule_reboot() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
-    local dnf_automatic_exit_code=0 needs_reboot_exit_code=0
+    local dnf_automatic_exit_code=0 needs_reboot_exit_code=0 service_restart_exit_code=0
 
     trap cleanup EXIT
 
     START_TIMESTAMP=$(date +%s)
+    START_UPTIME_SECONDS=$(uptime_seconds)
     log "Starting (pid=${SERVICE_PID})"
     check_conflicts
     warn_on_unsigned_repositories
@@ -384,29 +523,12 @@ main() {
 
     write_state "updating"
 
-    # Acquire systemd inhibitor lock via background sleep.  The lock prevents
-    # systemctl reboot/poweroff until we release it.  An admin can still
-    # force-reboot with: systemctl reboot --force
-    systemd-inhibit \
-        --what="shutdown:sleep" \
-        --who="dnf-automatic-reboot" \
-        --why="dnf-automatic update in progress - do not reboot" \
-        --mode="block" \
-        "${SLEEP_BIN}" infinity &
-    INHIBITOR_PID=$!
-    log "Inhibitor lock acquired PID=${INHIBITOR_PID}"
-    wall_msg "dnf-automatic-reboot: Starting automatic updates. Reboot is inhibited until complete."
-
-    # Run dnf-automatic under a hard wall-clock timeout.  timeout sends
-    # SIGTERM at DNF_TIMEOUT_MIN minutes, then SIGKILL after KILL_GRACE_SEC
-    # seconds.  Exit code 124 = timed out.
-    log "Running dnf-automatic (timeout=${DNF_TIMEOUT_MIN}m kill_grace=${KILL_GRACE_SEC}s)"
-    timeout --kill-after="${KILL_GRACE_SEC}s" "${DNF_TIMEOUT_MIN}m" "${DNF_AUTOMATIC_BIN}" \
-        || dnf_automatic_exit_code=$?
+    wall_msg "dnf-automatic-reboot: Starting automatic updates. Reboot is inhibited until they complete."
+    log "Running dnf-automatic under the inhibitor lock (timeout=${DNF_TIMEOUT_MIN}m kill_grace=${KILL_GRACE_SEC}s)"
+    run_dnf_automatic_under_inhibitor || dnf_automatic_exit_code=$?
 
     if [[ "${dnf_automatic_exit_code}" -ne 0 ]]; then
-        log_err "dnf-automatic exited ${dnf_automatic_exit_code}"
-        write_state "failed"
+        log_err "dnf-automatic, or the inhibitor lock taken before it, exited ${dnf_automatic_exit_code}"
         wall_msg "dnf-automatic-reboot: Update FAILED (exit ${dnf_automatic_exit_code})." \
                  "Manual inspection required."
         exit 1
@@ -417,41 +539,59 @@ main() {
     write_state "checking"
 
     # Decide whether a reboot is required.  Exit 0 = no reboot, 1 = reboot
-    # needed, 2 = undecidable (no reboot, but the run is failed so the
-    # condition is surfaced rather than silently ignored).
-    "${LIBRARY_DIRECTORY}/needs-reboot.sh" || needs_reboot_exit_code=$?
+    # needed; 2 = undecidable, and any other status is a helper failure.
+    # Neither reboots, and both fail the run so the condition is surfaced
+    # rather than silently ignored.
+    run_reboot_check || needs_reboot_exit_code=$?
 
     if [[ "${ALWAYS_REBOOT}" == "yes" && "${needs_reboot_exit_code}" -eq 0 ]]; then
         log "always_reboot=yes in config - scheduling reboot regardless"
         needs_reboot_exit_code=1
     fi
 
-    # Release the inhibitor lock BEFORE scheduling the reboot: a block-mode
-    # inhibitor would prevent our own reboot call if still held.
-    kill "${INHIBITOR_PID}" 2>/dev/null || true
-    wait "${INHIBITOR_PID}" 2>/dev/null || true
-    INHIBITOR_PID=0
-
-    rm -f "${STATE_FILE}" "${LOCK_FILE}"
-    trap - EXIT   # prevent double-cleanup after this point
-
+    # The state file stays until cleanup at exit: restart_stale_services can
+    # block, and the watchdog supervises the run only while the file exists.
     case "${needs_reboot_exit_code}" in
+        0)
+            log "No reboot required"
+            restart_stale_services || service_restart_exit_code=$?
+            report_completion "no reboot needed" "${service_restart_exit_code}"
+            ;;
         1)
             schedule_reboot || exit 1
-            ;;
-        2)
-            log_err "Reboot state could not be established - not rebooting. Updates were applied; the host may still need a manual reboot."
-            wall_msg "dnf-automatic-reboot: ERROR - updates applied but the reboot decision could not be made." \
-                     "Manual inspection required."
-            restart_stale_services
-            exit 1
+            SERVICE_RESTART_SUMMARY="service restarts skipped, the reboot replaces them"
+            report_completion "${SCHEDULED_REBOOT_SUMMARY}" 0
             ;;
         *)
-            log "No reboot required"
-            restart_stale_services
-            wall_msg "dnf-automatic-reboot: Updates complete. No reboot required."
+            log_err "needs-reboot.sh exited ${needs_reboot_exit_code}: reboot state could not be established - not rebooting. Updates were applied; the host may still need a manual reboot."
+            restart_stale_services || true
+            report_completion "reboot state UNDECIDABLE (needs-reboot.sh exited ${needs_reboot_exit_code}), not rebooting" 1
             ;;
     esac
+}
+
+# report_completion REBOOT_OUTCOME FAILED
+# Logs and broadcasts one line naming the update, reboot and service-restart
+# outcome of the run, with the command to inspect what is incomplete.  A
+# non-zero FAILED logs it at error level and exits 1, so OnFailure= reports
+# it.
+report_completion() {
+    local reboot_outcome="$1" run_failed="$2" completion_summary inspected_unit_names=()
+    completion_summary="Updates installed; ${reboot_outcome}; ${SERVICE_RESTART_SUMMARY}"
+    if [[ "${run_failed}" -eq 0 ]]; then
+        log "${completion_summary}"
+        wall_msg "dnf-automatic-reboot: ${completion_summary}."
+        return 0
+    fi
+    inspected_unit_names=("${FAILED_SERVICE_NAMES[@]}" "${PENDING_SERVICE_NAMES[@]}")
+    if [[ "${#inspected_unit_names[@]}" -gt 0 ]]; then
+        completion_summary+=". Check: systemctl status $(join_with ' ' "${inspected_unit_names[@]}")"
+    else
+        completion_summary+=". Check: journalctl -u dnf-automatic-reboot.service -e"
+    fi
+    log_err "${completion_summary}"
+    wall_msg "dnf-automatic-reboot: ${completion_summary}"
+    exit 1
 }
 
 # Sourcing defines the functions above without running the update.

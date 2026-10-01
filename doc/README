@@ -1,11 +1,12 @@
 dnf-automatic-reboot
 ====================
 
-Unattended update + conditional reboot for Oracle Linux 9 / RHEL 9 (aarch64).
+Unattended update + conditional reboot for EL8 and EL9 (RHEL, Oracle Linux).
 Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
 
-  - Holds a systemd shutdown inhibitor while updates are in progress so an
-    accidental reboot does not corrupt a partial update.
+  - Runs dnf-automatic under a systemd shutdown inhibitor, so an accidental
+    reboot does not corrupt a partial update; when logind refuses the lock,
+    no update runs and the run fails.
   - Filters false-positive reboot triggers on positive evidence only: the
     running kernel already being the newest installed one, or matching ELF
     build-ids between a running daemon and its on-disk binary.  Anything
@@ -52,14 +53,9 @@ Files installed
   /usr/lib/systemd/system/dnf-automatic-watchdog.timer
       Watchdog service + 5-minute polling timer.
 
-  /usr/lib/systemd/system/dnf-automatic-reboot-failure@.service
+  /usr/lib/systemd/system/dnf-automatic-reboot-notify@.service
       Instantiated by OnFailure= with the failed unit name, so a failed run
       is never visible only to somebody who thinks to read the journal.
-
-  /usr/lib/systemd/system/grub-boot-success.service
-      UEK-only.  Runs grub2-set-bootflag boot_success each boot so GRUB's
-      indeterminate-boot fallback cannot revert saved_entry to an old kernel.
-      Enabled by %post on UEK hosts; inert elsewhere (ConditionKernelVersion).
 
   /usr/lib/tmpfiles.d/dnf-automatic-reboot.conf
       Creates the log file and state directory with the intended mode and
@@ -300,24 +296,21 @@ UEK kernel default (kernel not booted after update)
   saved_entry unless DEFAULTKERNEL and GRUB_UPDATE_DEFAULT_KERNEL are set, and
   neither is by default.
 
-  The RPM %post scriptlet fixes this once, at install time, on UEK hosts only
-  (it acts only when rpm -qf /lib/modules/$(uname -r)/vmlinuz is the package
-  named by kernel_default_package).  It is idempotent and never touches non-UEK
-  kernels.  After install no per-update action is needed: kernel-install then
-  advances saved_entry on every future kernel update on its own.
+  The installer does not change either setting.  It refuses a host where
+  kernel updates would not become the default, and names what to set:
+      /etc/default/grub:      GRUB_UPDATE_DEFAULT_KERNEL=true
+      /etc/sysconfig/kernel:  DEFAULTKERNEL=kernel-uek-core   (EL9; the running
+                              kernel's package on any other host)
+      grubby --set-default /boot/vmlinuz-<newest installed kernel>
+  Once set, kernel-install advances saved_entry on every future kernel update
+  on its own.
 
-  Control it in /etc/dnf/automatic-reboot.conf:
-      [kernel]
-      manage_kernel_default  = yes
-      kernel_default_package = kernel-uek-core
-
-  Verify the provisioning took effect:
+  Check the settings:
       grep DEFAULTKERNEL /etc/sysconfig/kernel
       grep GRUB_UPDATE_DEFAULT_KERNEL /etc/default/grub
       grubby --default-kernel
       rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-uek-core | sort -V | tail -1
-      systemctl is-enabled grub-boot-success.service     # UEK: enabled
-      grub2-editenv /boot/grub2/grubenv list             # saved_entry, boot_success
+      grub2-editenv /boot/grub2/grubenv list             # saved_entry
 
 
 Adding to false_positives filter
@@ -353,6 +346,27 @@ Restart-state learning
   learn_false_positives = no
 
 
+Scheduled reboots
+-----------------
+
+  A reboot runs from the transient timer
+  dnf-automatic-reboot-scheduled-reboot.timer, reboot_delay_sec after the
+  decision; run.sh and the watchdog use the same name.  The wall message and
+  the log give the time.
+
+  systemctl list-timers dnf-automatic-reboot-scheduled-reboot.timer
+  systemctl stop dnf-automatic-reboot-scheduled-reboot.timer   # cancel it
+
+  A reboot the watchdog scheduled after stopping a stuck run also keeps
+  /run/dnf-automatic-reboot.recovery, which holds off every update run until
+  the reboot.  After cancelling such a reboot, allow runs again with:
+
+  rm -f /run/dnf-automatic-reboot.recovery
+
+  If the reboot itself fails to start, dnf-automatic-reboot-notify@ reports
+  the failed dnf-automatic-reboot-scheduled-reboot.service.
+
+
 Forcing a manual run
 --------------------
 
@@ -366,24 +380,47 @@ Forcing a manual run
 
   # Test needs-reboot detection only (no update, no reboot):
   /usr/libexec/dnf-automatic-reboot/needs-reboot.sh; echo "exit: $?"
+  # Side effects, the same as in a scheduled run: restart-state records a
+  # newly flagged package as pending, and confirms a pending one still
+  # flagged after a reboot; for a pending kernel, kernel-reboot-attempts
+  # counts the current boot as one attempt (once per boot).
 
   # Test watchdog (with no state file it exits immediately):
   /usr/libexec/dnf-automatic-reboot/watchdog.sh
+  # While a run is in progress it acts as its timer would: past the soft or
+  # hard timeout it can kill the run and reboot.
 
 
 Uninstalling
 ------------
 
-  dnf remove dnf-automatic-reboot
-  # or
-  make uninstall
+  Installed from the RPM:
 
-  The log file /var/log/dnf-automatic-reboot.log is preserved on uninstall.
-  Remove manually if not needed:  rm /var/log/dnf-automatic-reboot.log
+      dnf remove dnf-automatic-reboot
 
-  The restart-state and kernel-reboot-attempts files are preserved the same
-  way.  Remove manually if not needed:
+  This disables and stops both timers and removes every file the package
+  owns: the scripts, units, tmpfiles.d and logrotate drop-ins, the log
+  /var/log/dnf-automatic-reboot.log, and the state files restart-state and
+  kernel-reboot-attempts.  An edited /etc/dnf/automatic-reboot.conf or
+  /etc/logrotate.d/dnf-automatic-reboot is kept with a .rpmsave suffix.
+  Files the package does not own stay: rotated logs
+  (dnf-automatic-reboot.log.1, .2.gz, ...) and
+  /var/lib/dnf-automatic-reboot/.state.lock, which keeps its directory.
+  Remove them with:
+      rm -f /var/log/dnf-automatic-reboot.log.*
       rm -rf /var/lib/dnf-automatic-reboot
+
+  Installed with make install:
+
+      systemctl disable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
+      make uninstall
+      systemctl daemon-reload
+
+  make uninstall removes the units, the drop-ins, the scripts, this
+  documentation and /var/lib/dnf-automatic-reboot with its state.  It does
+  not stop the timers, hence the first command, and it keeps
+  /etc/dnf/automatic-reboot.conf and the logs.  Remove them with:
+      rm -f /etc/dnf/automatic-reboot.conf /var/log/dnf-automatic-reboot.log*
 
 
 Hardware watchdog (recommended for headless systems)

@@ -1,9 +1,13 @@
+# SPDX-License-Identifier: MIT
 Name:           dnf-automatic-reboot
-Version:        1.3
-Release:        1%{?dist}
-Summary:        Unattended update and conditional reboot for OL9/RHEL9 aarch64
+Version:        1.4.0
+# Plain "1" for a release; CI passes --define "rpm_release 0.<run>.git<sha>"
+# for a snapshot build.  The leading "0." makes rpm rank the release above
+# every snapshot that preceded it, so a trial build upgrades to it in place.
+Release:        %{!?rpm_release:1}%{?rpm_release}%{?dist}
+Summary:        Unattended update and conditional reboot for EL8 and EL9
 
-License:        MIT
+License:        GPL-2.0-or-later
 URL:            https://github.com/dag-node/tools-dnf-automatic-reboot
 Source0:        %{name}-%{version}.tar.gz
 
@@ -11,20 +15,24 @@ BuildArch:      noarch
 
 # dnf-automatic provides the /usr/bin/dnf-automatic binary we call
 Requires:       dnf-automatic
-# needs-restarting is provided by yum-utils on EL9 (confirmed via
-# rpm -qf against the live binary; dnf-plugins-core does not own it)
+# %%pre reads /etc/dnf/automatic.conf, which dnf-automatic installs.
+Requires(pre):  dnf-automatic
+# needs-restarting is provided by yum-utils on EL8 and EL9 (confirmed via
+# `rpm -qf` against the live binary; dnf-plugins-core does not own it)
 Requires:       yum-utils
 # systemd-inhibit, systemd-run, wall are all in systemd or util-linux.
-# >= 252 for `systemctl kill --kill-whom`, spelled --kill-who before that;
-# the watchdog relies on it to reach the whole service cgroup.
-Requires:       systemd >= 252
+# 239 is EL8's.  The watchdog signals the whole service cgroup with
+# `systemctl kill --kill-who=all` there and `--kill-whom=all` from 252, the
+# release that renamed the option; watchdog.sh picks the spelling at runtime.
+Requires:       systemd >= 239
 Requires:       util-linux
 # eu-readelf for systemd build-id comparison (false-positive detection)
 Requires:       elfutils
-# grubby + grub2-set-bootflag for the UEK GRUB BLS default fix (UEK hosts only;
-# the %%post logic degrades gracefully if either is somehow absent)
+# grubby reads and sets the GRUB BLS default: needs-reboot.sh verifies it
+# before a kernel reboot, %%post repairs it on UEK, and %%pre refuses a host
+# where it does not answer - hence also Requires(pre).
 Requires:       grubby
-Requires:       grub2-tools-minimal
+Requires(pre):  grubby
 # logrotate consumes the drop-in in %%{_sysconfdir}/logrotate.d; without it
 # /var/log/dnf-automatic-reboot.log grows without bound
 Requires:       logrotate
@@ -87,8 +95,7 @@ install -m 0644 units/dnf-automatic-reboot.service          %{buildroot}%{_unitd
 install -m 0644 units/dnf-automatic-reboot.timer            %{buildroot}%{_unitdir}/
 install -m 0644 units/dnf-automatic-watchdog.service        %{buildroot}%{_unitdir}/
 install -m 0644 units/dnf-automatic-watchdog.timer          %{buildroot}%{_unitdir}/
-install -m 0644 units/dnf-automatic-reboot-failure@.service %{buildroot}%{_unitdir}/
-install -m 0644 units/grub-boot-success.service             %{buildroot}%{_unitdir}/
+install -m 0644 units/dnf-automatic-reboot-notify@.service %{buildroot}%{_unitdir}/
 
 # Config file - noreplace preserves local edits on upgrade
 install -d -m 0755 %{buildroot}%{_sysconfdir}/dnf
@@ -115,14 +122,175 @@ touch %{buildroot}%{_localstatedir}/log/%{name}.log
 install -d -m 0750 %{buildroot}%{_localstatedir}/lib/%{name}
 
 %pre -p /bin/bash
+# Pre-install gate.  Every check reports and sets FAIL; the install is refused
+# once, at the end, with every problem listed, before any file is touched.
+# The host must be one this package can reboot safely and decide for: EL9,
+# booted by systemd, GRUB2 in BLS mode with a default grubby can read.
+#
+# %%{?preflight_root} is empty in every built RPM.  tests/run-tests.sh expands
+# this scriptlet with `rpmspec --define` to point the file checks at a fixture
+# tree, so the gate is tested without any runtime switch that could bypass it.
 FAIL=0
+readonly PREFLIGHT_ROOT="%{?preflight_root}"
 
-# dnf-automatic must be installed (Requires: covers normal installs; this
-# catches --nodeps bypasses).
-if ! rpm -q dnf-automatic > /dev/null 2>&1; then
-    echo "ERROR: dnf-automatic is not installed." >&2
-    echo "       Install it first:  dnf install dnf-automatic" >&2
+# Versions before 1.4.0 were only ever installed from locally built RPMs, and
+# no upgrade path from them is maintained: their paths, state files and
+# scriptlets differ, and this package does not migrate them.  An upgrade over one is
+# refused before any file is touched, naming the removal instead.  $1 is the
+# number of instances after this transaction, so 2 or more is an upgrade.
+readonly MINIMUM_UPGRADABLE_VERSION=1.4.0
+if [[ "$1" -gt 1 ]]; then
+    for installed_version in $(rpm -q --qf '%%{VERSION}\n' %{name} 2>/dev/null); do
+        oldest_version=$(printf '%s\n%s\n' "${installed_version}" "${MINIMUM_UPGRADABLE_VERSION}" \
+                         | sort -V | head -1)
+        if [[ "${installed_version}" != "${MINIMUM_UPGRADABLE_VERSION}" \
+              && "${oldest_version}" == "${installed_version}" ]]; then
+            echo "ERROR: %{name} ${installed_version} is installed; upgrading from a version" >&2
+            echo "       before ${MINIMUM_UPGRADABLE_VERSION} is not supported." >&2
+            echo "       Remove it first:  dnf remove %{name}" >&2
+            echo "       then install this package and re-enable its timers." >&2
+            FAIL=1
+        fi
+    done
+fi
+
+# EL8 and EL9.  Every rebuild of them (RHEL, Oracle Linux, Rocky, Alma) sets
+# PLATFORM_ID=platform:el8 or platform:el9.  EL10 is untested and refused
+# rather than half-working.
+platform_id=$(sed -n 's/^PLATFORM_ID="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' \
+              "${PREFLIGHT_ROOT}/etc/os-release" 2>/dev/null) || true
+if [[ "${platform_id}" != "platform:el8" && "${platform_id}" != "platform:el9" ]]; then
+    echo "ERROR: this host is '${platform_id:-unknown}', not platform:el8 or platform:el9." >&2
+    echo "       %{name} %{version} supports EL8 and EL9 only." >&2
     FAIL=1
+fi
+
+# systemd must be the running init: the package is timers, an inhibitor lock
+# and a transient reboot timer.  Absent in a container, chroot or image build.
+if [[ ! -d "${PREFLIGHT_ROOT}/run/systemd/system" ]]; then
+    echo "ERROR: systemd is not the running init (no /run/systemd/system)." >&2
+    echo "       Install on a booted host, not in a container, chroot or image build." >&2
+    FAIL=1
+fi
+
+# The packages every decision depends on.  Requires: covers a normal install;
+# this catches `rpm -i --nodeps`, which would otherwise leave the build-id or
+# GRUB check silently disabled at runtime.
+for required_package in dnf-automatic yum-utils elfutils grubby; do
+    if ! rpm -q "${required_package}" >/dev/null 2>&1; then
+        echo "ERROR: ${required_package} is not installed." >&2
+        echo "       Install it first:  dnf install ${required_package}" >&2
+        FAIL=1
+    fi
+done
+
+# GRUB2 with Boot Loader Specification entries.  The kernel reboot decision
+# compares `grubby --default-kernel` against the newest installed kernel, and
+# %%post repairs that default on UEK; neither means anything under another
+# bootloader, where a kernel reboot could return to the old kernel on every run.
+if ! grep -Eq '^GRUB_ENABLE_BLSCFG="?true"?[[:space:]]*$' "${PREFLIGHT_ROOT}/etc/default/grub" 2>/dev/null; then
+    echo "ERROR: GRUB_ENABLE_BLSCFG=true is not set in /etc/default/grub." >&2
+    echo "       %{name} requires GRUB2 with Boot Loader Specification entries." >&2
+    FAIL=1
+fi
+if ! compgen -G "${PREFLIGHT_ROOT}/boot/loader/entries/*.conf" >/dev/null; then
+    echo "ERROR: /boot/loader/entries holds no BLS entry." >&2
+    echo "       %{name} requires GRUB2 with Boot Loader Specification entries." >&2
+    FAIL=1
+fi
+grub_default_kernel=$(grubby --default-kernel 2>/dev/null) || true
+if [[ "${grub_default_kernel}" != /boot/vmlinuz-* \
+      || ! -e "${PREFLIGHT_ROOT}${grub_default_kernel}" ]]; then
+    echo "ERROR: grubby --default-kernel gave '${grub_default_kernel}', not an existing /boot/vmlinuz-*." >&2
+    echo "       Repair the default first:  grubby --set-default /boot/vmlinuz-\$(uname -r)" >&2
+    FAIL=1
+fi
+
+# GRUB must boot the entry grubby reads and sets.  grubby works on
+# saved_entry; grub2-mkconfig emits 'set default="${saved_entry}"' only when
+# built with GRUB_DEFAULT=saved, and a fixed default otherwise.  The generated
+# grub.cfg is what GRUB runs today; /etc/default/grub is what the next
+# grub2-mkconfig will produce; the gate reads grub.cfg and /etc/default/grub.
+# Which grub.cfg GRUB runs differs: on EL9 EFI the ESP copy is a stub that
+# loads /boot/grub2/grub.cfg (it holds `configfile`), on EL8 EFI the ESP copy
+# is the full config.  Every full config found must boot saved_entry.  The
+# repair runs `grub2-mkconfig -o <that file>` without `--update-bls-cmdline`:
+# the default is set in grub.cfg, and that flag rewrites the options line of
+# every BLS entry from GRUB_CMDLINE_LINUX.
+full_grub_config_count=0
+for grub_config_file in "${PREFLIGHT_ROOT}/boot/grub2/grub.cfg" "${PREFLIGHT_ROOT}"/boot/efi/EFI/*/grub.cfg; do
+    [[ -f "${grub_config_file}" ]] || continue
+    grep -q '^[[:space:]]*configfile' "${grub_config_file}" 2>/dev/null && continue
+    full_grub_config_count=$(( full_grub_config_count + 1 ))
+    if ! grep -qF 'set default="${saved_entry}"' "${grub_config_file}" 2>/dev/null; then
+        grub_config_path="${grub_config_file#"${PREFLIGHT_ROOT}"}"
+        echo "ERROR: ${grub_config_path} does not boot saved_entry, so the default grubby reads" >&2
+        echo "       and sets is not the one GRUB boots." >&2
+        echo "       Set GRUB_DEFAULT=saved in /etc/default/grub, then:  grub2-mkconfig -o ${grub_config_path}" >&2
+        FAIL=1
+    fi
+done
+if [[ "${full_grub_config_count}" -eq 0 ]]; then
+    echo "ERROR: no grub.cfg found in /boot/grub2 or /boot/efi/EFI/*." >&2
+    echo "       %{name} requires GRUB2 with Boot Loader Specification entries." >&2
+    FAIL=1
+fi
+if ! grep -Eq '^GRUB_DEFAULT="?saved"?[[:space:]]*$' "${PREFLIGHT_ROOT}/etc/default/grub" 2>/dev/null; then
+    echo "ERROR: GRUB_DEFAULT=saved is not set in /etc/default/grub; the next grub2-mkconfig" >&2
+    echo "       would stop GRUB booting saved_entry." >&2
+    echo "       Set it:  GRUB_DEFAULT=saved" >&2
+    FAIL=1
+fi
+
+# A kernel update must advance saved_entry, or every kernel reboot returns to
+# the old kernel and is withheld at runtime.  kernel-install's 20-grub.install
+# moves saved_entry only when /etc/default/grub has
+# GRUB_UPDATE_DEFAULT_KERNEL=true; the EL9 version also requires
+# /etc/sysconfig/kernel to name the kernel's package in DEFAULTKERNEL, the EL8
+# version does not read DEFAULTKERNEL.  Both files belong to the operator, so
+# a host without the settings is refused with the lines to add; neither file
+# is edited here.
+running_kernel_package=$(rpm -qf "/lib/modules/$(uname -r)/vmlinuz" --qf '%%{NAME}\n' 2>/dev/null | head -1) || true
+if [[ -z "${running_kernel_package}" ]]; then
+    echo "ERROR: no package owns /lib/modules/$(uname -r)/vmlinuz; cannot tell which kernel" >&2
+    echo "       package kernel updates must make the default." >&2
+    FAIL=1
+else
+    if ! grep -Eq '^GRUB_UPDATE_DEFAULT_KERNEL="?true"?[[:space:]]*$' "${PREFLIGHT_ROOT}/etc/default/grub" 2>/dev/null; then
+        echo "ERROR: kernel updates will not advance the GRUB default. kernel-install moves" >&2
+        echo "       saved_entry only with, in /etc/default/grub:  GRUB_UPDATE_DEFAULT_KERNEL=true" >&2
+        FAIL=1
+    fi
+    configured_default_kernel=$(sed -n 's/^DEFAULTKERNEL=//p' "${PREFLIGHT_ROOT}/etc/sysconfig/kernel" 2>/dev/null | tail -1) || true
+    if [[ "${platform_id}" == "platform:el9" && "${configured_default_kernel}" != "${running_kernel_package}" ]]; then
+        echo "ERROR: kernel updates will not advance the GRUB default. On EL9 kernel-install" >&2
+        echo "       moves saved_entry only for the package named in /etc/sysconfig/kernel:" >&2
+        echo "         DEFAULTKERNEL=${running_kernel_package}  (found: '${configured_default_kernel}')" >&2
+        FAIL=1
+    fi
+
+    # The default must already be the newest installed kernel of that package,
+    # or every kernel reboot is withheld at runtime.  It is not set here:
+    # setting it changes which kernel the next boot runs, which may be one an
+    # operator left behind on purpose.
+    newest_kernel_version=$(rpm -q --qf '%%{VERSION}-%%{RELEASE}.%%{ARCH}\n' "${running_kernel_package}" 2>/dev/null \
+                            | sort -V | tail -1) || true
+    if [[ -n "${newest_kernel_version}" && "${grub_default_kernel}" == /boot/vmlinuz-* \
+          && "${grub_default_kernel}" != "/boot/vmlinuz-${newest_kernel_version}" ]]; then
+        echo "ERROR: the GRUB default is ${grub_default_kernel}, not the newest installed" >&2
+        echo "       ${running_kernel_package} ${newest_kernel_version}, so kernel reboots would be withheld." >&2
+        echo "       If that kernel should run:  grubby --set-default /boot/vmlinuz-${newest_kernel_version}" >&2
+        FAIL=1
+    fi
+fi
+
+# Not a prerequisite, but it changes what the runtime check reports.  With
+# GRUB_SAVEDEFAULT=true the entry booted is saved as the default, so picking an
+# older kernel from the menu once makes it the default; a kernel reboot is
+# then withheld with an error until the default is set back.
+if grep -Eq '^GRUB_SAVEDEFAULT="?true"?[[:space:]]*$' "${PREFLIGHT_ROOT}/etc/default/grub" 2>/dev/null; then
+    echo "WARNING: GRUB_SAVEDEFAULT=true: booting an older kernel from the GRUB menu makes it the" >&2
+    echo "         default, and kernel reboots are withheld until:  grubby --set-default <newest>" >&2
 fi
 
 # Conflicting timers must be disabled; dnf-automatic-reboot owns the schedule.
@@ -136,7 +304,7 @@ for timer in dnf-automatic.timer dnf-automatic-install.timer; do
 done
 
 # /etc/dnf/automatic.conf must not trigger reboots itself; this package does that.
-ACONF=/etc/dnf/automatic.conf
+ACONF="${PREFLIGHT_ROOT}/etc/dnf/automatic.conf"
 if [[ -f "${ACONF}" ]]; then
     reboot_val=$(grep -E '^\s*reboot\s*=' "${ACONF}" 2>/dev/null \
                  | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
@@ -144,10 +312,28 @@ if [[ -f "${ACONF}" ]]; then
     if [[ -n "${reboot_val}" && "${reboot_val}" != "never" ]]; then
         echo "ERROR: /etc/dnf/automatic.conf has 'reboot = ${reboot_val}'." >&2
         echo "       dnf-automatic must not reboot independently of this package." >&2
-        echo "       Set it to 'never' in ${ACONF}:  reboot = never" >&2
+        echo "       Set it to 'never' in /etc/dnf/automatic.conf:  reboot = never" >&2
         FAIL=1
     fi
 fi
+
+# dnf-automatic must install what it downloads.  apply_updates defaults to
+# false in dnf-automatic, which then exits 0 after downloading, so every run
+# would report success without installing an update.  The file is the
+# operator's: this scriptlet reads it and does not write it.  True values are those libdnf's
+# OptionBool accepts.
+apply_updates_value=$(grep -E '^\s*apply_updates\s*=' "${ACONF}" 2>/dev/null \
+                      | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
+                      | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]') || true
+case "${apply_updates_value}" in
+    yes|true|1|on) ;;
+    *)
+        echo "ERROR: /etc/dnf/automatic.conf has 'apply_updates = ${apply_updates_value:-<unset>}'." >&2
+        echo "       dnf-automatic would download updates without installing them." >&2
+        echo "       Set it in /etc/dnf/automatic.conf:  apply_updates = yes" >&2
+        FAIL=1
+        ;;
+esac
 
 if [[ "${FAIL}" -ne 0 ]]; then
     echo "" >&2
@@ -195,9 +381,8 @@ arc_conf_get() {
 # makes the ordering mean anything.
 #
 # Enabling another package's unit cannot be expressed as a preset of ours, so
-# this is a second deliberate exception to the macro-only scriptlet rule (see
-# grub-boot-success.service below for the first).  Never disabled on erase:
-# a synchronised clock is not this package's to take away.
+# this is the one deliberate exception to the macro-only scriptlet rule.  Never
+# disabled on erase: a synchronised clock is not this package's to take away.
 # ---------------------------------------------------------------------------
 ARC_CHRONY_WAIT=$(arc_conf_get enable_chrony_wait yes)
 if [ "${ARC_CHRONY_WAIT}" = "yes" ] \
@@ -208,110 +393,21 @@ if [ "${ARC_CHRONY_WAIT}" = "yes" ] \
     fi
 fi
 
-# ---------------------------------------------------------------------------
-# UEK GRUB BLS default provisioning (one-time, idempotent; no-op off UEK).
-# On OL9 UEK hosts kernel-install does not advance the GRUB saved_entry by
-# default, so a newly installed kernel-uek-core is not booted after reboot.
-# Configure DEFAULTKERNEL + GRUB_UPDATE_DEFAULT_KERNEL so every future kernel
-# update advances saved_entry automatically, repair the current backlog with
-# grubby, and enable the boot-success safeguard.  Gated on the running kernel
-# package so non-UEK kernels are never touched.  Behaviour is controlled by
-# the [kernel] section of /etc/dnf/automatic-reboot.conf (read below).
-# ---------------------------------------------------------------------------
-ARC_MANAGE=$(arc_conf_get manage_kernel_default yes)
-ARC_KPKG=$(arc_conf_get kernel_default_package kernel-uek-core)
-
-ARC_RUNPKG=""
-ARC_VMLINUZ="/lib/modules/$(uname -r)/vmlinuz"
-if [ -e "${ARC_VMLINUZ}" ]; then
-    ARC_RUNPKG=$(rpm -qf "${ARC_VMLINUZ}" --qf '%%{NAME}\n' 2>/dev/null | head -1) || true
-fi
-
-if [ "${ARC_MANAGE}" = "yes" ] && [ "${ARC_RUNPKG}" = "${ARC_KPKG}" ]; then
-    echo "dnf-automatic-reboot: configuring GRUB BLS default for ${ARC_KPKG}"
-
-    # 1. DEFAULTKERNEL in /etc/sysconfig/kernel
-    SK=/etc/sysconfig/kernel
-    if [ -f "${SK}" ] && grep -qE "^DEFAULTKERNEL=${ARC_KPKG}\$" "${SK}"; then
-        :
-    elif [ -f "${SK}" ] && grep -qE '^DEFAULTKERNEL=' "${SK}"; then
-        sed -i "s/^DEFAULTKERNEL=.*/DEFAULTKERNEL=${ARC_KPKG}/" "${SK}"
-    elif [ -f "${SK}" ]; then
-        printf 'DEFAULTKERNEL=%s\n' "${ARC_KPKG}" >> "${SK}"
-    else
-        printf 'DEFAULTKERNEL=%s\n' "${ARC_KPKG}" > "${SK}"
-        chmod 0644 "${SK}"
-    fi
-
-    # 2. GRUB_UPDATE_DEFAULT_KERNEL in /etc/default/grub
-    DG=/etc/default/grub
-    if [ -f "${DG}" ] && grep -qE '^GRUB_UPDATE_DEFAULT_KERNEL=' "${DG}"; then
-        if ! grep -qE '^GRUB_UPDATE_DEFAULT_KERNEL="?true"?[[:space:]]*$' "${DG}"; then
-            sed -i 's/^GRUB_UPDATE_DEFAULT_KERNEL=.*/GRUB_UPDATE_DEFAULT_KERNEL="true"/' "${DG}"
-        fi
-    else
-        printf 'GRUB_UPDATE_DEFAULT_KERNEL="true"\n' >> "${DG}"
-    fi
-
-    # 3. Backlog repair: point the default at the newest installed kernel
-    if command -v grubby >/dev/null 2>&1; then
-        ARC_EVR=$(rpm -q "${ARC_KPKG}" --qf '%%{VERSION}-%%{RELEASE}.%%{ARCH}\n' 2>/dev/null \
-                  | sort -V | tail -1) || true
-        if [ -n "${ARC_EVR}" ] && [ -e "/boot/vmlinuz-${ARC_EVR}" ]; then
-            ARC_CUR=$(grubby --default-kernel 2>/dev/null) || true
-            if [ "${ARC_CUR}" != "/boot/vmlinuz-${ARC_EVR}" ]; then
-                if grubby --set-default "/boot/vmlinuz-${ARC_EVR}" >/dev/null 2>&1; then
-                    echo "dnf-automatic-reboot: GRUB default set to /boot/vmlinuz-${ARC_EVR}"
-                fi
-            fi
-        fi
-    fi
-
-    # /etc/sysconfig/kernel may have been created; restore its SELinux label
-    if [ -x /sbin/restorecon ]; then
-        restorecon "${SK}" >/dev/null 2>&1 || true
-    fi
-
-    # 4. Enable the boot-success safeguard on UEK only.  Conditional (per-host)
-    #    enablement cannot be expressed via systemd presets, so this is a
-    #    deliberate, narrow exception to the macro-only scriptlet rule.  The
-    #    unit also carries ConditionKernelVersion=*uek* so it stays inert even
-    #    if it is ever enabled on a non-UEK host.
-    systemctl --no-reload enable grub-boot-success.service >/dev/null 2>&1 || true
-    systemctl start grub-boot-success.service >/dev/null 2>&1 || true
-fi
-
 echo ""
 echo "dnf-automatic-reboot installed."
 echo ""
 echo "Next steps:"
-echo "  1. Ensure /etc/dnf/automatic.conf has apply_updates = yes"
-echo "  2. Review /etc/dnf/automatic-reboot.conf"
-echo "  3. Disable stock timers if not already done:"
-echo "       systemctl disable --now dnf-automatic.timer dnf-automatic-install.timer"
-echo "  4. Enable this package:"
+echo "  1. Review /etc/dnf/automatic-reboot.conf"
+echo "  2. Enable this package:"
 echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer"
-
-%posttrans
-# Versions before 1.3 installed the scripts under /usr/local/lib.  RPM removes
-# the files it owned there but never owned the directory itself.  This has to
-# run after the old package's files are gone, so %%posttrans rather than %%post.
-rmdir /usr/local/lib/%{name} >/dev/null 2>&1 || true
 
 %preun
 %systemd_preun dnf-automatic-reboot.service
 %systemd_preun dnf-automatic-reboot.timer
 %systemd_preun dnf-automatic-watchdog.service
 %systemd_preun dnf-automatic-watchdog.timer
-
-# grub-boot-success.service is enabled directly (not via preset) on UEK hosts,
-# so disable it directly on final uninstall.  No-op if it was never enabled.
 # chrony-wait.service is deliberately left enabled: it belongs to chrony and a
 # synchronised clock is not this package's to remove.
-if [ $1 -eq 0 ]; then
-    systemctl --no-reload disable grub-boot-success.service >/dev/null 2>&1 || true
-    systemctl stop grub-boot-success.service >/dev/null 2>&1 || true
-fi
 
 %postun
 %systemd_postun_with_restart dnf-automatic-reboot.timer
@@ -336,10 +432,7 @@ fi
 %{_unitdir}/dnf-automatic-watchdog.service
 %{_unitdir}/dnf-automatic-watchdog.timer
 # Failure notifier, instantiated by OnFailure= with the failed unit name
-%{_unitdir}/dnf-automatic-reboot-failure@.service
-# Boot-success safeguard - shipped on all hosts (noarch) but only enabled on
-# UEK by %%post; ConditionKernelVersion=*uek* keeps it inert elsewhere.
-%{_unitdir}/grub-boot-success.service
+%{_unitdir}/dnf-automatic-reboot-notify@.service
 
 # Config - preserved across upgrades; root:root 640 (no world read for safety)
 %config(noreplace) %attr(0640, root, root) %{_sysconfdir}/dnf/automatic-reboot.conf
@@ -362,83 +455,177 @@ fi
 %ghost %attr(0640, root, root) %{_localstatedir}/lib/%{name}/kernel-reboot-attempts
 
 %changelog
+* Wed Sep 30 2026 DagNode <packages@dagnode.com> - 1.4.0-1
+- LICENSE: The project license is now GPL-2.0-or-later. Releases through 1.3 were licensed MIT,
+  and anyone who received them keeps those terms on those versions. The spec file stays MIT;
+  REUSE.toml declares the copyright of every file and the license of every file without its own
+  header. The source archive carries REUSE.toml and both license texts.
+- CHANGE: Versions follow vX.Y.Z.
+- CHANGE: Installation no longer edits /etc/sysconfig/kernel or /etc/default/grub, and no
+  longer runs grubby --set-default, on UEK hosts. The installer refuses a host without
+  DEFAULTKERNEL, GRUB_UPDATE_DEFAULT_KERNEL=true or a default on the newest kernel, and names
+  each setting or command. Changing the default at install would change which kernel the next
+  boot runs. The [kernel] settings manage_kernel_default and kernel_default_package are
+  removed.
+- CHANGE: Installing over any version before 1.4.0 is refused before a file is touched. Remove the
+  earlier version first with 'dnf remove dnf-automatic-reboot', then install 1.4.0 and re-enable
+  the timers with 'systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer'.
+  Removal keeps an edited /etc/dnf/automatic-reboot.conf as automatic-reboot.conf.rpmsave and
+  deletes the log and the learned restart-state, so each package it had confirmed as a false
+  positive costs one reboot to learn again. Nothing migrates from the earlier versions: an
+  in-place upgrade from them would run that night's reboot decision through a script the upgrade
+  had just removed.
+- CHANGE: Installation is refused, before a file is touched, on a host this package cannot reboot
+  safely: one that is not EL8 or EL9 (PLATFORM_ID), not booted by systemd, missing
+  dnf-automatic, yum-utils, elfutils or grubby, not GRUB2 in BLS mode with a default kernel
+  grubby can read, not booting saved_entry (GRUB_DEFAULT=saved), or unable to make an updated
+  kernel the default (GRUB_UPDATE_DEFAULT_KERNEL=true, DEFAULTKERNEL on EL9, and the default
+  already on the newest installed kernel). GRUB_SAVEDEFAULT=true is reported, not refused. The
+  refusal lists every problem with its fix.
+- CHANGE: /etc/dnf/automatic.conf must have 'apply_updates = yes' as well as 'reboot = never'.
+  dnf-automatic defaults apply_updates to off, and then only downloads updates and exits 0.
+  Installation is refused and each run fails until it is set. The file is checked, never
+  edited, so an existing dnf-automatic setup is kept as it is.
+- CHANGE: grub-boot-success.service is removed, and grub2-tools-minimal is no longer required. It
+  set boot_success at every boot on UEK hosts, which in RHEL's GRUB scripts only decides whether
+  the menu is hidden; saved_entry never depended on it. It would also have disarmed greenboot's
+  boot_counter rollback. Removing an earlier version disables it.
+- CHANGE: The failure notifier unit is renamed dnf-automatic-reboot-notify@.service.
+- SECURITY: Compare build-ids for every process running a binary, not one per binary. PID 1
+  re-execs onto the new systemd while each systemd --user manager keeps the old image; checking
+  PID 1 alone could call a genuine systemd update a false positive and skip the reboot.
+- SECURITY: A process still running a systemd binary whose build-id cannot be read keeps the
+  reboot, even when every other process matches. One matching process could call the update a
+  false positive for a process nobody had checked. A process counts as gone only when it has
+  left /proc, is a zombie, or runs another binary.
+- NEW: Enterprise Linux 8 support (RHEL 8, Oracle Linux 8, Rocky Linux 8, AlmaLinux 8). The
+  package requires systemd 239 instead of 252, and the watchdog stops a stuck run with the
+  systemctl kill option each systemd version accepts. On EL8 EFI hosts the install checks the
+  grub.cfg on the EFI partition, which is the one GRUB runs there.
+- NEW: restart_service_timeout_sec (default 300) bounds each restart of a stale service. A
+  restart that does not finish in time is left to systemd, and the run goes on.
+- NEW: Each run that installs updates ends with one line, logged and sent to logged-in users,
+  naming the reboot outcome and every service restarted, failed, still pending or excluded, and
+  the command to check what is incomplete.
+- NEW: A reboot is scheduled as dnf-automatic-reboot-scheduled-reboot.timer. The message gives
+  its time and 'systemctl stop dnf-automatic-reboot-scheduled-reboot.timer' to cancel it, and a
+  reboot that fails to start is reported through the failure notifier.
+- FIX: Security advisories that dnf will not install are reported on Red Hat Enterprise Linux,
+  Rocky Linux and AlmaLinux, whose advisory ids have the form RHSA-2020:3011, for EPEL
+  advisories such as FEDORA-EPEL-2024-bf31852fe0, and for Oracle Linux advisories with a
+  revision suffix such as ELSA-2026-60226-0. Only the form ELSA-2026-26533 was recognized, so
+  the warning never appeared for the others.
+- FIX: Stale-service restarts leave user@*.service, getty@*.service, serial-getty@*.service
+  and autovt@*.service alone; restarting them would end a user's session or log out a console.
+  restart_services_exclude entries accept globs.
+- FIX: The watchdog acts on a recorded PID only while it is the unit's main process. After a
+  crash, a reused PID belonging to another process could have been signalled.
+- FIX: 'wall_messages = no' followed by a comment on the same line disables wall messages.
+- FIX: make install writes the config as /etc/dnf/automatic-reboot.conf, the name the scripts
+  read.
+- FIX: The watchdog times a run from the boot clock (/proc/uptime) instead of the wall clock. On a
+  host with no RTC, a run started before chrony synchronised could read as days old once the
+  clock stepped, and the hard timeout could then stop it mid-transaction.
+- FIX: An unreadable GRUB default does not withhold a kernel reboot. grubby prints '/boot' and
+  exits 0 when it cannot read grubenv, which the check would have taken for a stale default.
+  Anything other than a /boot/vmlinuz-* path now counts as undetermined, and
+  kernel_reboot_attempt_limit remains the backstop.
+- FIX: A dnf error during the reboot check no longer reboots the host. dnf exits 1 for errors
+  such as a missing cache, the same code needs-restarting uses for "reboot required"; only an
+  exit 1 that names a package is a reboot requirement now. Anything else is retried with a
+  metadata refresh, then fails the run without rebooting.
+- FIX: Updates start only once logind has granted the shutdown inhibitor lock. dnf-automatic
+  runs under systemd-inhibit, and a refused lock fails the run before anything is installed.
+- FIX: A reboot check that exits with any status other than 0 or 1, such as a missing helper,
+  fails the run instead of reporting "No reboot required". The watchdog fails its unit the same
+  way, so OnFailure= reports it.
+- FIX: The watchdog's own reboot check is killed after three times needs_restarting_timeout_sec,
+  and the watchdog unit after 15 minutes. A hung check could keep the watchdog running, so the
+  hard timeout was never reached.
+- FIX: The watchdog supervises a run until it exits, stale-service restarts included. A hung
+  restart could hold the run open and block every later update run.
+- FIX: kernel_reboot_attempt_limit counts at most one attempt per boot. Every check counted
+  before, so running the reboot check by hand, or the watchdog's check, used up the limit and
+  withheld the next genuine kernel reboot.
+- FIX: The reboot check no longer removes /dev/null when it cannot create a temporary file; it
+  fails without rebooting.
+- FIX: The watchdog re-checks the run right before stopping it, and no new run starts until its
+  recovery ends, or, when it reboots, until that reboot. A run that ended during the watchdog's own reboot check, and the next run that
+  started meanwhile, could otherwise be killed mid-update and the host rebooted. A process whose
+  identity systemd cannot confirm is left alone.
+- FIX: The watchdog counts a stuck run as stopped only once systemd reports it inactive or
+  failed within watchdog_kill_confirm_sec (default 30). A failed or unconfirmed kill keeps the
+  run supervised, does not reboot, and fails the watchdog. The recorded PID is no longer
+  signalled on its own, since its number may belong to another process by then.
+- FIX: A stale-service restart that fails or does not finish fails the run. The run reported
+  "No stale services needed restarting" and success instead.
+- FIX: The watchdog fails its unit when it cannot schedule a reboot, so OnFailure= reports it.
+
 * Fri Jul 31 2026 DagNode <packages@dagnode.com> - 1.3-1
-New:
-- Restart services still mapping pre-update files via needs-restarting -s,
-  which -r never reports; new [services] section with restart_services and
-  restart_services_exclude
-- Report enabled repositories with gpgcheck=0, and security advisories that
-  apply to the host but that dnf will not install; a repository priority= or
-  excludepkgs= leaves an advisory visible to updateinfo but invisible to the
-  depsolver while every run reports success; new [security] section
-- Verify grubby --default-kernel already points at the newest installed kernel
-  before scheduling a kernel reboot, and cap consecutive attempts per target
-  version, so a saved_entry that never advances cannot loop; new
-  verify_grub_default and kernel_reboot_attempt_limit
-- Enable chrony-wait.service at install time so Requires=time-sync.target is a
-  real gate on UEK R8, where systemd-time-wait-sync.service does not exist
-- Report failed runs to wall(1) and the log through OnFailure=
-- Ship tmpfiles.d and logrotate.d drop-ins so the log is created 0640 and
-  rotated weekly; it was created 0644 by the first script to write to it and
-  grew without bound
-- Ship a test suite; make check runs lint and tests, and %%check runs it during
-  the build
+- CHANGE: Scripts move from /usr/local/lib to /usr/libexec; update anything that calls them by
+  path.
+- CHANGE: Requires systemd >= 252 for systemctl kill --kill-whom.
+- SECURITY: Treat every unverifiable state as a genuine reboot requirement: missing elfutils no
+  longer aborts a kernel decision it cannot affect, and a package with no verifiable running
+  process is no longer dropped.
+- SECURITY: Compare build-ids across every running process a package owns; stopping at the first
+  match cleared systemd on PID 1 while journald ran the old image.
+- SECURITY: Replace the fixed 30s needs-restarting timeout, which expired into a fail-open "no
+  reboot" on slow links, with a configurable needs_restarting_timeout_sec defaulting to 120s and a
+  cache-first attempt.
+- SECURITY: Restart services still mapping pre-update files via needs-restarting -s, which -r
+  never reports; new [services] section with restart_services and restart_services_exclude.
+- SECURITY: Report enabled repositories with gpgcheck=0, and security advisories that apply to the
+  host but that dnf will not install; a repository priority= or excludepkgs= leaves an advisory
+  visible to updateinfo but invisible to the depsolver while every run reports success; new
+  [security] section.
+- NEW: Verify grubby --default-kernel already points at the newest installed kernel before
+  scheduling a kernel reboot, and cap consecutive attempts per target version, so a saved_entry
+  that never advances cannot loop; new verify_grub_default and kernel_reboot_attempt_limit.
+- NEW: Enable chrony-wait.service at install time so Requires=time-sync.target is a real gate on
+  UEK R8, where systemd-time-wait-sync.service does not exist.
+- NEW: Report failed runs to wall(1) and the log through OnFailure=.
+- NEW: Ship a test suite; make check runs lint and tests, and %%check runs it during the build.
+- FIX: Parse needs-restarting output with an allowlist under LC_ALL=C and keep its stderr out of
+  the parsed stream; a translated locale or a plugin warning line was read as a package name and
+  rebooted the host on every run.
+- FIX: Kill the whole service cgroup at watchdog timeout; signalling the recorded PID and its
+  direct children left dnf-automatic running behind timeout(1).
+- FIX: Do not force-reboot at hard timeout while phase=updating, where an rpm transaction may be
+  half-applied; opt back in with force_reboot_on_hard_timeout.
+- FIX: Fail the run instead of reporting success when the reboot state cannot be established.
+- FIX: Prefer an orderly systemctl reboot over --force.
+- FIX: Validate numeric config values instead of failing inside an arithmetic test, and keep the
+  warning off stdout where it was captured into the value returned.
+- FIX: Ship tmpfiles.d and logrotate.d drop-ins so the log is created 0640 and rotated weekly; it
+  was created 0644 by the first script to write to it and grew without bound.
 
-Fixed, most severe first:
-- Parse needs-restarting output with an allowlist under LC_ALL=C and keep its
-  stderr out of the parsed stream; a translated locale or a plugin warning line
-  was read as a package name and rebooted the host on every run
-- Treat every unverifiable state as a genuine reboot requirement: missing
-  elfutils no longer aborts a kernel decision it cannot affect, and a package
-  with no verifiable running process is no longer dropped
-- Kill the whole service cgroup at watchdog timeout; signalling the recorded
-  PID and its direct children left dnf-automatic running behind timeout(1)
-- Do not force-reboot at hard timeout while phase=updating, where an rpm
-  transaction may be half-applied; opt back in with
-  force_reboot_on_hard_timeout
-- Fail the run instead of reporting success when the reboot state cannot be
-  established
-- Compare build-ids across every running process a package owns; stopping at
-  the first match cleared systemd on PID 1 while journald ran the old image
-- Prefer an orderly systemctl reboot over --force
-- Replace the fixed 30s needs-restarting timeout, which expired into a
-  fail-open "no reboot" on slow links, with a configurable
-  needs_restarting_timeout_sec defaulting to 120s and a cache-first attempt
-- Validate numeric config values instead of failing inside an arithmetic test,
-  and keep the warning off stdout where it was captured into the value returned
-
-Upgrade notes:
-- Scripts move from /usr/local/lib to /usr/libexec; update anything that calls
-  them by path
-- Requires systemd >= 252 for systemctl kill --kill-whom
 * Fri Jul 03 2026 DagNode <packages@dagnode.com> - 1.2-1
-- Learn non-kernel false positives (e.g. glibc) by observing whether a
-  package is still flagged by needs-restarting after a real reboot, keyed
-  on exact EVR and proven via kernel boot ID rather than timestamps
-- New learn_false_positives config key and
-  /var/lib/dnf-automatic-reboot/restart-state tracking file
-- Fix watchdog timer OnCalendar: was firing every 5 seconds instead of
-  every 5 minutes (step was on the wrong field)
-- run.sh and watchdog.sh now check systemd-run's exit code when dispatching
-  the scheduled reboot and log dispatch success/failure explicitly, instead
-  of assuming a fire-and-forget systemd-run call always succeeds
+- NEW: Learn non-kernel false positives (e.g. glibc) by observing whether a package is still
+  flagged by needs-restarting after a real reboot, keyed on exact EVR and proven via kernel boot
+  ID rather than timestamps.
+- NEW: New learn_false_positives config key and /var/lib/dnf-automatic-reboot/restart-state
+  tracking file.
+- FIX: Fix watchdog timer OnCalendar: was firing every 5 seconds instead of every 5 minutes (step
+  was on the wrong field).
+- FIX: run.sh and watchdog.sh now check systemd-run's exit code when dispatching the scheduled
+  reboot and log dispatch success/failure explicitly, instead of assuming a fire-and-forget
+  systemd-run call always succeeds.
+
 * Mon Jun 22 2026 DagNode <packages@dagnode.com> - 1.1-1
-- Fix UEK kernel not booted after update: provision GRUB BLS saved_entry
-  handling at install time (DEFAULTKERNEL + GRUB_UPDATE_DEFAULT_KERNEL) so
-  kernel-install advances the default on every future kernel update
-- Repair existing saved_entry backlog with grubby --set-default at install
-- Add grub-boot-success.service to clear GRUB's indeterminate-boot fallback;
-  enabled on UEK hosts only, inert elsewhere (ConditionKernelVersion=*uek*)
-- New [kernel] config section: manage_kernel_default, kernel_default_package
-- Provisioning is UEK-gated and idempotent; non-UEK kernels are never touched
-- Requires: grubby, grub2-tools-minimal
+- CHANGE: Requires: grubby, grub2-tools-minimal.
+- NEW: Add grub-boot-success.service to clear GRUB's indeterminate-boot fallback; enabled on UEK
+  hosts only, inert elsewhere (ConditionKernelVersion=*uek*).
+- NEW: New [kernel] config section: manage_kernel_default, kernel_default_package.
+- NEW: Provisioning is UEK-gated and idempotent; non-UEK kernels are never touched.
+- FIX: Fix UEK kernel not booted after update: provision GRUB BLS saved_entry handling at install
+  time (DEFAULTKERNEL + GRUB_UPDATE_DEFAULT_KERNEL) so kernel-install advances the default on
+  every future kernel update.
+- FIX: Repair existing saved_entry backlog with grubby --set-default at install.
 
 * Sat May 23 2026 DagNode <packages@dagnode.com> - 1.0-1
-- Initial release
-- Inhibitor lock prevents reboot during updates
-- UEK aarch64 false-positive filtering with version cross-verification
-- systemd false-positive detection via eu-readelf build-id comparison
-- Independent watchdog with configurable soft/hard timeouts
-- filter_packages defaults include kernel-uek,kernel-uek-core,systemd
-- Requires=time-sync.target; note systemd-time-wait-sync absent on UEK R8
-- All settings in /etc/dnf/automatic-reboot.conf
+- Initial release: inhibitor lock prevents reboot during updates; UEK aarch64 false-positive
+  filtering with version cross-verification; systemd false-positive detection via eu-readelf
+  build-id comparison; independent watchdog with configurable soft/hard timeouts; filter_packages
+  defaults include kernel-uek,kernel-uek-core,systemd; Requires=time-sync.target (note
+  systemd-time-wait-sync absent on UEK R8); all settings in /etc/dnf/automatic-reboot.conf.
