@@ -117,11 +117,32 @@ if bash -c 'set -u; empty_options=(); printf "%s" "${empty_options[@]}"' >/dev/n
 else
     report_fail start_reboot_unit "bash ${BASH_VERSION} fails on an empty array under set -u"
 fi
-if flock --help 2>&1 | grep -q -- '--nonblock' && flock --help 2>&1 | grep -q -- '--wait'; then
-    report_pass lock "flock supports --nonblock and --wait"
+report_info lock "$(flock --version 2>&1 | head -n 1)"
+# The invocations acquire_reboot_request_lock uses, on a scratch file: -n and
+# -w on a free lock succeed; held by another process, -n fails at once and
+# -w 1 gives up after about a second.
+scratch_lock_file=$(mktemp)
+exec {scratch_lock_descriptor}>>"${scratch_lock_file}"
+if flock -n "${scratch_lock_descriptor}" && flock -u "${scratch_lock_descriptor}" \
+   && flock -w 1 "${scratch_lock_descriptor}" && flock -u "${scratch_lock_descriptor}"; then
+    report_pass lock "flock -n and flock -w acquire a free lock"
 else
-    report_fail lock "flock lacks --nonblock or --wait"
+    report_fail lock "flock -n or flock -w failed on a free lock"
 fi
+flock "${scratch_lock_descriptor}"
+if flock -n "${scratch_lock_file}" true 2>/dev/null; then
+    report_fail lock "flock -n acquired a lock another process holds"
+else
+    report_pass lock "flock -n refuses a held lock"
+fi
+wait_started_seconds=${SECONDS}
+if flock -w 1 "${scratch_lock_file}" true 2>/dev/null; then
+    report_fail lock "flock -w 1 acquired a lock another process holds"
+else
+    report_pass lock "flock -w 1 gives up on a held lock after $(( SECONDS - wait_started_seconds ))s"
+fi
+exec {scratch_lock_descriptor}>&-
+rm -f "${scratch_lock_file}"
 
 # ---------------------------------------------------------------------------
 printf '== systemctl show format\n'
@@ -234,7 +255,7 @@ if [[ -e "${LOCK_FILE}" ]]; then
         report_fail lock "${LOCK_FILE} is ${lock_attributes}; a user who can open it can block every reboot request"
     fi
     report_info lock "label: $(stat -c '%C' "${LOCK_FILE}" 2>&1)"
-    if runuser -u nobody -- flock --nonblock "${LOCK_FILE}" true >/dev/null 2>&1; then
+    if runuser -u nobody -- flock -n "${LOCK_FILE}" true >/dev/null 2>&1; then
         report_fail lock "user nobody could open and lock ${LOCK_FILE}"
     else
         report_pass lock "user nobody cannot open ${LOCK_FILE}"

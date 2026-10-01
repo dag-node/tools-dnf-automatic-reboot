@@ -2238,6 +2238,12 @@ test_invariant_lock_file_is_never_removed() {
     return 0
 }
 
+test_invariant_flock_uses_documented_short_options() {
+    # util-linux documents -w as --timeout; --wait is an undocumented alias.
+    script_lines 'flock --' | grep -q . && fail "flock long options in a shipped script"
+    return 0
+}
+
 test_invariant_every_script_is_shipped() {
     local script_path script_name
     for script_path in "${REPO_ROOT}"/scripts/*.sh; do
@@ -3004,6 +3010,7 @@ run_test "invariant: only reboot-if-pending reboots" test_invariant_only_reboot_
 run_test "invariant: marker removers are known"     test_invariant_marker_removers_are_known
 run_test "invariant: dispatched file removed only on refusal" test_invariant_dispatched_file_is_removed_only_on_refusal
 run_test "invariant: lock file is never removed"    test_invariant_lock_file_is_never_removed
+run_test "invariant: flock uses documented short options" test_invariant_flock_uses_documented_short_options
 run_test "invariant: every script is shipped"       test_invariant_every_script_is_shipped
 run_test "invariant: versions agree"                test_invariant_versions_agree
 run_test "reader: unit snapshot job forms"          test_reader_unit_snapshot_job_forms

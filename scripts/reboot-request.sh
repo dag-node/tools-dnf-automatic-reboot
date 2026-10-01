@@ -243,6 +243,8 @@ submit_reboot() {
 
 # acquire_reboot_request_lock WAIT_SECONDS - 0 when the lock is held; with
 # WAIT_SECONDS 0 it does not wait.  A process that exits releases it.
+# Short options only: util-linux documents -w as --timeout, and --wait is an
+# undocumented alias.
 # flock(2) grants an exclusive lock through a read-only descriptor, so any
 # user able to open the file could hold it: it is created 0600 and set to
 # 0600 before every use, in place, so a holder keeps its inode.
@@ -255,9 +257,9 @@ acquire_reboot_request_lock() {
     fi
     exec {REBOOT_REQUEST_LOCK_DESCRIPTOR}>>"${REBOOT_REQUEST_LOCK_FILE}" || return 1
     if [[ "${wait_seconds}" -eq 0 ]]; then
-        flock --nonblock "${REBOOT_REQUEST_LOCK_DESCRIPTOR}" && return 0
+        flock -n "${REBOOT_REQUEST_LOCK_DESCRIPTOR}" && return 0
     else
-        flock --wait "${wait_seconds}" "${REBOOT_REQUEST_LOCK_DESCRIPTOR}" && return 0
+        flock -w "${wait_seconds}" "${REBOOT_REQUEST_LOCK_DESCRIPTOR}" && return 0
     fi
     release_reboot_request_lock
     return 1
