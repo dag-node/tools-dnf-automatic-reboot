@@ -104,12 +104,12 @@ readonly CONFIG_FILE=/etc/dnf/automatic-reboot.conf
 readonly LOG_FILE=/var/log/dnf-automatic-reboot.log
 readonly SCRIPT_NAME=script-name   # used in log prefix
 
-log()      { printf '<6>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: %s\n'          "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
-log_warn() { printf '<4>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
-log_err()  { printf '<3>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: ERROR: %s\n'   "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
+log()         { printf '<6>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: %s\n'          "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
+log_warning() { printf '<4>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
+log_error()   { printf '<3>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: ERROR: %s\n'   "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
 
-# Config reader: conf_get KEY DEFAULT_VALUE
-conf_get() {
+# Config reader: get_config_value KEY DEFAULT_VALUE
+get_config_value() {
     local config_key="$1" default_value="$2" config_value
     config_value=$(grep -E "^\s*${config_key}\s*=" "${CONFIG_FILE}" 2>/dev/null \
                    | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//') || true
@@ -130,7 +130,7 @@ Script-scope constants and globals are `UPPER_SNAKE_CASE`; function locals are
 - Save/restore `IFS` around comma-split loops: `PREVIOUS_IFS="${IFS}"; IFS=','; ...; IFS="${PREVIOUS_IFS}"`
 - `|| true` on commands that are allowed to fail
 - Never `return` at top level; use `exit`
-- `conf_get_int` for any value that reaches an arithmetic test — a typo in the
+- `get_config_integer` for any value that reaches an arithmetic test — a typo in the
   config must not abort the run inside `[[ ... -gt ... ]]`
 - A function whose value is captured with `$(...)` must not log to stdout. Log
   helpers write to stdout for the journal, so inside a value-returning function
@@ -189,8 +189,8 @@ watchdog path that could reboot a host mid-transaction — not on line coverage.
 ### Config file parsing
 
 All tunables live in `conf/automatic-reboot.conf`. Scripts never have hardcoded
-policy values — always `conf_get key default`. This keeps scripts testable without
-installing the config. `conf_get` is section-blind: it matches `^\s*KEY\s*=` anywhere
+policy values — always `get_config_value key default`. This keeps scripts testable without
+installing the config. `get_config_value` is section-blind: it matches `^\s*KEY\s*=` anywhere
 in the file, so every key name must be unique across all sections.
 
 ### Parsing external tool output
@@ -309,7 +309,7 @@ removers:
 
 `dnf-automatic-reboot.service` carries `ConditionPathExists=!` for both. `request_reboot`
 in `run.sh` and `watchdog.sh` hands over between them: it creates `.reboot-pending`, then
-calls `schedule_reboot` or `reboot_now`. On success `.reboot-pending` stays and the
+calls `schedule_reboot` or `request_immediate_reboot`. On success `.reboot-pending` stays and the
 watchdog's EXIT trap releases `.recovery`. On a definite failure it removes the
 `.reboot-pending` it created; one that already existed belongs to an earlier request and
 stays. When the process is stopped mid-request, the outcome is unknown: `.reboot-pending`
@@ -756,7 +756,7 @@ tail -f /var/log/dnf-automatic-reboot.log
 ## What not to do
 
 - Do not add `setenforce 0` or `permissive` as a workaround for any SELinux denial.
-- Do not hardcode policy (timeouts, package names) in scripts — use `conf_get`.
+- Do not hardcode policy (timeouts, package names) in scripts — use `get_config_value`.
 - Do not parse tool output with a blocklist of known-uninteresting lines, and do not
   fold stderr into a parsed stream. Match the shape you want and discard the rest.
 - Do not treat an unverifiable state as a false positive. "Cannot tell" keeps the

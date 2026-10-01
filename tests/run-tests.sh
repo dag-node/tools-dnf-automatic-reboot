@@ -360,7 +360,7 @@ test_parser_yields_nothing_without_bullets() {
 }
 
 # ---------------------------------------------------------------------------
-# config: conf_get is section-blind, so key names must not collide
+# config: get_config_value is section-blind, so key names must not collide
 # ---------------------------------------------------------------------------
 test_config_every_key_resolves() {
     load_needs_reboot_library
@@ -372,7 +372,7 @@ test_config_every_key_resolves() {
                       restart_services_exclude watchdog_soft_timeout_min \
                       watchdog_hard_timeout_min force_reboot_on_hard_timeout \
                       enable_chrony_wait wall_messages; do
-        resolved_value=$(conf_get "${config_key}" "MISSING")
+        resolved_value=$(get_config_value "${config_key}" "MISSING")
         if [[ "${resolved_value}" == "MISSING" ]]; then
             fail "shipped config does not define ${config_key}"
         fi
@@ -383,8 +383,8 @@ test_config_every_key_resolves() {
 test_config_prefix_keys_do_not_collide() {
     load_needs_reboot_library
     # restart_services must not pick up restart_services_exclude's value.
-    assert_equals "yes" "$(conf_get restart_services MISSING)" "restart_services"
-    assert_contains "$(conf_get restart_services_exclude MISSING)" "dbus.service" \
+    assert_equals "yes" "$(get_config_value restart_services MISSING)" "restart_services"
+    assert_contains "$(get_config_value restart_services_exclude MISSING)" "dbus.service" \
         "restart_services_exclude"
 }
 
@@ -394,7 +394,7 @@ test_config_int_rejects_non_numeric() {
         > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
     # The warning must not land on stdout: the caller assigns this to a
     # variable that then goes straight into `timeout <value>s`.
-    assert_equals "120" "$(conf_get_int needs_restarting_timeout_sec 120 2>/dev/null)" \
+    assert_equals "120" "$(get_config_integer needs_restarting_timeout_sec 120 2>/dev/null)" \
         "non-numeric falls back to a clean default"
 }
 
@@ -402,7 +402,7 @@ test_config_int_rejects_negative() {
     load_needs_reboot_library
     printf '[kernel]\nkernel_reboot_attempt_limit = -1\n' \
         > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    assert_equals "3" "$(conf_get_int kernel_reboot_attempt_limit 3 2>/dev/null)" \
+    assert_equals "3" "$(get_config_integer kernel_reboot_attempt_limit 3 2>/dev/null)" \
         "negative falls back to a clean default"
 }
 
@@ -1394,8 +1394,8 @@ stub_watchdog_kill_path() {
         [[ "${STUB_KILL_FAILS:-}" == "yes" ]] && return 1
         return 0
     }
-    reboot_now() {
-        printf 'reboot_now recovery_file=%s state_file=%s reboot_pending_file=%s\n' \
+    request_immediate_reboot() {
+        printf 'request_immediate_reboot recovery_file=%s state_file=%s reboot_pending_file=%s\n' \
             "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${STATE_FILE}")" \
             "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
     }
@@ -1424,7 +1424,7 @@ test_watchdog_failed_kill_keeps_supervision() {
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 1 "${exit_code}" "a failed kill fails the watchdog"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot_now" "no reboot over a run that may still be updating"
+    assert_not_contains "$(cat "${STUB_LOG}")" "request_immediate_reboot" "no reboot over a run that may still be updating"
     [[ -f "${STATE_FILE}" ]] || fail "the state file must survive a failed kill"
     [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery file must be removed"
     return 0
@@ -1446,7 +1446,7 @@ test_watchdog_unconfirmed_kill_signals_no_pid() {
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 1 "${exit_code}" "an unconfirmed kill fails the watchdog"
     assert_equals "yes" "${process_survived}" "the PID is not signalled directly"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot_now" "and nothing is rebooted"
+    assert_not_contains "$(cat "${STUB_LOG}")" "request_immediate_reboot" "and nothing is rebooted"
     [[ -f "${STATE_FILE}" ]] || fail "the state file must survive an unconfirmed kill"
     return 0
 }
@@ -1464,7 +1464,7 @@ test_watchdog_no_run_starts_during_the_kill() {
         "the main unit is blocked from starting while its run is killed"
     # A run starting after the kill would have its state file removed and
     # be rebooted under; the marker must outlast the reboot request.
-    assert_contains "$(cat "${STUB_LOG}")" "reboot_now recovery_file=present state_file=absent reboot_pending_file=present" \
+    assert_contains "$(cat "${STUB_LOG}")" "request_immediate_reboot recovery_file=present state_file=absent reboot_pending_file=present" \
         "no run can start between the state cleanup and the reboot"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the reboot-pending marker must stay until the reboot"
     [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery marker ends with recovery"
@@ -1498,7 +1498,7 @@ test_watchdog_recovery_without_reboot_allows_runs_again() {
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 0 "${exit_code}" "recovery completes"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot_now" "no reboot while updating"
+    assert_not_contains "$(cat "${STUB_LOG}")" "request_immediate_reboot" "no reboot while updating"
     [[ -f "${RECOVERY_FILE}" ]] && fail "with no reboot pending the next run must be allowed"
     return 0
 }
@@ -1642,14 +1642,14 @@ test_watchdog_unknown_identity_is_not_acted_on() {
     export STUB_MAIN_PID=""
     write_watchdog_state checking 200 "${background_pid}"
     stub_watchdog_host
-    reboot_now() { printf 'reboot_now\n' >> "${STUB_LOG}"; }
+    request_immediate_reboot() { printf 'request_immediate_reboot\n' >> "${STUB_LOG}"; }
     # Past the hard timeout, but systemctl reports no MainPID: the live PID
     # may not be the run.
     output=$( main 2>&1 ) || exit_code=$?
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 1 "${exit_code}" "an unestablished identity fails the watchdog"
     assert_not_contains "$(cat "${STUB_LOG}")" "kill_service_cgroup" "nothing is killed"
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot_now" "and nothing is rebooted"
+    assert_not_contains "$(cat "${STUB_LOG}")" "request_immediate_reboot" "and nothing is rebooted"
 }
 
 test_watchdog_dispatch_failure_fails_the_watchdog() {
@@ -1713,14 +1713,14 @@ load_cancel_reboot_library() {
     source "${REPO_ROOT}/scripts/cancel-reboot.sh"
     set +e
     IFS=$' \t\n'
-    unit_property() {
+    get_unit_property() {
         case "$1:$2" in
             *.timer:ActiveState)   printf '%s' "${STUB_TIMER_ACTIVE_STATE:-active}" ;;
             *.timer:LoadState)     printf '%s' "${STUB_TIMER_LOAD_STATE:-loaded}" ;;
             *.service:ActiveState) printf '%s' "${STUB_SERVICE_ACTIVE_STATE:-inactive}" ;;
         esac
     }
-    system_state() { printf '%s' "${STUB_SYSTEM_STATE:-running}"; }
+    get_system_state() { printf '%s' "${STUB_SYSTEM_STATE:-running}"; }
     stop_scheduled_reboot_timer() { printf 'stop timer\n' >> "${STUB_LOG}"; }
     : > "${REBOOT_PENDING_FILE}"
 }

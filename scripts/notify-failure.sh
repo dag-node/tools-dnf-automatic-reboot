@@ -34,7 +34,7 @@ readonly CANCEL_REBOOT_COMMAND=/usr/libexec/dnf-automatic-reboot/cancel-reboot.s
 readonly SCRIPT_NAME=notify-failure
 readonly JOURNAL_EXCERPT_LINES=15
 
-log_err() {
+log_error() {
     printf '<3>%s: %s\n' "${SCRIPT_NAME}" "$*"
     printf '%s %s: ERROR: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
@@ -62,21 +62,21 @@ main() {
     local failed_unit_name="${1:-dnf-automatic-reboot.service}" journal_excerpt="" journal_line
     local outcome_summary="Automatic updates or the reboot decision did not complete."
 
-    log_err "${failed_unit_name} FAILED - the host may be running unpatched or unrebooted"
+    log_error "${failed_unit_name} FAILED - the host may be running unpatched or unrebooted"
 
     journal_excerpt=$(journalctl -u "${failed_unit_name}" -n "${JOURNAL_EXCERPT_LINES}" \
                       --no-pager --output=cat 2>/dev/null) || true
     if [[ -n "${journal_excerpt}" ]]; then
         while IFS= read -r journal_line; do
             if [[ -n "${journal_line}" ]]; then
-                log_err "${failed_unit_name}: ${journal_line}"
+                log_error "${failed_unit_name}: ${journal_line}"
             fi
         done <<< "${journal_excerpt}"
     fi
 
     if [[ "${failed_unit_name}" == "${SCHEDULED_REBOOT_SERVICE}" ]]; then
         outcome_summary=$(failed_reboot_recovery_hint)
-        log_err "${outcome_summary}"
+        log_error "${outcome_summary}"
     fi
 
     wall_msg "dnf-automatic-reboot: ${failed_unit_name} FAILED." \

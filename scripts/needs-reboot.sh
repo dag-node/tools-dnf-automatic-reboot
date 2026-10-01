@@ -59,11 +59,11 @@ log() {
     printf '<6>%s: %s\n' "${SCRIPT_NAME}" "$*"
     printf '%s %s: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
-log_warn() {
+log_warning() {
     printf '<4>%s: %s\n' "${SCRIPT_NAME}" "$*"
     printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
-log_err() {
+log_error() {
     printf '<3>%s: %s\n' "${SCRIPT_NAME}" "$*"
     printf '%s %s: ERROR: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
@@ -71,25 +71,25 @@ log_err() {
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
-# conf_get KEY DEFAULT_VALUE
+# get_config_value KEY DEFAULT_VALUE
 # Reads a key from any section; returns DEFAULT_VALUE when the key is absent.
-conf_get() {
+get_config_value() {
     local config_key="$1" default_value="$2" config_value
     config_value=$(grep -E "^\s*${config_key}\s*=" "${CONFIG_FILE}" 2>/dev/null \
                    | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//') || true
     printf '%s' "${config_value:-${default_value}}"
 }
 
-# conf_get_int KEY DEFAULT_VALUE
-# As conf_get, but falls back to DEFAULT_VALUE when the configured value is
+# get_config_integer KEY DEFAULT_VALUE
+# As get_config_value, but falls back to DEFAULT_VALUE when the configured value is
 # not a plain non-negative integer.  Keeps a typo in the config from aborting
 # the run inside an arithmetic comparison.
-conf_get_int() {
+get_config_integer() {
     local config_key="$1" default_value="$2" config_value
-    config_value=$(conf_get "${config_key}" "${default_value}")
+    config_value=$(get_config_value "${config_key}" "${default_value}")
     config_value="${config_value//[[:space:]]/}"
     if [[ ! "${config_value}" =~ ^[0-9]+$ ]]; then
-        log_warn "${config_key}='${config_value}' is not a non-negative integer - using default ${default_value}" >&2
+        log_warning "${config_key}='${config_value}' is not a non-negative integer - using default ${default_value}" >&2
         config_value="${default_value}"
     fi
     printf '%s' "${config_value}"
@@ -176,12 +176,12 @@ write_kernel_reboot_attempts() {
 # ---------------------------------------------------------------------------
 # Read config
 # ---------------------------------------------------------------------------
-FILTER_PACKAGE_LIST=$(conf_get filter_packages "kernel-uek,kernel-uek-core,kernel,kernel-core,systemd")
-VERIFY_KERNEL_VERSION=$(conf_get verify_kernel_version yes)
-LEARN_FALSE_POSITIVES=$(conf_get learn_false_positives yes)
-VERIFY_GRUB_DEFAULT=$(conf_get verify_grub_default yes)
-KERNEL_REBOOT_ATTEMPT_LIMIT=$(conf_get_int kernel_reboot_attempt_limit 3)
-NEEDS_RESTARTING_TIMEOUT_SEC=$(conf_get_int needs_restarting_timeout_sec 120)
+FILTER_PACKAGE_LIST=$(get_config_value filter_packages "kernel-uek,kernel-uek-core,kernel,kernel-core,systemd")
+VERIFY_KERNEL_VERSION=$(get_config_value verify_kernel_version yes)
+LEARN_FALSE_POSITIVES=$(get_config_value learn_false_positives yes)
+VERIFY_GRUB_DEFAULT=$(get_config_value verify_grub_default yes)
+KERNEL_REBOOT_ATTEMPT_LIMIT=$(get_config_integer kernel_reboot_attempt_limit 3)
+NEEDS_RESTARTING_TIMEOUT_SEC=$(get_config_integer needs_restarting_timeout_sec 120)
 
 # Save and restore IFS around the comma-split so the global \n\t setting
 # is not silently clobbered for the rest of the script.
@@ -303,7 +303,7 @@ verify_build_id() {
                     log "${package_name}: pid ${process_id} of ${binary_path} exited before its build-id was read"
                     continue
                 fi
-                log_warn "${package_name}: could not read build-ids for ${binary_path} (pid ${process_id})"
+                log_warning "${package_name}: could not read build-ids for ${binary_path} (pid ${process_id})"
                 unreadable_build_id=1
                 continue
             fi
@@ -316,11 +316,11 @@ verify_build_id() {
     done
 
     if [[ "${unreadable_build_id}" -eq 1 ]]; then
-        log_warn "${package_name}: a running process could not be verified - keeping the package"
+        log_warning "${package_name}: a running process could not be verified - keeping the package"
         return 1
     fi
     if [[ "${verified_process_count}" -eq 0 ]]; then
-        log_warn "${package_name}: no running process owned by this package"
+        log_warning "${package_name}: no running process owned by this package"
         return 1
     fi
 
@@ -354,7 +354,7 @@ running_kernel_is_newest() {
     newest_kernel_version=$(newest_installed_kernel_version "${package_name}")
     if [[ -z "${newest_kernel_version}" ]]; then
         # Flagged but not installed, or rpm failed: no evidence of spuriousness.
-        log_warn "${package_name}: no installed version found, treating as genuine"
+        log_warning "${package_name}: no installed version found, treating as genuine"
         return 1
     fi
     newest_kernel_version_without_arch="${newest_kernel_version%".${machine_architecture}"}"
@@ -407,7 +407,7 @@ run_needs_restarting() {
     # No fallback path: this function removes the file when needs-restarting
     # returns, and a fixed path such as /dev/null would be removed with it.
     if ! stderr_capture_file=$(mktemp); then
-        log_err "cannot create a temporary file for needs-restarting stderr"
+        log_error "cannot create a temporary file for needs-restarting stderr"
         return 2
     fi
 
@@ -415,7 +415,7 @@ run_needs_restarting() {
         "${DNF_BIN}" -q -C needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?
 
     if ! needs_restarting_gave_result "${exit_code}"; then
-        log_warn "cache-only needs-restarting exited ${exit_code} without a result - retrying with a metadata refresh"
+        log_warning "cache-only needs-restarting exited ${exit_code} without a result - retrying with a metadata refresh"
         exit_code=0
         NEEDS_RESTARTING_OUTPUT=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
             "${DNF_BIN}" -q needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?
@@ -427,7 +427,7 @@ run_needs_restarting() {
     # package name.
     if [[ -s "${stderr_capture_file}" ]]; then
         while IFS= read -r stderr_line; do
-            [[ -n "${stderr_line}" ]] && log_warn "needs-restarting: ${stderr_line}"
+            [[ -n "${stderr_line}" ]] && log_warning "needs-restarting: ${stderr_line}"
         done < "${stderr_capture_file}"
     fi
 
@@ -453,7 +453,7 @@ classify_flagged_packages() {
         # run, but the kernel and learning paths still can.  Losing one verifier
         # must not suppress the reboot decision the others are able to make.
         build_id_verifier_available=0
-        log_err "eu-readelf unavailable - elfutils is required; build-id verification disabled, affected packages treated as genuine"
+        log_error "eu-readelf unavailable - elfutils is required; build-id verification disabled, affected packages treated as genuine"
     fi
 
     REBOOT_TRIGGER_PACKAGES=()
@@ -481,11 +481,11 @@ classify_flagged_packages() {
                 grub_default_check_result=0
                 grub_default_is_newest_kernel "${flagged_package_name}" || grub_default_check_result=$?
                 if [[ "${grub_default_check_result}" -eq 1 ]]; then
-                    log_err "${flagged_package_name}: GRUB default is $(grubby --default-kernel 2>/dev/null) but the newest installed kernel is ${target_kernel_version} - a reboot would return to the same kernel; withholding reboot, repair the BLS default"
+                    log_error "${flagged_package_name}: GRUB default is $(grubby --default-kernel 2>/dev/null) but the newest installed kernel is ${target_kernel_version} - a reboot would return to the same kernel; withholding reboot, repair the BLS default"
                     REBOOT_WITHHELD=1
                     continue
                 elif [[ "${grub_default_check_result}" -eq 2 ]]; then
-                    log_warn "${flagged_package_name}: could not read the GRUB default; proceeding with the reboot decision"
+                    log_warning "${flagged_package_name}: could not read the GRUB default; proceeding with the reboot decision"
                 fi
             fi
 
@@ -501,12 +501,12 @@ classify_flagged_packages() {
                     log "${flagged_package_name}: attempt ${kernel_reboot_attempts} of ${KERNEL_REBOOT_ATTEMPT_LIMIT} for ${target_kernel_version} is already counted in this boot"
                 else
                     if [[ "${kernel_reboot_attempts}" -ge "${KERNEL_REBOOT_ATTEMPT_LIMIT}" ]]; then
-                        log_err "${flagged_package_name}: ${kernel_reboot_attempts} consecutive reboots for ${target_kernel_version} did not make it the running kernel - giving up, manual intervention required"
+                        log_error "${flagged_package_name}: ${kernel_reboot_attempts} consecutive reboots for ${target_kernel_version} did not make it the running kernel - giving up, manual intervention required"
                         REBOOT_WITHHELD=1
                         continue
                     fi
                     if [[ -z "${current_boot_id}" ]]; then
-                        log_warn "could not read boot_id - counting this check as a reboot attempt"
+                        log_warning "could not read boot_id - counting this check as a reboot attempt"
                     fi
                     write_kernel_reboot_attempts "${flagged_package_name}" \
                         "${target_kernel_version}" $(( kernel_reboot_attempts + 1 )) "${current_boot_id}"
@@ -562,7 +562,7 @@ apply_restart_state_learning() {
 
     current_boot_id=$(cat "${BOOT_ID_FILE}" 2>/dev/null) || true
     if [[ -z "${current_boot_id}" ]]; then
-        log_warn "could not read boot_id - restart-state learning skipped this run"
+        log_warning "could not read boot_id - restart-state learning skipped this run"
         return 0
     fi
 
@@ -574,7 +574,7 @@ apply_restart_state_learning() {
 
         installed_package_evr=$(rpm -q --qf '%{EVR}' "${trigger_package_name}" 2>/dev/null) || true
         if [[ -z "${installed_package_evr}" ]]; then
-            log_warn "${trigger_package_name}: not installed or rpm query failed, cannot track restart-state"
+            log_warning "${trigger_package_name}: not installed or rpm query failed, cannot track restart-state"
             learned_trigger_packages+=("${trigger_package_name}")
             continue
         fi
@@ -631,7 +631,7 @@ main() {
 
     # Exit 1 without a package line is a dnf error, not the plugin's answer.
     if ! needs_restarting_gave_result "${needs_restarting_exit_code}"; then
-        log_err "needs-restarting exited ${needs_restarting_exit_code} without naming a package - cannot determine reboot state, not rebooting"
+        log_error "needs-restarting exited ${needs_restarting_exit_code} without naming a package - cannot determine reboot state, not rebooting"
         exit 2
     fi
 
@@ -646,7 +646,7 @@ main() {
 
     if [[ "${#REBOOT_TRIGGER_PACKAGES[@]}" -eq 0 ]]; then
         if [[ "${REBOOT_WITHHELD}" -eq 1 ]]; then
-            log_err "Reboot withheld: a genuine kernel update is pending but rebooting would not boot it - see errors above"
+            log_error "Reboot withheld: a genuine kernel update is pending but rebooting would not boot it - see errors above"
             exit 2
         fi
         log "All triggers filtered as false positives - no reboot needed"
