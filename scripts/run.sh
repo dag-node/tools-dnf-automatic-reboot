@@ -250,6 +250,8 @@ SERVICE_RESTART_SUMMARY="stale services not checked"
 SCHEDULED_REBOOT_SUMMARY=""
 # The state file content this run last published; empty before the first.
 PUBLISHED_RUN_STATE=""
+# What dnf-automatic installed, for the completion line; set once it returns.
+UPDATE_SUMMARY="update result unknown"
 
 # ---------------------------------------------------------------------------
 # Cleanup handler - run by the EXIT trap
@@ -511,7 +513,7 @@ schedule_reboot() {
             fi
             SCHEDULED_REBOOT_SUMMARY="reboot scheduled for ${reboot_time}; update runs held until then; cancel with: ${CANCEL_REBOOT_COMMAND}"
             log "Reboot dispatch confirmed: ${SCHEDULED_REBOOT_UNIT}.timer fires at ${reboot_time}"
-            wall_msg "dnf-automatic-reboot: Updates installed. System will reboot at ${reboot_time}." \
+            wall_msg "dnf-automatic-reboot: System will reboot at ${reboot_time}." \
                      "Cancel with: ${CANCEL_REBOOT_COMMAND}"
             return 0
             ;;
@@ -568,6 +570,21 @@ wait_for_clock_sync() {
     return 1
 }
 
+# describe_installed_updates EPOCH -> the update part of the completion line,
+# from the packages whose rpm INSTALLTIME is at or after EPOCH, taken just
+# before dnf-automatic started.  dnf-automatic exits 0 whether or not it
+# installed anything.  Only wording depends on this; no decision does.
+describe_installed_updates() {
+    local installed_package_count
+    installed_package_count=$(rpm -qa --qf '%{INSTALLTIME}\n' 2>/dev/null \
+        | awk -v since="$1" '$1 >= since { count++ } END { print count + 0 }') || installed_package_count=""
+    case "${installed_package_count}" in
+        "") printf '%s' "Updates applied" ;;
+        0)  printf '%s' "No updates installed" ;;
+        *)  printf '%s' "Updates installed (packages: ${installed_package_count})" ;;
+    esac
+}
+
 # exit_if_reboot_pending - exits 0 without updating while a scheduled reboot
 # is waiting, queued, running or dispatched, and exits 1 when that cannot be
 # read.  ConditionPathExists=! on REBOOT_PENDING_FILE normally keeps this unit
@@ -593,7 +610,7 @@ exit_if_reboot_pending() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
-    local dnf_automatic_exit_code=0 needs_reboot_exit_code=0 service_restart_exit_code=0
+    local dnf_automatic_exit_code=0 needs_reboot_exit_code=0 service_restart_exit_code=0 update_started_epoch
 
     trap cleanup EXIT
 
@@ -624,6 +641,7 @@ main() {
 
     wall_msg "dnf-automatic-reboot: Starting automatic updates. Reboot is inhibited until they complete."
     log "Running dnf-automatic under the inhibitor lock (timeout=${DNF_TIMEOUT_MIN}m kill_grace=${KILL_GRACE_SEC}s)"
+    update_started_epoch=$(date +%s)
     run_dnf_automatic_under_inhibitor || dnf_automatic_exit_code=$?
 
     if [[ "${dnf_automatic_exit_code}" -ne 0 ]]; then
@@ -634,6 +652,7 @@ main() {
     fi
 
     log "dnf-automatic completed successfully"
+    UPDATE_SUMMARY=$(describe_installed_updates "${update_started_epoch}")
     warn_on_unapplied_security_advisories
     # Still supervised when this fails: the file keeps phase=updating, which
     # the watchdog treats the more cautiously of the two.
@@ -678,7 +697,7 @@ main() {
 # it.
 report_completion() {
     local reboot_outcome="$1" run_failed="$2" completion_summary inspected_unit_names=()
-    completion_summary="Updates installed; ${reboot_outcome}; ${SERVICE_RESTART_SUMMARY}"
+    completion_summary="${UPDATE_SUMMARY}; ${reboot_outcome}; ${SERVICE_RESTART_SUMMARY}"
     if [[ "${run_failed}" -eq 0 ]]; then
         log "${completion_summary}"
         wall_msg "dnf-automatic-reboot: ${completion_summary}."

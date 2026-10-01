@@ -983,6 +983,7 @@ stub_run_main() {
         return "${STUB_DNF_AUTOMATIC_RC:-0}"
     }
     run_reboot_check() { return "${STUB_NEEDS_REBOOT_RC:-0}"; }
+    describe_installed_updates() { printf '%s' "Updates installed (packages: 2)"; }
     read_scheduled_reboot_status() { printf '%s' "${STUB_SCHEDULED_REBOOT_STATUS:-none}"; }
     chronyc_available() { [[ "${STUB_CHRONYC_MISSING:-}" != "yes" ]]; }
     chronyc() { printf 'chronyc %s\n' "$*" >> "${STUB_LOG}"; return "${STUB_CHRONYC_RC:-0}"; }
@@ -1024,7 +1025,7 @@ test_run_pending_restart_fails_the_run() {
     local exit_code=0 output
     output=$( main 2>&1 ) || exit_code=$?
     assert_exit_code 1 "${exit_code}" "a restart that did not finish fails the run"
-    assert_contains "${output}" "Updates installed; no reboot needed; restart still pending for sshd.service. Check: systemctl status sshd.service" \
+    assert_contains "${output}" "Updates installed (packages: 2); no reboot needed; restart still pending for sshd.service. Check: systemctl status sshd.service" \
         "one summary names the pending restart and the command to check it"
     assert_not_contains "${output}" "No stale services needed restarting" "never reported as nothing to do"
 }
@@ -1051,8 +1052,17 @@ dbus.service"
     local exit_code=0 output
     output=$( main 2>&1 ) || exit_code=$?
     assert_exit_code 0 "${exit_code}" "an excluded unit is by design, not a failure"
-    assert_contains "${output}" "Updates installed; no reboot needed; restarted sshd.service; excluded from restart, still on pre-update code: dbus.service" \
+    assert_contains "${output}" "Updates installed (packages: 2); no reboot needed; restarted sshd.service; excluded from restart, still on pre-update code: dbus.service" \
         "one line for the whole run"
+}
+
+test_run_summary_counts_what_was_installed() {
+    load_run_library
+    rpm() { printf '100\n200\n300\n'; }
+    assert_equals "Updates installed (packages: 2)" "$(describe_installed_updates 200)" "two installed during the run"
+    assert_equals "No updates installed" "$(describe_installed_updates 301)" "nothing installed: never 'Updates installed'"
+    rpm() { return 1; }
+    assert_equals "Updates applied" "$(describe_installed_updates 200)" "rpm unreadable: no count claimed"
 }
 
 test_run_service_restarts_stay_supervised() {
@@ -3233,6 +3243,7 @@ run_test "run: failed restart fails the run"        test_run_failed_restart_fail
 run_test "run: completion summary names every outcome" test_run_completion_summary_names_every_outcome
 run_test "run: reboot is scheduled on a named unit"  test_reboot_is_scheduled_on_a_named_unit needs-exec
 run_test "run: reboot already scheduled is kept"     test_reboot_already_scheduled_is_not_scheduled_twice needs-exec
+run_test "run: summary counts what was installed"   test_run_summary_counts_what_was_installed
 run_test "run: service restarts stay supervised"    test_run_service_restarts_stay_supervised
 
 printf 'repositories\n'

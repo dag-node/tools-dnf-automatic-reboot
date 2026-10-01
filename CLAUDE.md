@@ -591,7 +591,7 @@ A restart that fails, one still unfinished at `restart_service_timeout_sec`, and
 `needs-restarting -s` that cannot list the units each leave pre-update code running, so
 each fails the run. An excluded unit does not: it is left running by design. The run
 ends with one line naming the update, reboot and restart outcome, for example
-`Updates installed; no reboot needed; restart still pending for sshd.service. Check:
+`Updates installed (packages: 3); no reboot needed; restart still pending for sshd.service. Check:
 systemctl status sshd.service`, logged and sent through `wall`.
 
 ## `dnf-automatic` on EL8

@@ -532,6 +532,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   read as decimal. Bash read it as an invalid octal number, and a reboot could be submitted with
   no delay. reboot_delay_sec must lie between 1 and 86400 and reboot_request_lock_wait_sec
   between 1 and 600; a value outside is logged and the default used.
+- FIX: The completion line says "No updates installed" when dnf-automatic installed nothing, and
+  otherwise counts the packages it installed; it said "Updates installed" either way. The reboot
+  warning no longer claims updates were installed.
 - FIX: A failed scheduled reboot's notice says whether update runs are still held and how to
   release them.
 
