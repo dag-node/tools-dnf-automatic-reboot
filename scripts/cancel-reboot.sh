@@ -5,24 +5,22 @@
 # Cancels a reboot that run.sh or the watchdog requested, and allows update
 # runs again.
 #
-# Under the reboot request lock, stops dnf-automatic-reboot-scheduled-reboot
-# .timer, then removes /run/dnf-automatic-reboot.reboot-pending.  It reports
-# success only on positive evidence that the reboot will not happen:
+# Holding the reboot request lock, it removes
+# /run/dnf-automatic-reboot.reboot-pending and stops
+# dnf-automatic-reboot-scheduled-reboot.timer.  Every reboot this package
+# requests runs reboot-if-pending.sh, which reboots only while that file
+# exists and only under the same lock, so once the file is gone a timer that
+# still fires, or a request systemd processes late, does not reboot the host.
 #
-#   - the timer was stopped before it fired, and the reboot service has no
-#     queued job
-#   - the reboot service ran and failed
-#   - no reboot was scheduled, PID 1 is not stopping and logind is not
-#     preparing a shutdown
-#
-# It exits 1 and changes nothing while a reboot request holds the lock, once
-# the reboot service is queued, running or has succeeded, while the host is
-# shutting down, and whenever systemd's state cannot be read.
+# It exits 1 and changes nothing while a reboot request or the reboot command
+# holds the lock, once reboot-if-pending.sh has called systemctl reboot
+# (/run/dnf-automatic-reboot.reboot-dispatched exists), while the host is
+# shutting down or its shutdown state cannot be read, and when the scheduled
+# reboot's state cannot be read.
 #
 # Exit: 0 = cancelled, or nothing was pending; 1 = not cancelled.
 #
 # Log: /var/log/dnf-automatic-reboot.log
-# ---------------------------------------------------------------------------
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -63,48 +61,45 @@ refuse_cancellation() {
 main() {
     local scheduled_reboot_status shutdown_state
     # A request holds the lock from before it creates the marker until its
-    # outcome is known; a marker seen without the lock may not have reached
-    # systemd yet.
+    # outcome is known, and reboot-if-pending.sh from its marker check until
+    # systemctl reboot returns.
     acquire_reboot_request_lock 0 \
-        || refuse_cancellation "a reboot request is in progress; retry in a minute"
+        || refuse_cancellation "a reboot request or the reboot command is in progress; retry in a minute"
 
+    if [[ -e "${REBOOT_DISPATCHED_FILE}" ]]; then
+        refuse_cancellation "the reboot command already ran in this boot"
+    fi
     scheduled_reboot_status=$(read_scheduled_reboot_status)
-    case "${scheduled_reboot_status}" in
-        in_progress) refuse_cancellation "the reboot service is queued or running" ;;
-        dispatched)  refuse_cancellation "systemd already accepted the reboot" ;;
-        unknown)     refuse_cancellation "the state of ${SCHEDULED_REBOOT_UNIT} cannot be read" ;;
-    esac
+    if [[ "${scheduled_reboot_status}" == "unknown" ]]; then
+        refuse_cancellation "the state of ${SCHEDULED_REBOOT_UNIT} cannot be read"
+    fi
     if [[ ! -e "${REBOOT_PENDING_FILE}" && "${scheduled_reboot_status}" == "none" ]]; then
         log "no reboot is pending"
         exit 0
     fi
-
-    if [[ "${scheduled_reboot_status}" == "waiting" ]]; then
-        stop_unit "${SCHEDULED_REBOOT_UNIT}.timer" \
-            || refuse_cancellation "cannot stop ${SCHEDULED_REBOOT_UNIT}.timer"
-        # The timer may have queued the reboot service just before it stopped;
-        # stopping a timer does not cancel a job it queued.
-        scheduled_reboot_status=$(read_scheduled_reboot_status)
-        case "${scheduled_reboot_status}" in
-            none|failed) ;;
-            *) refuse_cancellation "after stopping the timer, ${SCHEDULED_REBOOT_UNIT} is ${scheduled_reboot_status}" ;;
-        esac
-    fi
-    if [[ "${scheduled_reboot_status}" == "failed" ]]; then
-        log "the scheduled reboot had already failed: systemctl status ${SCHEDULED_REBOOT_UNIT}.service"
-        reset_failed_units "${SCHEDULED_REBOOT_UNIT}.service"
-    fi
-
-    # An immediate reboot, or one logind accepted and delays for an inhibitor,
-    # leaves no unit to inspect.
+    # An immediate reboot from elsewhere, or one logind accepted and delays
+    # for an inhibitor, leaves no unit of this package to inspect.
     shutdown_state=$(read_host_shutdown_state)
     case "${shutdown_state}" in
         yes)     refuse_cancellation "the host is already shutting down" ;;
         unknown) refuse_cancellation "whether the host is shutting down cannot be read" ;;
     esac
 
+    # From here no reboot of this package can start: reboot-if-pending.sh
+    # needs the lock this process holds, and finds no marker after it.
     rm -f "${REBOOT_PENDING_FILE}" \
-        || refuse_cancellation "cannot remove ${REBOOT_PENDING_FILE}; no reboot is scheduled, but update runs stay blocked"
+        || refuse_cancellation "cannot remove ${REBOOT_PENDING_FILE}"
+    case "${scheduled_reboot_status}" in
+        waiting|in_progress)
+            if ! stop_unit "${SCHEDULED_REBOOT_UNIT}.timer"; then
+                log_warning "cannot stop ${SCHEDULED_REBOOT_UNIT}.timer; when it fires, reboot-if-pending.sh finds no pending reboot and does not reboot"
+            fi
+            ;;
+        failed)
+            log "the requested reboot had failed: systemctl status ${SCHEDULED_REBOOT_UNIT}.service"
+            reset_failed_units "${SCHEDULED_REBOOT_UNIT}.service"
+            ;;
+    esac
     log "reboot cancelled; update runs are allowed again"
     exit 0
 }

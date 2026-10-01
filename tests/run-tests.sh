@@ -164,13 +164,13 @@ fi
 # MainPID is STUB_MAIN_PID.
 if [[ "$1" == "show" ]]; then
     case "${*: -1}:${2#--property=}" in
-        *scheduled-reboot.timer:LoadState)    printf '%s\n' "${STUB_REBOOT_TIMER_LOAD_STATE:-not-found}" ;;
-        *scheduled-reboot.timer:SubState)     printf '%s\n' "${STUB_REBOOT_TIMER_SUB_STATE:-dead}" ;;
-        *scheduled-reboot.service:LoadState)  printf 'not-found\n' ;;
-        *scheduled-reboot.service:ActiveState) printf 'inactive\n' ;;
-        *scheduled-reboot.service:Job)        printf '\n' ;;
-        *:ActiveState)                        printf '%s\n' "${STUB_ACTIVE_STATE:-failed}" ;;
-        *)                                    printf '%s\n' "${STUB_MAIN_PID:-}" ;;
+        *scheduled-reboot.timer:LoadState,*)
+            printf 'LoadState=%s\nActiveState=inactive\nSubState=%s\n' \
+                "${STUB_REBOOT_TIMER_LOAD_STATE:-not-found}" "${STUB_REBOOT_TIMER_SUB_STATE:-dead}" ;;
+        *scheduled-reboot.service:LoadState,*)
+            printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\n' ;;
+        *:ActiveState) printf '%s\n' "${STUB_ACTIVE_STATE:-failed}" ;;
+        *)             printf '%s\n' "${STUB_MAIN_PID:-}" ;;
     esac
     exit 0
 fi
@@ -847,6 +847,7 @@ stub_run_main() {
         return "${STUB_DNF_AUTOMATIC_RC:-0}"
     }
     run_reboot_check() { return "${STUB_NEEDS_REBOOT_RC:-0}"; }
+    read_scheduled_reboot_status() { printf '%s' "${STUB_SCHEDULED_REBOOT_STATUS:-none}"; }
     schedule_reboot() {
         printf 'schedule_reboot reboot_pending_file=%s\n' "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
         [[ "${STUB_SCHEDULE_FAILS:-}" == "yes" ]] && return 1
@@ -958,6 +959,9 @@ test_reboot_is_scheduled_on_a_named_unit() {
     assert_contains "${dispatch_call}" "--unit=dnf-automatic-reboot-scheduled-reboot" "an operator can find the reboot"
     assert_contains "${dispatch_call}" "OnFailure=dnf-automatic-reboot-notify@dnf-automatic-reboot-scheduled-reboot.service.service" \
         "a reboot that fails to start is reported"
+    assert_contains "${dispatch_call}" "--on-active=60" "after the configured delay"
+    assert_contains "${dispatch_call}" "reboot-if-pending.sh no 60" \
+        "through the pending check, never --force, waiting the configured lock time"
     assert_contains "${SCHEDULED_REBOOT_SUMMARY}" "cancel with: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh" \
         "the summary says how to cancel it"
 }
@@ -1308,7 +1312,7 @@ test_watchdog_hard_timeout_while_updating_does_not_reboot() {
     local recorded_calls
     recorded_calls=$(cat "${STUB_LOG}")
     assert_contains "${recorded_calls}" "kill --kill-whom=all" "whole cgroup is killed"
-    assert_not_contains "${recorded_calls}" "systemctl reboot" \
+    assert_not_contains "${recorded_calls}" "systemd-run" \
         "a half-applied rpm transaction must not be rebooted into"
 }
 
@@ -1320,7 +1324,7 @@ test_watchdog_hard_timeout_while_updating_can_be_forced() {
     write_watchdog_state updating 200 "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
-    assert_contains "$(cat "${STUB_LOG}")" "systemctl reboot" "opt-in override still works"
+    assert_contains "$(cat "${STUB_LOG}")" "reboot-if-pending.sh yes" "opt-in override still works"
 }
 
 test_watchdog_hard_timeout_while_checking_reboots() {
@@ -1333,7 +1337,7 @@ test_watchdog_hard_timeout_while_checking_reboots() {
     local recorded_calls
     recorded_calls=$(cat "${STUB_LOG}")
     assert_contains "${recorded_calls}" "kill --kill-whom=all" "whole cgroup is killed"
-    assert_contains "${recorded_calls}" "systemctl reboot" "safe to reboot after a clean dnf"
+    assert_contains "${recorded_calls}" "reboot-if-pending.sh yes" "safe to reboot after a clean dnf"
 }
 
 test_watchdog_kill_option_follows_systemd_version() {
@@ -1410,9 +1414,9 @@ stub_watchdog_kill_path() {
         [[ "${STUB_KILL_FAILS:-}" == "yes" ]] && return 1
         return 0
     }
-    submit_immediate_reboot() {
-        printf 'submit_immediate_reboot recovery_file=%s state_file=%s reboot_pending_file=%s\n' \
-            "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${STATE_FILE}")" \
+    submit_reboot() {
+        printf 'submit_reboot delay=%s force=%s recovery_file=%s state_file=%s reboot_pending_file=%s\n' \
+            "$1" "$2" "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${STATE_FILE}")" \
             "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
     }
     schedule_reboot() {
@@ -1441,7 +1445,7 @@ test_watchdog_failed_kill_keeps_supervision() {
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 1 "${exit_code}" "a failed kill fails the watchdog"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_immediate_reboot" "no reboot over a run that may still be updating"
+    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "no reboot over a run that may still be updating"
     [[ -f "${STATE_FILE}" ]] || fail "the state file must survive a failed kill"
     [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery file must be removed"
     return 0
@@ -1463,7 +1467,7 @@ test_watchdog_unconfirmed_kill_signals_no_pid() {
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 1 "${exit_code}" "an unconfirmed kill fails the watchdog"
     assert_equals "yes" "${process_survived}" "the PID is not signalled directly"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_immediate_reboot" "and nothing is rebooted"
+    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "and nothing is rebooted"
     [[ -f "${STATE_FILE}" ]] || fail "the state file must survive an unconfirmed kill"
     return 0
 }
@@ -1481,7 +1485,7 @@ test_watchdog_no_run_starts_during_the_kill() {
         "the main unit is blocked from starting while its run is killed"
     # A run starting after the kill would have its state file removed and
     # be rebooted under; the marker must outlast the reboot request.
-    assert_contains "$(cat "${STUB_LOG}")" "submit_immediate_reboot recovery_file=present state_file=absent reboot_pending_file=present" \
+    assert_contains "$(cat "${STUB_LOG}")" "submit_reboot delay=0 force=yes recovery_file=present state_file=absent reboot_pending_file=present" \
         "no run can start between the state cleanup and the reboot"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the reboot-pending marker must stay until the reboot"
     [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery marker ends with recovery"
@@ -1515,7 +1519,7 @@ test_watchdog_recovery_without_reboot_allows_runs_again() {
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 0 "${exit_code}" "recovery completes"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_immediate_reboot" "no reboot while updating"
+    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "no reboot while updating"
     [[ -f "${RECOVERY_FILE}" ]] && fail "with no reboot pending the next run must be allowed"
     return 0
 }
@@ -1659,14 +1663,14 @@ test_watchdog_unknown_identity_is_not_acted_on() {
     export STUB_MAIN_PID=""
     write_watchdog_state checking 200 "${background_pid}"
     stub_watchdog_host
-    submit_immediate_reboot() { printf 'submit_immediate_reboot\n' >> "${STUB_LOG}"; }
+    submit_reboot() { printf 'submit_reboot\n' >> "${STUB_LOG}"; }
     # Past the hard timeout, but systemctl reports no MainPID: the live PID
     # may not be the run.
     output=$( main 2>&1 ) || exit_code=$?
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 1 "${exit_code}" "an unestablished identity fails the watchdog"
     assert_not_contains "$(cat "${STUB_LOG}")" "kill_service_cgroup" "nothing is killed"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_immediate_reboot" "and nothing is rebooted"
+    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "and nothing is rebooted"
 }
 
 test_watchdog_dispatch_failure_fails_the_watchdog() {
@@ -1708,14 +1712,16 @@ test_watchdog_unit_has_a_start_timeout() {
         || fail "dnf-automatic-watchdog.service needs a finite TimeoutStartSec, has [${start_timeout}]"
 }
 
-test_watchdog_prefers_orderly_reboot() {
+test_watchdog_reboots_through_the_pending_check() {
     sleep 60 &
     local background_pid=$!
     write_watchdog_state checking 200 "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
-    assert_not_contains "$(cat "${STUB_LOG}")" "reboot --force" \
-        "--force is the fallback, never the first attempt"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemctl reboot" \
+        "the watchdog never reboots directly, only through reboot-if-pending.sh"
+    assert_contains "$(cat "${STUB_LOG}")" "--unit=dnf-automatic-reboot-scheduled-reboot" "on the named unit"
+    assert_not_contains "$(cat "${STUB_LOG}")" "--on-active" "at once"
 }
 
 # ---------------------------------------------------------------------------
@@ -1725,28 +1731,37 @@ test_watchdog_prefers_orderly_reboot() {
 # reboot-request.sh.  The scheduled-reboot timer reports
 # STUB_TIMER_LOAD_STATE (loaded) and STUB_TIMER_SUB_STATE (waiting); its
 # service STUB_SERVICE_LOAD_STATE (not-found), STUB_SERVICE_ACTIVE_STATE
-# (inactive) and STUB_SERVICE_JOB (empty).  STUB_PROPERTY_READ_FAILS=yes makes
-# every read fail.  The host reports STUB_SYSTEM_STATE (running) and logind
-# STUB_PREPARING_FOR_SHUTDOWN ("b false").  Stopping the timer leaves it
-# STUB_TIMER_SUB_STATE_AFTER_STOP (dead) and the service
-# STUB_SERVICE_JOB_AFTER_STOP; systemd-run exits STUB_SYSTEMD_RUN_RC (0) and
-# leaves the timer STUB_TIMER_SUB_STATE_AFTER_SUBMIT.  State changes go
-# through files, since each read runs in a command substitution.
+# (inactive) and STUB_SERVICE_JOB (no Job line).  STUB_PROPERTY_READ_FAILS=yes
+# makes every read fail.  The host reports STUB_SYSTEM_STATE (running) and
+# logind STUB_PREPARING_FOR_SHUTDOWN ("b false").  systemd-run exits
+# STUB_SYSTEMD_RUN_RC (0) and, with STUB_TIMER_SUB_STATE_AFTER_SUBMIT, leaves
+# the timer loaded in that state.  systemctl reboot exits STUB_REBOOT_RC (0),
+# --force STUB_FORCE_REBOOT_RC (0).  State changes go through files, since
+# each read runs in a command substitution.
 stub_reboot_unit_state() {
-    get_unit_property() {
-        [[ "${STUB_PROPERTY_READ_FAILS:-}" == "yes" ]] && return 1
+    stub_property() {
         local override_file="${TEST_ROOT_DIR}/stub-$1-$2"
         if [[ -f "${override_file}" ]]; then
             cat "${override_file}"
-            return 0
+        else
+            printf '%s' "$3"
         fi
-        case "$1:$2" in
-            *.timer:LoadState)     printf '%s' "${STUB_TIMER_LOAD_STATE-loaded}" ;;
-            *.timer:SubState)      printf '%s' "${STUB_TIMER_SUB_STATE-waiting}" ;;
-            *.service:LoadState)   printf '%s' "${STUB_SERVICE_LOAD_STATE-not-found}" ;;
-            *.service:ActiveState) printf '%s' "${STUB_SERVICE_ACTIVE_STATE-inactive}" ;;
-            *.service:Job)         printf '%s' "${STUB_SERVICE_JOB-}" ;;
+    }
+    get_unit_properties() {
+        [[ "${STUB_PROPERTY_READ_FAILS:-}" == "yes" ]] && return 1
+        case "$1" in
+            *.timer)
+                printf 'LoadState=%s\nActiveState=inactive\nSubState=%s\n' \
+                    "$(stub_property timer LoadState "${STUB_TIMER_LOAD_STATE-loaded}")" \
+                    "$(stub_property timer SubState "${STUB_TIMER_SUB_STATE-waiting}")"
+                ;;
+            *.service)
+                printf 'LoadState=%s\nActiveState=%s\nSubState=dead\n' \
+                    "${STUB_SERVICE_LOAD_STATE-not-found}" "${STUB_SERVICE_ACTIVE_STATE-inactive}"
+                [[ -n "${STUB_SERVICE_JOB:-}" ]] && printf 'Job=%s\n' "${STUB_SERVICE_JOB}"
+                ;;
         esac
+        return 0
     }
     get_system_state() { printf '%s' "${STUB_SYSTEM_STATE-running}"; }
     get_logind_preparing_for_shutdown() {
@@ -1756,29 +1771,25 @@ stub_reboot_unit_state() {
     stop_unit() {
         printf 'stop %s\n' "$1" >> "${STUB_LOG}"
         [[ "${STUB_STOP_FAILS:-}" == "yes" ]] && return 1
-        printf '%s' "${STUB_TIMER_SUB_STATE_AFTER_STOP:-dead}" \
-            > "${TEST_ROOT_DIR}/stub-dnf-automatic-reboot-scheduled-reboot.timer-SubState"
-        if [[ -n "${STUB_SERVICE_JOB_AFTER_STOP:-}" ]]; then
-            printf '%s' "${STUB_SERVICE_JOB_AFTER_STOP}" \
-                > "${TEST_ROOT_DIR}/stub-dnf-automatic-reboot-scheduled-reboot.service-Job"
-        fi
         return 0
     }
     reset_failed_units() { printf 'reset-failed %s\n' "$*" >> "${STUB_LOG}"; }
-    start_transient_reboot_timer() {
+    start_reboot_unit() {
         printf 'systemd-run %s\n' "$*" >> "${STUB_LOG}"
         if [[ -n "${STUB_TIMER_SUB_STATE_AFTER_SUBMIT:-}" ]]; then
-            printf 'loaded' > "${TEST_ROOT_DIR}/stub-dnf-automatic-reboot-scheduled-reboot.timer-LoadState"
-            printf '%s' "${STUB_TIMER_SUB_STATE_AFTER_SUBMIT}" \
-                > "${TEST_ROOT_DIR}/stub-dnf-automatic-reboot-scheduled-reboot.timer-SubState"
+            printf 'loaded' > "${TEST_ROOT_DIR}/stub-timer-LoadState"
+            printf '%s' "${STUB_TIMER_SUB_STATE_AFTER_SUBMIT}" > "${TEST_ROOT_DIR}/stub-timer-SubState"
         fi
         if [[ "${STUB_STATE_UNREADABLE_AFTER_SUBMIT:-}" == "yes" ]]; then
-            printf 'error' > "${TEST_ROOT_DIR}/stub-dnf-automatic-reboot-scheduled-reboot.timer-LoadState"
+            printf 'error' > "${TEST_ROOT_DIR}/stub-timer-LoadState"
         fi
         return "${STUB_SYSTEMD_RUN_RC:-0}"
     }
     reboot_host() {
         printf 'reboot %s\n' "$*" >> "${STUB_LOG}"
+        if [[ "${1:-}" == "--force" ]]; then
+            return "${STUB_FORCE_REBOOT_RC:-0}"
+        fi
         return "${STUB_REBOOT_RC:-0}"
     }
 }
@@ -1812,37 +1823,63 @@ assert_cancel_refused() {
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "$1: the marker must stay"
 }
 
-test_cancel_stops_the_timer_and_allows_runs() {
-    load_cancel_reboot_library
+# assert_cancel_succeeds DESCRIPTION - cancel-reboot.sh exits 0 and removes
+# the marker.
+assert_cancel_succeeds() {
     local exit_code=0
     run_cancel || exit_code=$?
-    assert_exit_code 0 "${exit_code}" "a waiting reboot is cancelled"
-    assert_contains "$(cat "${STUB_LOG}")" "stop dnf-automatic-reboot-scheduled-reboot.timer" "the timer is stopped"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "update runs must be allowed again"
+    assert_exit_code 0 "${exit_code}" "$1: $(cat "${TEST_ROOT_DIR}/cancel.out")"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "$1: update runs must be allowed again"
     return 0
 }
 
-test_cancel_refuses_once_the_reboot_command_runs() {
-    load_cancel_reboot_library
-    export STUB_TIMER_LOAD_STATE=not-found STUB_TIMER_SUB_STATE=dead \
-           STUB_SERVICE_LOAD_STATE=loaded STUB_SERVICE_ACTIVE_STATE=activating
-    assert_cancel_refused "a running reboot command is never reported as cancelled"
+# load_reboot_if_pending_library: sources reboot-if-pending.sh with every
+# systemd observation and action stubbed.
+load_reboot_if_pending_library() {
+    # shellcheck source=/dev/null
+    source "${REPO_ROOT}/scripts/reboot-if-pending.sh"
+    set +e
+    IFS=$' \t\n'
+    stub_reboot_unit_state
 }
 
-test_cancel_refuses_after_systemd_accepted_the_reboot() {
-    load_cancel_reboot_library
-    # RemainAfterExit=yes keeps a reboot service that succeeded active.
-    export STUB_TIMER_LOAD_STATE=not-found STUB_TIMER_SUB_STATE=dead \
-           STUB_SERVICE_LOAD_STATE=loaded STUB_SERVICE_ACTIVE_STATE=active
-    assert_cancel_refused "an accepted reboot is never reported as cancelled"
+# run_reboot_if_pending FORCE_ALLOWED -> its exit code; output goes to
+# ${TEST_ROOT_DIR}/reboot.out.
+run_reboot_if_pending() {
+    local exit_code=0
+    ( main "$1" 1 ) > "${TEST_ROOT_DIR}/reboot.out" 2>&1 || exit_code=$?
+    return "${exit_code}"
 }
 
-test_cancel_refuses_a_job_queued_before_the_timer_stopped() {
+test_cancel_stops_the_timer_and_allows_runs() {
     load_cancel_reboot_library
-    # The timer fired and queued the service, which waits for its ordering;
-    # stopping the timer does not cancel that job.
-    export STUB_SERVICE_LOAD_STATE=loaded STUB_SERVICE_JOB_AFTER_STOP=4711
-    assert_cancel_refused "a queued reboot job is never reported as cancelled"
+    assert_cancel_succeeds "a waiting reboot is cancelled"
+    assert_contains "$(cat "${STUB_LOG}")" "stop dnf-automatic-reboot-scheduled-reboot.timer" "the timer is stopped"
+}
+
+test_cancel_then_a_late_firing_does_not_reboot() {
+    # The reported interleavings: the timer stopped after it had queued the
+    # service, or a submission systemd processes only after the cancellation.
+    # Either way reboot-if-pending.sh runs after the cancellation.
+    (
+        load_cancel_reboot_library
+        export STUB_SERVICE_LOAD_STATE=loaded STUB_SERVICE_JOB=4711
+        assert_cancel_succeeds "a queued job that has not reached systemctl reboot"
+    ) || fail "cancellation"
+    load_reboot_if_pending_library
+    local exit_code=0
+    run_reboot_if_pending no || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a cancelled reboot is no failure"
+    assert_not_contains "$(cat "${STUB_LOG}")" "reboot " "and does not reboot"
+    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "nothing was dispatched"
+    return 0
+}
+
+test_cancel_refuses_after_the_reboot_command_ran() {
+    load_cancel_reboot_library
+    : > "${REBOOT_DISPATCHED_FILE}"
+    export STUB_TIMER_LOAD_STATE=not-found STUB_TIMER_SUB_STATE=dead
+    assert_cancel_refused "a dispatched reboot is never reported as cancelled"
 }
 
 test_cancel_refuses_while_shutting_down() {
@@ -1853,7 +1890,7 @@ test_cancel_refuses_while_shutting_down() {
 
 test_cancel_refuses_a_shutdown_logind_delays() {
     load_cancel_reboot_library
-    # logind accepted the reboot and holds it for a delay inhibitor; PID 1
+    # logind accepted a reboot and holds it for a delay inhibitor; PID 1
     # still reports running.
     export STUB_TIMER_LOAD_STATE=not-found STUB_TIMER_SUB_STATE=dead \
            STUB_PREPARING_FOR_SHUTDOWN="b true"
@@ -1885,31 +1922,24 @@ test_cancel_accepts_a_degraded_host() {
     load_cancel_reboot_library
     # is-system-running exits non-zero for degraded; the state is still known.
     export STUB_SYSTEM_STATE=degraded
-    local exit_code=0
-    run_cancel || exit_code=$?
-    assert_exit_code 0 "${exit_code}" "degraded is not stopping"
+    assert_cancel_succeeds "degraded is not stopping"
 }
 
 test_cancel_refuses_while_a_request_holds_the_lock() {
     load_cancel_reboot_library
-    # A request created the marker and has not yet reached systemd: no timer
-    # exists, so without the lock this would look cancellable.
+    # A request created the marker and has not yet reached systemd.
     export STUB_TIMER_LOAD_STATE=not-found STUB_TIMER_SUB_STATE=dead
     exec {held_lock_descriptor}>>"${REBOOT_REQUEST_LOCK_FILE}"
     flock "${held_lock_descriptor}"
     assert_cancel_refused "a request in progress"
-    assert_contains "$(cat "${TEST_ROOT_DIR}/cancel.out")" "reboot request is in progress" "named as such"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/cancel.out")" "is in progress" "named as such"
 }
 
 test_cancel_after_a_failed_reboot_allows_runs() {
     load_cancel_reboot_library
     export STUB_TIMER_LOAD_STATE=not-found STUB_TIMER_SUB_STATE=dead \
            STUB_SERVICE_LOAD_STATE=loaded STUB_SERVICE_ACTIVE_STATE=failed
-    local exit_code=0
-    run_cancel || exit_code=$?
-    assert_exit_code 0 "${exit_code}" "a reboot that failed will not happen"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "update runs must be allowed again"
-    return 0
+    assert_cancel_succeeds "a reboot that was refused"
 }
 
 test_cancel_with_nothing_pending_is_a_noop() {
@@ -1923,11 +1953,110 @@ test_cancel_with_nothing_pending_is_a_noop() {
 }
 
 # ---------------------------------------------------------------------------
+# reboot: reboot-if-pending.sh reboots only while the reboot is pending
+# ---------------------------------------------------------------------------
+test_reboot_pending_reboots_and_records_it() {
+    load_reboot_if_pending_library
+    : > "${REBOOT_PENDING_FILE}"
+    local exit_code=0
+    run_reboot_if_pending no || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the reboot is submitted"
+    assert_contains "$(cat "${STUB_LOG}")" "reboot " "systemctl reboot is called"
+    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] || fail "the dispatch is recorded for cancel-reboot.sh"
+    return 0
+}
+
+test_reboot_accepted_by_logind_is_not_forced() {
+    load_reboot_if_pending_library
+    : > "${REBOOT_PENDING_FILE}"
+    # The client failed, but logind accepted the shutdown and delays it.
+    export STUB_REBOOT_RC=1 STUB_PREPARING_FOR_SHUTDOWN="b true"
+    local exit_code=0
+    run_reboot_if_pending yes || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "an accepted shutdown is success"
+    assert_not_contains "$(cat "${STUB_LOG}")" "reboot --force" "an orderly shutdown under way is never forced"
+}
+
+test_reboot_unknown_shutdown_state_is_not_forced() {
+    load_reboot_if_pending_library
+    : > "${REBOOT_PENDING_FILE}"
+    export STUB_REBOOT_RC=1 STUB_LOGIND_READ_FAILS=yes
+    local exit_code=0
+    run_reboot_if_pending yes || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "an unknown outcome fails the unit"
+    assert_not_contains "$(cat "${STUB_LOG}")" "reboot --force" "unknown is not a refusal"
+    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] || fail "an unknown outcome keeps cancellation refused"
+    return 0
+}
+
+test_reboot_refused_on_a_running_host_is_forced_when_allowed() {
+    load_reboot_if_pending_library
+    : > "${REBOOT_PENDING_FILE}"
+    export STUB_REBOOT_RC=1
+    local exit_code=0
+    run_reboot_if_pending yes || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the forced reboot is submitted"
+    assert_contains "$(cat "${STUB_LOG}")" "reboot --force" "a leaked inhibitor lock is overridden"
+}
+
+test_reboot_refused_without_force_releases_the_dispatch() {
+    load_reboot_if_pending_library
+    : > "${REBOOT_PENDING_FILE}"
+    export STUB_REBOOT_RC=1
+    local exit_code=0
+    run_reboot_if_pending no || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "a refused reboot fails the unit, so OnFailure= reports it"
+    assert_not_contains "$(cat "${STUB_LOG}")" "reboot --force" "never forced unless allowed"
+    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a refused reboot can be cancelled"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "update runs stay held until a reboot or cancellation"
+    return 0
+}
+
+test_reboot_waits_for_a_cancellation_in_progress() {
+    load_reboot_if_pending_library
+    : > "${REBOOT_PENDING_FILE}"
+    exec {held_lock_descriptor}>>"${REBOOT_REQUEST_LOCK_FILE}"
+    flock "${held_lock_descriptor}"
+    local exit_code=0
+    run_reboot_if_pending no || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "no lock, no reboot"
+    assert_not_contains "$(cat "${STUB_LOG}")" "reboot " "nothing is rebooted"
+}
+
+# ---------------------------------------------------------------------------
+# lock: only root can open, and so hold, the reboot request lock
+# ---------------------------------------------------------------------------
+test_lock_is_created_owner_only() {
+    load_request_library
+    umask 022
+    acquire_reboot_request_lock 1 || fail "the lock is free"
+    assert_equals "600" "$(stat -c '%a' "${REBOOT_REQUEST_LOCK_FILE}")" "created 0600 under umask 022"
+}
+
+test_lock_permissions_are_corrected_in_place() {
+    load_request_library
+    ( umask 022 && : > "${REBOOT_REQUEST_LOCK_FILE}" )
+    chmod 0644 "${REBOOT_REQUEST_LOCK_FILE}"
+    local inode_before
+    inode_before=$(stat -c '%i' "${REBOOT_REQUEST_LOCK_FILE}")
+    acquire_reboot_request_lock 1 || fail "the lock is free"
+    assert_equals "600" "$(stat -c '%a' "${REBOOT_REQUEST_LOCK_FILE}")" "a readable lock is closed"
+    assert_equals "${inode_before}" "$(stat -c '%i' "${REBOOT_REQUEST_LOCK_FILE}")" \
+        "the inode a holder or waiter uses is kept"
+}
+
+test_lock_is_shipped_owner_only() {
+    grep -qx 'f /run/dnf-automatic-reboot.reboot-request.lock 0600 root root -' \
+        "${REPO_ROOT}/tmpfiles/dnf-automatic-reboot.conf" \
+        || fail "tmpfiles.d must create the lock 0600 root"
+}
+
+# ---------------------------------------------------------------------------
 # request: accepted, rejected or unknown, under the lock
 # ---------------------------------------------------------------------------
 # load_request_library: sources run.sh, whose reboot-request.sh is the one
-# watchdog.sh and cancel-reboot.sh use, with systemd stubbed and no reboot
-# scheduled yet.
+# watchdog.sh, cancel-reboot.sh and reboot-if-pending.sh use, with systemd
+# stubbed and no reboot scheduled yet.
 load_request_library() {
     load_run_library
     stub_reboot_unit_state
@@ -1936,10 +2065,8 @@ load_request_library() {
 
 test_request_cancel_during_dispatch_cannot_drop_the_marker() {
     load_request_library
-    # The reported interleaving: the marker exists, the timer does not yet,
-    # and cancel-reboot.sh runs.  It must not remove the marker the request
-    # is about to depend on.
-    start_transient_reboot_timer() {
+    # The marker exists, the timer does not yet, and cancel-reboot.sh runs.
+    start_reboot_unit() {
         local cancel_exit_code=0
         bash "${REPO_ROOT}/scripts/cancel-reboot.sh" >> "${STUB_LOG}" 2>&1 || cancel_exit_code=$?
         printf 'cancel during dispatch exited %s\n' "${cancel_exit_code}" >> "${STUB_LOG}"
@@ -1949,7 +2076,7 @@ test_request_cancel_during_dispatch_cannot_drop_the_marker() {
     request_reboot 1 schedule_reboot >/dev/null 2>&1 || exit_code=$?
     assert_exit_code 0 "${exit_code}" "the reboot is scheduled"
     assert_contains "$(cat "${STUB_LOG}")" "cancel during dispatch exited 1" "the cancellation is refused"
-    assert_contains "$(cat "${STUB_LOG}")" "reboot request is in progress" "because the request holds the lock"
+    assert_contains "$(cat "${STUB_LOG}")" "is in progress" "because the request holds the lock"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "a scheduled reboot must keep update runs held"
     return 0
 }
@@ -1977,24 +2104,37 @@ test_request_failed_client_with_timer_present_is_accepted() {
     return 0
 }
 
-test_request_failed_client_without_timer_is_rejected() {
+test_request_failed_client_without_timer_is_unknown() {
     load_request_library
+    # No unit yet does not prove rejection: the request may still be on its
+    # way to systemd.
     export STUB_SYSTEMD_RUN_RC=1
-    local exit_code=0
-    request_reboot 1 schedule_reboot >/dev/null 2>&1 || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "no timer exists"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "a rejected request removes the marker it created"
+    local exit_code=0 output
+    output=$(request_reboot 1 schedule_reboot 2>&1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "an unknown outcome fails the caller"
+    assert_contains "${output}" "reached systemd is unknown" "and is reported"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "an unknown outcome keeps update runs held"
     return 0
 }
 
 test_request_failed_client_with_unreadable_state_keeps_the_marker() {
     load_request_library
     export STUB_SYSTEMD_RUN_RC=1 STUB_STATE_UNREADABLE_AFTER_SUBMIT=yes
-    local exit_code=0 output
-    output=$(request_reboot 1 schedule_reboot 2>&1) || exit_code=$?
+    local exit_code=0
+    request_reboot 1 schedule_reboot >/dev/null 2>&1 || exit_code=$?
     assert_exit_code 1 "${exit_code}" "an unknown outcome fails the caller"
-    assert_contains "${output}" "reached systemd is unknown" "and is reported"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "an unknown outcome keeps update runs held"
+    return 0
+}
+
+test_request_unreadable_state_before_submission_is_rejected() {
+    load_request_library
+    export STUB_PROPERTY_READ_FAILS=yes
+    local exit_code=0
+    request_reboot 1 schedule_reboot >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "nothing submitted"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run" "systemd-run never ran"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "a request never submitted releases its marker"
     return 0
 }
 
@@ -2018,30 +2158,39 @@ test_request_waiting_timer_is_not_scheduled_twice() {
     assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run" "no second transient unit"
 }
 
-test_request_immediate_reboot_rejected_only_when_host_is_up() {
+test_request_coherent_snapshot_sees_a_running_service() {
     load_request_library
-    export STUB_REBOOT_RC=1
-    local exit_code=0
-    request_reboot 1 submit_immediate_reboot >/dev/null 2>&1 || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "both reboot calls failed and the host is up"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "a rejected request removes its marker"
-    export STUB_PREPARING_FOR_SHUTDOWN="b true"
-    exit_code=0
-    request_reboot 1 submit_immediate_reboot >/dev/null 2>&1 || exit_code=$?
-    assert_exit_code 0 "${exit_code}" "logind is shutting the host down despite the error"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "an accepted reboot keeps its marker"
-    rm -f "${REBOOT_PENDING_FILE}"
-    export STUB_LOGIND_READ_FAILS=yes STUB_PREPARING_FOR_SHUTDOWN=""
-    exit_code=0
-    request_reboot 1 submit_immediate_reboot >/dev/null 2>&1 || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "unknown fails the caller"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "an unknown outcome keeps its marker"
-    return 0
+    # One systemctl show per unit: a service that started its job reads as
+    # running, never as inactive with its job already gone.
+    export STUB_SERVICE_LOAD_STATE=loaded STUB_SERVICE_ACTIVE_STATE=activating
+    assert_equals "in_progress" "$(read_scheduled_reboot_status)" "a running reboot service"
+    export STUB_SERVICE_ACTIVE_STATE=inactive STUB_SERVICE_JOB=4711
+    assert_equals "in_progress" "$(read_scheduled_reboot_status)" "a queued reboot service"
 }
 
-test_request_transient_service_records_success() {
-    grep -q -- '--property=RemainAfterExit=yes' "${REPO_ROOT}/scripts/reboot-request.sh" \
-        || fail "a reboot service that succeeded must stay active as evidence"
+# ---------------------------------------------------------------------------
+# run: no update while a reboot is pending
+# ---------------------------------------------------------------------------
+test_run_does_not_update_before_a_pending_reboot() {
+    load_run_library
+    stub_run_main
+    # A timer an earlier version's watchdog scheduled during an upgrade has
+    # no reboot-pending marker; the unit started anyway.
+    export STUB_SCHEDULED_REBOOT_STATUS=waiting
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a pending reboot is no failure"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "nothing is updated"
+}
+
+test_run_unknown_reboot_state_does_not_update() {
+    load_run_library
+    stub_run_main
+    export STUB_SCHEDULED_REBOOT_STATUS=unknown
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "an unreadable reboot state fails the run"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "nothing is updated"
 }
 
 # notify: a failed deferred reboot says whether updates stay blocked
@@ -2062,6 +2211,16 @@ test_notify_failed_reboot_names_blocked_updates() {
     assert_contains "$(cat "${STUB_LOG}")" "cancel-reboot.sh" "and how to release them"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the notifier leaves the marker to the operator"
     return 0
+}
+
+test_notify_failed_dispatched_reboot_says_reboot() {
+    load_notify_library
+    : > "${REBOOT_PENDING_FILE}"
+    : > "${REBOOT_DISPATCHED_FILE}"
+    ( main dnf-automatic-reboot-scheduled-reboot.service ) >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "whether systemd accepted it is unknown" \
+        "a reboot command with an unknown outcome is named"
+    assert_not_contains "$(cat "${STUB_LOG}")" "cancel-reboot.sh" "cancellation would be refused"
 }
 
 test_notify_failed_reboot_without_marker_is_not_blocked() {
@@ -2502,7 +2661,7 @@ run_test "watchdog: state without uptime is malformed" test_watchdog_state_witho
 run_test "watchdog: hard timeout while updating does not reboot" test_watchdog_hard_timeout_while_updating_does_not_reboot needs-exec
 run_test "watchdog: hard timeout while updating can be forced"   test_watchdog_hard_timeout_while_updating_can_be_forced   needs-exec
 run_test "watchdog: hard timeout while checking reboots"         test_watchdog_hard_timeout_while_checking_reboots         needs-exec
-run_test "watchdog: prefers orderly reboot"          test_watchdog_prefers_orderly_reboot          needs-exec
+run_test "watchdog: reboots through the pending check" test_watchdog_reboots_through_the_pending_check needs-exec
 run_test "watchdog: kill option follows systemd version" test_watchdog_kill_option_follows_systemd_version
 run_test "watchdog: hung reboot check is undecidable" test_watchdog_hung_reboot_check_is_undecidable
 run_test "watchdog: helper failure is not no-reboot" test_watchdog_helper_failure_is_not_no_reboot
@@ -2519,9 +2678,8 @@ run_test "watchdog: interrupted request keeps a marker" test_watchdog_interrupte
 run_test "watchdog: failed request keeps an earlier marker" test_watchdog_failed_request_keeps_an_earlier_marker
 run_test "watchdog: reports a marker left by the killed run" test_watchdog_reports_a_marker_left_by_the_killed_run
 run_test "cancel: stops the timer and allows runs"   test_cancel_stops_the_timer_and_allows_runs
-run_test "cancel: refuses once the reboot command runs" test_cancel_refuses_once_the_reboot_command_runs
-run_test "cancel: refuses after systemd accepted the reboot" test_cancel_refuses_after_systemd_accepted_the_reboot
-run_test "cancel: refuses a job queued before the timer stopped" test_cancel_refuses_a_job_queued_before_the_timer_stopped
+run_test "cancel: then a late firing does not reboot" test_cancel_then_a_late_firing_does_not_reboot
+run_test "cancel: refuses after the reboot command ran" test_cancel_refuses_after_the_reboot_command_ran
 run_test "cancel: refuses while shutting down"       test_cancel_refuses_while_shutting_down
 run_test "cancel: refuses a shutdown logind delays"  test_cancel_refuses_a_shutdown_logind_delays
 run_test "cancel: refuses unreadable systemd state"  test_cancel_refuses_unreadable_systemd_state
@@ -2530,16 +2688,28 @@ run_test "cancel: accepts a degraded host"           test_cancel_accepts_a_degra
 run_test "cancel: refuses while a request holds the lock" test_cancel_refuses_while_a_request_holds_the_lock
 run_test "cancel: after a failed reboot allows runs" test_cancel_after_a_failed_reboot_allows_runs
 run_test "cancel: nothing pending is a noop"         test_cancel_with_nothing_pending_is_a_noop
+run_test "reboot: pending reboots and records it"   test_reboot_pending_reboots_and_records_it
+run_test "reboot: accepted by logind is not forced"  test_reboot_accepted_by_logind_is_not_forced
+run_test "reboot: unknown shutdown state is not forced" test_reboot_unknown_shutdown_state_is_not_forced
+run_test "reboot: refused on a running host is forced when allowed" test_reboot_refused_on_a_running_host_is_forced_when_allowed
+run_test "reboot: refused without force releases the dispatch" test_reboot_refused_without_force_releases_the_dispatch
+run_test "reboot: waits for a cancellation in progress" test_reboot_waits_for_a_cancellation_in_progress
+run_test "lock: created owner-only"                  test_lock_is_created_owner_only
+run_test "lock: permissions corrected in place"      test_lock_permissions_are_corrected_in_place
+run_test "lock: shipped owner-only"                  test_lock_is_shipped_owner_only
 run_test "request: cancel during dispatch cannot drop the marker" test_request_cancel_during_dispatch_cannot_drop_the_marker
 run_test "request: waits for the lock, then gives up" test_request_waits_for_the_lock_then_gives_up
 run_test "request: failed client with timer present is accepted" test_request_failed_client_with_timer_present_is_accepted
-run_test "request: failed client without timer is rejected" test_request_failed_client_without_timer_is_rejected
+run_test "request: failed client without timer is unknown" test_request_failed_client_without_timer_is_unknown
 run_test "request: failed client, unreadable state keeps the marker" test_request_failed_client_with_unreadable_state_keeps_the_marker
+run_test "request: unreadable state before submission is rejected" test_request_unreadable_state_before_submission_is_rejected
 run_test "request: elapsed timer is not a scheduled reboot" test_request_elapsed_timer_is_not_a_scheduled_reboot
 run_test "request: waiting timer is not scheduled twice" test_request_waiting_timer_is_not_scheduled_twice
-run_test "request: immediate reboot rejected only when host is up" test_request_immediate_reboot_rejected_only_when_host_is_up
-run_test "request: transient service records success" test_request_transient_service_records_success
+run_test "request: coherent snapshot sees a running service" test_request_coherent_snapshot_sees_a_running_service
+run_test "run: does not update before a pending reboot" test_run_does_not_update_before_a_pending_reboot
+run_test "run: unknown reboot state does not update" test_run_unknown_reboot_state_does_not_update
 run_test "notify: failed reboot names blocked updates" test_notify_failed_reboot_names_blocked_updates
+run_test "notify: failed dispatched reboot says reboot" test_notify_failed_dispatched_reboot_says_reboot
 run_test "notify: failed reboot without marker is not blocked" test_notify_failed_reboot_without_marker_is_not_blocked
 run_test "watchdog: unknown identity is not acted on" test_watchdog_unknown_identity_is_not_acted_on
 run_test "watchdog: dispatch failure fails the watchdog" test_watchdog_dispatch_failure_fails_the_watchdog

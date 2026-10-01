@@ -29,6 +29,7 @@ readonly TEST_ROOT="${DNF_AUTOMATIC_REBOOT_TEST_ROOT:-}"
 readonly CONFIG_FILE="${TEST_ROOT}/etc/dnf/automatic-reboot.conf"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly REBOOT_PENDING_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-pending"
+readonly REBOOT_DISPATCHED_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-dispatched"
 readonly SCHEDULED_REBOOT_SERVICE=dnf-automatic-reboot-scheduled-reboot.service
 readonly CANCEL_REBOOT_COMMAND=/usr/libexec/dnf-automatic-reboot/cancel-reboot.sh
 readonly SCRIPT_NAME=notify-failure
@@ -51,7 +52,9 @@ wall_msg() {
 # failed_reboot_recovery_hint -> what a failed scheduled reboot leaves behind
 # and how to recover from it.
 failed_reboot_recovery_hint() {
-    if [[ -e "${REBOOT_PENDING_FILE}" ]]; then
+    if [[ -e "${REBOOT_DISPATCHED_FILE}" ]]; then
+        printf '%s' "The reboot command ran, but whether systemd accepted it is unknown. Update runs stay blocked until the host reboots: reboot it."
+    elif [[ -e "${REBOOT_PENDING_FILE}" ]]; then
         printf '%s' "The scheduled reboot did not happen. Update runs stay blocked until the host reboots: reboot it, or allow updates again with ${CANCEL_REBOOT_COMMAND}"
     else
         printf '%s' "The scheduled reboot did not happen. Update runs are not blocked; reboot the host to apply the updates."

@@ -318,7 +318,8 @@ schedule_reboot() {
     local reboot_time submit_result=0
     reboot_time=$(date -d "@$(( $(date +%s) + REBOOT_DELAY_SEC ))" '+%F %T %Z')
     log "Watchdog scheduling reboot in ${REBOOT_DELAY_SEC}s"
-    submit_scheduled_reboot "${REBOOT_DELAY_SEC}" "dnf-automatic-reboot watchdog reboot" || submit_result=$?
+    submit_reboot "${REBOOT_DELAY_SEC}" no "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "dnf-automatic-reboot watchdog reboot" \
+        || submit_result=$?
     case "${submit_result}" in
         0)
             if [[ "${SCHEDULED_REBOOT_ALREADY_PRESENT}" -eq 1 ]]; then
@@ -430,7 +431,11 @@ main() {
         if [[ "${run_phase}" == "checking" || "${FORCE_REBOOT_ON_HARD_TIMEOUT}" == "yes" ]]; then
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded." \
                      "Killed the stuck run and rebooting now."
-            if ! request_reboot "${REBOOT_REQUEST_LOCK_WAIT_SEC}" submit_immediate_reboot; then
+            # At once (delay 0) through reboot-if-pending.sh, which may fall
+            # back to --force: a leaked inhibitor lock is a likely cause of
+            # the stuck run.
+            if ! request_reboot "${REBOOT_REQUEST_LOCK_WAIT_SEC}" submit_reboot \
+                    0 yes "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "dnf-automatic-reboot watchdog reboot"; then
                 log_error "reboot request failed - the host was not rebooted"
                 exit 1
             fi

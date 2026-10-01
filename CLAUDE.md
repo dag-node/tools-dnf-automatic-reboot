@@ -50,7 +50,8 @@ scripts/watchdog.sh             Independent watchdog (soft/hard timeout)
 scripts/needs-reboot.sh         Reboot decision + false-positive filtering
 scripts/notify-failure.sh       OnFailure= notifier (wall + log)
 scripts/cancel-reboot.sh        Cancels a pending reboot and allows update runs again
-scripts/reboot-request.sh       Reboot request/cancel protocol, sourced by run, watchdog, cancel
+scripts/reboot-if-pending.sh    The scheduled reboot's command: reboots only while one is pending
+scripts/reboot-request.sh       Reboot request/cancel protocol, sourced by the scripts that request, run or cancel reboots
 units/dnf-automatic-reboot.service    Oneshot service wrapping run.sh
 units/dnf-automatic-reboot.timer      Daily 03:00, RandomizedDelaySec=10min, Persistent
 units/dnf-automatic-watchdog.service  Oneshot service wrapping watchdog.sh
@@ -306,62 +307,81 @@ removers:
 | Marker | Lifetime | Removed by |
 |--------|----------|------------|
 | `/run/dnf-automatic-reboot.recovery` | identity re-check, kill, state cleanup, reboot decision | the watchdog's EXIT trap; `ExecStopPost=` |
-| `/run/dnf-automatic-reboot.reboot-pending` | from before a reboot request until the reboot | the reboot (emptying `/run`); `cancel-reboot.sh`; a rejected request, for the file it created |
+| `/run/dnf-automatic-reboot.reboot-pending` | from before a reboot request until the reboot | the reboot (emptying `/run`); `cancel-reboot.sh`; a request that submitted nothing, for the file it created |
 
 `dnf-automatic-reboot.service` carries `ConditionPathExists=!` for both. No timeout or
 further condition is to be added to either marker.
 
 ### Reboot requests (`scripts/reboot-request.sh`)
 
-`run.sh`, `watchdog.sh` and `cancel-reboot.sh` source one library for the request and
-cancellation protocol; it is installed 0640 and never executed.
+`run.sh`, `watchdog.sh`, `cancel-reboot.sh` and `reboot-if-pending.sh` source one library for
+the request and cancellation protocol; it is installed 0640 and never executed.
 
-**Lock.** `request_reboot` holds `/run/dnf-automatic-reboot.reboot-request.lock`
-(`flock`) from before it creates `.reboot-pending` until the dispatch's outcome is known,
-waiting up to `reboot_request_lock_wait_sec`. `cancel-reboot.sh` takes it without waiting
-and refuses when it is held, so it never sees a marker whose request has not reached
-systemd. The lock file is never removed.
+**The invariant.** No script calls `systemctl reboot` directly. Every reboot is the transient
+`dnf-automatic-reboot-scheduled-reboot.service` running `reboot-if-pending.sh`, after
+`reboot_delay_sec` through its timer, or at once for the watchdog's hard timeout. Holding the
+request lock, `reboot-if-pending.sh` reboots only while `.reboot-pending` exists, and writes
+`/run/dnf-automatic-reboot.reboot-dispatched` before it calls `systemctl reboot`. Holding the
+same lock, `cancel-reboot.sh` refuses when the dispatched file exists, and otherwise removes
+`.reboot-pending`. After a cancellation succeeds, no request of this package can reboot the
+host: a timer that still fires, a job the timer queued before it stopped, or a submission
+systemd processes late all find no marker and exit 0. Cancellation therefore does not depend
+on reading every systemd state exactly.
 
-**Outcomes.** Every dispatch returns accepted (0), rejected (1) or unknown (2):
+**Lock.** `/run/dnf-automatic-reboot.reboot-request.lock` (`flock`). `request_reboot` holds it
+from before it creates `.reboot-pending` until the dispatch's outcome is known, waiting up to
+`reboot_request_lock_wait_sec`; `reboot-if-pending.sh` holds it from its marker check until
+`systemctl reboot` returns, waiting the same time (passed on its command line).
+`cancel-reboot.sh` takes it without waiting and refuses when it is held. `flock(2)` grants an
+exclusive lock through a read-only descriptor, so any user who can open the file can block
+every request: tmpfiles.d creates it `0600 root`, and `acquire_reboot_request_lock` creates
+it under `umask 077` and `chmod 0600`s it before every use, in place, so holders and waiters
+keep the same inode. The file is never removed.
 
-| Dispatch | Accepted | Rejected | Unknown |
-|----------|----------|----------|---------|
-| `submit_scheduled_reboot` | `systemd-run` exit 0; or it failed and the timer is `waiting`, or the service queued, running, `active` or `failed` | it failed and neither unit exists; or the state could not be read before submitting | it failed and the state cannot be read |
-| `submit_immediate_reboot` | `systemctl reboot` or `--force` exit 0; or both failed and the host is shutting down | both failed and the host is not shutting down | both failed and the shutdown state cannot be read |
+**Request outcomes.** `submit_reboot` returns accepted (0), rejected (1) or unknown (2).
+Rejected only when nothing was submitted: the scheduled reboot's state could not be read
+before `systemd-run`. A failed `systemd-run` is accepted when the unit is visible afterwards,
+and unknown otherwise, because a request may still be on its way to systemd. Accepted and
+unknown keep `.reboot-pending`; rejected removes the one this request created. Unknown, and a
+process stopped mid-request (its EXIT trap), log the check and recovery commands and fail the
+unit; a late reboot still happens, because the marker is there. A run killed by SIGKILL
+mid-request has no trap: when the watchdog then decides no reboot is needed, it fails its
+unit if `.reboot-pending` exists with no reboot waiting or under way.
 
-Accepted keeps `.reboot-pending`. Rejected removes the one this request created; one that
-existed belongs to an earlier request and stays. Unknown keeps it and logs the check and
-recovery commands, and the caller fails its unit. A process stopped mid-request keeps it
-too; its EXIT trap logs the same. A run killed by SIGKILL at that point has no trap: when
-the watchdog then decides no reboot is needed, it fails its unit if `.reboot-pending`
-exists with no reboot waiting or under way.
+**Reboot outcomes.** `reboot-if-pending.sh` exits 0 when `systemctl reboot` succeeds, and
+when no reboot is pending. When the orderly reboot fails it reads the shutdown state first:
+`yes` (logind accepted, perhaps delaying for an inhibitor) is success and is never escalated;
+`unknown` fails with the dispatched file kept. Only `no` counts as a refusal: with force
+allowed (the watchdog's hard timeout, for a leaked inhibitor lock) it tries `--force`; without,
+or when `--force` fails on a host still up, it removes the dispatched file and fails. Its
+`OnFailure=` notice says whether update runs are still held, and names `cancel-reboot.sh`
+unless the dispatched file makes cancellation refuse.
 
-**Reading systemd.** `read_scheduled_reboot_status` returns `none`, `waiting`,
-`in_progress`, `dispatched`, `failed` or `unknown` from the timer's `LoadState` and
-`SubState` and the service's `LoadState`, `ActiveState` and `Job`. Only a timer in
-`SubState=waiting` is a reboot to come; an `elapsed` timer is not. A service with a
-non-zero `Job`, or `activating`, counts as `in_progress`: a timer can queue the service
-behind its ordering dependencies, and stopping the timer leaves that job queued. The
-transient service runs with `RemainAfterExit=yes`, so a reboot that `systemctl` accepted
-leaves it `active` (`dispatched`). A failed `systemctl show`, a `LoadState` other than
-`loaded` or `not-found`, or any unlisted value is `unknown`.
-`read_host_shutdown_state` is `yes` when `systemctl is-system-running` prints `stopping`
-or logind's `PreparingForShutdown` is true; logind sets it when it accepts a shutdown that
-a delay inhibitor holds back, while PID 1 still reports `running`. It is `no` only when
-both were read and the system state is one of `initializing`, `starting`, `running`,
-`degraded` or `maintenance`. The command exits non-zero for every state but `running`, so
-only its output is read.
+**Reading systemd.** `read_unit_snapshot` reads `LoadState`, `ActiveState`, `SubState` and
+`Job` of one unit from one `systemctl show`, so the values describe one moment; a missing
+`Job` line is no job. `read_scheduled_reboot_status` reads the timer, then the service, and
+returns `dispatched` (the dispatched file exists), `in_progress` (service queued or running,
+or timer `running`), `failed`, `waiting` (timer `SubState=waiting`; an `elapsed` timer is
+not), `none`, or `unknown` for a failed read or any unlisted value. `read_host_shutdown_state`
+is `yes` when `systemctl is-system-running` prints `stopping` or logind's
+`PreparingForShutdown` is true, `no` only when both were read and the state is one of
+`initializing`, `starting`, `running`, `degraded` or `maintenance`, and `unknown` otherwise.
 
 **Cancellation.** `cancel-reboot.sh` refuses (exit 1, marker kept) while the lock is held,
-for `in_progress`, `dispatched` or `unknown`, when stopping a `waiting` timer fails or
-leaves anything but `none` or `failed`, and when the host shutdown state is `yes` or
-`unknown`. Otherwise it removes `.reboot-pending`. A `failed` reboot service also starts
-`dnf-automatic-reboot-notify@`, whose message says whether `.reboot-pending` still holds
-update runs and names `cancel-reboot.sh`.
+when the dispatched file exists, when the scheduled reboot's state is `unknown`, and when the
+shutdown state is `yes` or `unknown`. Otherwise it removes `.reboot-pending`, then stops a
+waiting or running timer (a failure only warns: the timer's command finds no marker) and
+resets a failed service.
 
-The `Job` format of `systemctl show --value` (empty with no job), `SubState=waiting` on a
-transient timer, and `PreparingForShutdown` under a delay inhibitor are read from systemd
-239 and 252 sources, not yet observed on a host.
+**No update before a pending reboot.** `run.sh` exits 0 without updating while the scheduled
+reboot is `waiting`, `in_progress` or `dispatched`, and 1 when it is `unknown`. The marker's
+`ConditionPathExists=!` normally keeps the unit from starting then; this also covers a timer
+with no marker, such as one a 1.4.0 watchdog scheduled during an upgrade to this version,
+whose `ExecStopPost=` removes the 1.4.0 hold. Nothing migrates from 1.4.0.
+
+The `systemctl show` output format (no `Job=` line, or `Job=` with an id),
+`SubState=waiting` on a transient `--on-active` timer, and `PreparingForShutdown` under a
+delay inhibitor are read from systemd 239 and 252 sources, not yet observed on a host.
 
 After the kill, the watchdog waits up to `watchdog_kill_confirm_sec` for systemd to report
 the unit `inactive` or `failed`. A failed `systemctl kill`, or a unit still active then,

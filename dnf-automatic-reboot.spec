@@ -89,6 +89,7 @@ install -m 0750 scripts/watchdog.sh       %{buildroot}%{pkglibexecdir}/watchdog.
 install -m 0750 scripts/needs-reboot.sh   %{buildroot}%{pkglibexecdir}/needs-reboot.sh
 install -m 0750 scripts/notify-failure.sh %{buildroot}%{pkglibexecdir}/notify-failure.sh
 install -m 0750 scripts/cancel-reboot.sh  %{buildroot}%{pkglibexecdir}/cancel-reboot.sh
+install -m 0750 scripts/reboot-if-pending.sh %{buildroot}%{pkglibexecdir}/reboot-if-pending.sh
 install -m 0640 scripts/reboot-request.sh %{buildroot}%{pkglibexecdir}/reboot-request.sh
 
 # systemd units
@@ -428,7 +429,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %attr(0750, root, root) %{pkglibexecdir}/needs-reboot.sh
 %attr(0750, root, root) %{pkglibexecdir}/notify-failure.sh
 %attr(0750, root, root) %{pkglibexecdir}/cancel-reboot.sh
-# Sourced by run.sh, watchdog.sh and cancel-reboot.sh; never executed.
+%attr(0750, root, root) %{pkglibexecdir}/reboot-if-pending.sh
+# Sourced by run.sh, watchdog.sh, cancel-reboot.sh and reboot-if-pending.sh;
+# never executed.
 %attr(0640, root, root) %{pkglibexecdir}/reboot-request.sh
 
 # systemd units
@@ -463,26 +466,32 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 * Thu Oct 01 2026 DagNode <packages@dagnode.com> - 1.5.0-1
 - CHANGE: A pending reboot holds update runs through its own marker,
   /run/dnf-automatic-reboot.reboot-pending, created before the reboot is requested and removed
-  by the reboot, by cancelling it, or when systemd shows the request was not taken. It covers
-  the reboots run.sh schedules as well as the watchdog's, so no update run starts in
-  reboot_delay_sec before either. /run/dnf-automatic-reboot.recovery now covers only the
-  watchdog's recovery and is always removed when the watchdog ends.
-- CHANGE: The scheduled reboot's transient service stays active after systemctl reboot
-  succeeds (RemainAfterExit=yes), as the record that the reboot was accepted.
+  by the reboot or by cancelling it. It covers the reboots run.sh schedules as well as the
+  watchdog's, so no update run starts in reboot_delay_sec before either.
+  /run/dnf-automatic-reboot.recovery now covers only the watchdog's recovery and is always
+  removed when the watchdog ends.
+- CHANGE: Every reboot, the watchdog's immediate one included, runs
+  /usr/libexec/dnf-automatic-reboot/reboot-if-pending.sh in the transient
+  dnf-automatic-reboot-scheduled-reboot.service, which reboots only while the reboot is still
+  pending.
+- CHANGE: run.sh does not update while a scheduled reboot is waiting or under way. This also
+  holds when upgrading from 1.4.0 while its watchdog has a reboot scheduled.
 - NEW: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels a pending reboot and allows
-  update runs again. It succeeds only when the reboot will not happen, and exits 1 without
-  changing anything while a reboot request is in progress, once the reboot is queued, running
-  or accepted, while the host shuts down (including a shutdown logind delays for an
+  update runs again; a timer that fires afterwards does not reboot. It exits 1 without
+  changing anything while a reboot is being requested or carried out, once systemctl reboot
+  has been called, while the host shuts down (including a shutdown logind delays for an
   inhibitor), and when systemd's state cannot be read. It replaces stopping the timer and
   removing the recovery file by hand.
-- NEW: reboot_request_lock_wait_sec (default 60) bounds how long run.sh and the watchdog wait
-  for a cancellation or another request to finish before requesting a reboot.
+- NEW: reboot_request_lock_wait_sec (default 60) bounds how long a reboot request waits for a
+  cancellation or another request to finish.
 - FIX: A watchdog that failed or timed out while a reboot it had scheduled was pending removed
   the file that held update runs, so an update could start before that reboot.
 - FIX: A reboot request whose outcome cannot be established keeps update runs held and fails
-  the run or watchdog, naming the commands to check and recover. This covers a request that was
-  interrupted, and a systemd-run that failed when systemd's state does not show whether the
-  timer exists. A failed systemd-run whose timer does exist counts as scheduled.
+  the run or watchdog, naming the commands to check and recover; a reboot that reaches systemd
+  late still happens. This covers an interrupted request and a failed systemd-run.
+- FIX: When the orderly reboot reports failure, the watchdog's reboot checks whether the host
+  is already shutting down before it falls back to systemctl reboot --force, and does not force
+  when it cannot tell.
 - FIX: A timer that has elapsed is no longer taken for a reboot still to come, so a reboot that
   failed earlier no longer stops a new one from being scheduled.
 - FIX: A failed scheduled reboot's notice says whether update runs are still held and how to

@@ -2,28 +2,35 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # reboot-request.sh
 # ---------------------------------------------------------------------------
-# Reboot request and cancellation protocol, sourced by run.sh, watchdog.sh
-# and cancel-reboot.sh so all three follow one implementation.
+# Reboot request and cancellation protocol, sourced by run.sh, watchdog.sh,
+# cancel-reboot.sh and reboot-if-pending.sh so all four follow one
+# implementation.
 #
 # REBOOT_PENDING_FILE holds every update run from before a reboot is
 # requested until the reboot; dnf-automatic-reboot.service carries
-# ConditionPathExists=! on it.  A request and a cancellation each run under
-# REBOOT_REQUEST_LOCK_FILE, so a cancellation never sees a marker whose
-# request has not yet reached systemd.  The lock file is never removed.
+# ConditionPathExists=! on it.  It is also the authority for the reboot
+# itself: every reboot this package requests runs reboot-if-pending.sh in the
+# transient unit, which, holding REBOOT_REQUEST_LOCK_FILE, reboots only while
+# REBOOT_PENDING_FILE exists, and writes REBOOT_DISPATCHED_FILE before it
+# calls systemctl reboot.  cancel-reboot.sh, holding the same lock, refuses
+# when REBOOT_DISPATCHED_FILE exists and otherwise removes
+# REBOOT_PENDING_FILE.  After a cancellation succeeds, no request of this
+# package can reboot the host, however late systemd processes it.
 #
-# Every outcome is accepted, rejected or unknown.  Only rejected, read from
-# systemd state that says no reboot exists, releases a marker the request
-# created; unknown keeps it.  A cancellation succeeds only on positive
-# evidence that the reboot will not happen.
+# A request returns accepted, rejected or unknown.  Rejected means nothing
+# was submitted, and only then is the REBOOT_PENDING_FILE the request created
+# removed; accepted and unknown keep it.
 #
 # The sourcing script defines TEST_ROOT, SYSTEMCTL_BIN, log, log_warning and
-# log_error; a script that schedules reboots also defines SYSTEMD_RUN_BIN.
+# log_error; a script that requests reboots also defines SYSTEMD_RUN_BIN.
 # ---------------------------------------------------------------------------
 
 readonly REBOOT_PENDING_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-pending"
+readonly REBOOT_DISPATCHED_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-dispatched"
 readonly REBOOT_REQUEST_LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-request.lock"
+readonly REBOOT_IF_PENDING_COMMAND="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot/reboot-if-pending.sh"
 readonly BUSCTL_BIN="${TEST_ROOT}/usr/bin/busctl"
-# Transient timer and service that carry a scheduled reboot.
+# Transient timer and service that carry a requested reboot.
 readonly SCHEDULED_REBOOT_UNIT=dnf-automatic-reboot-scheduled-reboot
 readonly CANCEL_REBOOT_COMMAND=/usr/libexec/dnf-automatic-reboot/cancel-reboot.sh
 
@@ -33,16 +40,35 @@ REBOOT_REQUEST_IN_PROGRESS=0
 REBOOT_REQUEST_LOCK_DESCRIPTOR=""
 
 # ---------------------------------------------------------------------------
-# Observations.  Each prints what systemd reports and returns non-zero when
-# systemd did not answer; callers treat that, and any value they do not
-# recognise, as unknown.
+# Observations.  Each returns non-zero when systemd did not answer; callers
+# treat that, and any value they do not recognise, as unknown.
 # ---------------------------------------------------------------------------
 
-# get_unit_property UNIT PROPERTY -> the property's value.  An unknown unit
-# reports LoadState=not-found, ActiveState=inactive, SubState=dead and an
-# empty Job.
-get_unit_property() {
-    "${SYSTEMCTL_BIN}" show --property="$2" --value "$1" 2>/dev/null
+# get_unit_properties UNIT -> LoadState, ActiveState, SubState and Job as
+# KEY=VALUE lines from one systemctl show, so the values describe one moment.
+# An unknown unit reports LoadState=not-found and ActiveState=inactive.
+get_unit_properties() {
+    "${SYSTEMCTL_BIN}" show --property=LoadState,ActiveState,SubState,Job "$1" 2>/dev/null
+}
+
+# read_unit_snapshot UNIT -> "LOAD ACTIVE SUB JOB", tab-separated, with JOB 0
+# when none is queued.  Returns 1 when systemd did not answer, when LoadState
+# or ActiveState is missing, or when Job is not a number.
+read_unit_snapshot() {
+    local unit_properties property_line load_state="" active_state="" sub_state="" job_id="0"
+    unit_properties=$(get_unit_properties "$1") || return 1
+    while IFS= read -r property_line; do
+        case "${property_line}" in
+            LoadState=*)   load_state="${property_line#LoadState=}" ;;
+            ActiveState=*) active_state="${property_line#ActiveState=}" ;;
+            SubState=*)    sub_state="${property_line#SubState=}" ;;
+            Job=*)         job_id="${property_line#Job=}" ;;
+        esac
+    done <<< "${unit_properties}"
+    [[ -n "${load_state}" && -n "${active_state}" ]] || return 1
+    job_id="${job_id:-0}"
+    [[ "${job_id}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\t%s\t%s\t%s' "${load_state}" "${active_state}" "${sub_state}" "${job_id}"
 }
 
 # get_system_state -> systemctl is-system-running's output.  The command exits
@@ -60,39 +86,42 @@ get_logind_preparing_for_shutdown() {
 }
 
 # read_scheduled_reboot_status -> one of
-#   none         no timer waiting, no reboot service queued, running or done
+#   none         nothing waiting, queued or running, and no reboot dispatched
 #   waiting      the timer is waiting to fire
 #   in_progress  the timer fired, or the reboot service has a job or runs
-#   dispatched   the reboot service succeeded (RemainAfterExit=yes keeps it
-#                active): systemd accepted the reboot
-#   failed       the reboot service failed: the reboot was refused
+#   dispatched   reboot-if-pending.sh called systemctl reboot in this boot
+#   failed       the reboot service failed
 #   unknown      systemd did not answer, or answered with an unknown state
+# The timer is read before the service: a timer that fires between the two
+# reads shows as a queued or running service.
 read_scheduled_reboot_status() {
-    local timer_load_state timer_sub_state service_load_state service_active_state service_job
-    if ! timer_load_state=$(get_unit_property "${SCHEDULED_REBOOT_UNIT}.timer" LoadState) \
-       || ! timer_sub_state=$(get_unit_property "${SCHEDULED_REBOOT_UNIT}.timer" SubState) \
-       || ! service_load_state=$(get_unit_property "${SCHEDULED_REBOOT_UNIT}.service" LoadState) \
-       || ! service_active_state=$(get_unit_property "${SCHEDULED_REBOOT_UNIT}.service" ActiveState) \
-       || ! service_job=$(get_unit_property "${SCHEDULED_REBOOT_UNIT}.service" Job); then
+    local timer_snapshot service_snapshot
+    local timer_load_state timer_sub_state service_load_state service_active_state service_job_id
+    if [[ -e "${REBOOT_DISPATCHED_FILE}" ]]; then
+        printf 'dispatched'
+        return 0
+    fi
+    if ! timer_snapshot=$(read_unit_snapshot "${SCHEDULED_REBOOT_UNIT}.timer") \
+       || ! service_snapshot=$(read_unit_snapshot "${SCHEDULED_REBOOT_UNIT}.service"); then
         printf 'unknown'
         return 0
     fi
+    IFS=$'\t' read -r timer_load_state _ timer_sub_state _ <<< "${timer_snapshot}"
+    IFS=$'\t' read -r service_load_state service_active_state _ service_job_id <<< "${service_snapshot}"
     if [[ ! "${timer_load_state}" =~ ^(loaded|not-found)$ \
-          || ! "${service_load_state}" =~ ^(loaded|not-found)$ \
-          || ! "${service_job}" =~ ^[0-9]*$ ]]; then
+          || ! "${service_load_state}" =~ ^(loaded|not-found)$ ]]; then
         printf 'unknown'
         return 0
     fi
-    if [[ -n "${service_job}" && "${service_job}" != "0" ]]; then
+    if [[ "${service_job_id}" != "0" ]]; then
         printf 'in_progress'
         return 0
     fi
     case "${service_active_state}" in
-        activating|deactivating|reloading) printf 'in_progress'; return 0 ;;
-        active)                            printf 'dispatched';  return 0 ;;
-        failed)                            printf 'failed';      return 0 ;;
-        inactive)                          ;;
-        *)                                 printf 'unknown';     return 0 ;;
+        activating|active|deactivating|reloading) printf 'in_progress'; return 0 ;;
+        failed)                                   printf 'failed';      return 0 ;;
+        inactive)                                 ;;
+        *)                                        printf 'unknown';     return 0 ;;
     esac
     if [[ "${timer_load_state}" == "loaded" ]]; then
         case "${timer_sub_state}" in
@@ -137,19 +166,22 @@ reset_failed_units() {
     "${SYSTEMCTL_BIN}" reset-failed "$@" 2>/dev/null || true
 }
 
-# start_transient_reboot_timer DELAY_SECONDS DESCRIPTION -> systemd-run's exit
-# code.  RemainAfterExit=yes keeps a reboot service that succeeded active, the
-# evidence cancel-reboot.sh reads; OnFailure= reports one that systemctl could
-# not start, such as one blocked by an inhibitor.
-start_transient_reboot_timer() {
+# start_reboot_unit DELAY_SECONDS FORCE_ALLOWED LOCK_WAIT_SECONDS DESCRIPTION
+# -> systemd-run's exit code.  The transient service runs reboot-if-pending.sh
+# after DELAY_SECONDS through a timer, or at once with DELAY_SECONDS 0.
+# OnFailure= reports a reboot that did not happen.
+start_reboot_unit() {
+    local delay_seconds="$1" force_allowed="$2" lock_wait_seconds="$3" description="$4"
+    local timer_options=()
+    if [[ "${delay_seconds}" -gt 0 ]]; then
+        timer_options=(--on-active="${delay_seconds}" --timer-property=AccuracySec=1s)
+    fi
     "${SYSTEMD_RUN_BIN}" \
         --unit="${SCHEDULED_REBOOT_UNIT}" \
-        --on-active="$1" \
-        --timer-property=AccuracySec=1s \
-        --property=RemainAfterExit=yes \
+        "${timer_options[@]}" \
         --property="OnFailure=dnf-automatic-reboot-notify@${SCHEDULED_REBOOT_UNIT}.service.service" \
-        --description="$2" \
-        "${SYSTEMCTL_BIN}" reboot
+        --description="${description}" \
+        "${REBOOT_IF_PENDING_COMMAND}" "${force_allowed}" "${lock_wait_seconds}"
 }
 
 # reboot_host [--force] -> systemctl reboot's exit code.
@@ -157,17 +189,19 @@ reboot_host() {
     "${SYSTEMCTL_BIN}" reboot "$@"
 }
 
-# submit_scheduled_reboot DELAY_SECONDS DESCRIPTION
-# Returns: 0 = accepted: the timer is waiting, or a reboot is already on its
-#              way; SCHEDULED_REBOOT_ALREADY_PRESENT=1 when it was not this
-#              call's
-#          1 = rejected: nothing was scheduled
-#          2 = unknown: systemd-run failed and systemd's state does not say
-#              whether the timer exists
+# submit_reboot DELAY_SECONDS FORCE_ALLOWED LOCK_WAIT_SECONDS DESCRIPTION
+# A dispatch function for request_reboot.  FORCE_ALLOWED (yes/no) lets
+# reboot-if-pending.sh fall back to systemctl reboot --force.
+# Returns: 0 = accepted: the unit exists, or a reboot was already waiting,
+#              queued, running or dispatched (SCHEDULED_REBOOT_ALREADY_PRESENT=1)
+#          1 = rejected: nothing was submitted
+#          2 = unknown: systemd-run failed and its unit is not visible; the
+#              request may still be on its way to systemd
 # shellcheck disable=SC2034  # read by the sourcing script
 SCHEDULED_REBOOT_ALREADY_PRESENT=0
-submit_scheduled_reboot() {
-    local delay_seconds="$1" description="$2" status systemd_run_exit_code=0
+submit_reboot() {
+    local delay_seconds="$1" force_allowed="$2" lock_wait_seconds="$3" description="$4"
+    local status systemd_run_exit_code=0
     # shellcheck disable=SC2034
     SCHEDULED_REBOOT_ALREADY_PRESENT=0
     status=$(read_scheduled_reboot_status)
@@ -175,11 +209,11 @@ submit_scheduled_reboot() {
         waiting|in_progress|dispatched)
             # shellcheck disable=SC2034
             SCHEDULED_REBOOT_ALREADY_PRESENT=1
-            log "a reboot is already scheduled or under way (${status}) - not scheduling a second one"
+            log "a reboot is already scheduled or under way (${status}) - not requesting a second one"
             return 0
             ;;
         unknown)
-            log_error "cannot read the state of ${SCHEDULED_REBOOT_UNIT} - reboot not scheduled"
+            log_error "cannot read the state of ${SCHEDULED_REBOOT_UNIT} - reboot not requested"
             return 1
             ;;
     esac
@@ -187,49 +221,19 @@ submit_scheduled_reboot() {
     # keeps the unit name taken until it is stopped and reset.
     stop_unit "${SCHEDULED_REBOOT_UNIT}.timer" || true
     reset_failed_units "${SCHEDULED_REBOOT_UNIT}.service" "${SCHEDULED_REBOOT_UNIT}.timer"
-    start_transient_reboot_timer "${delay_seconds}" "${description}" || systemd_run_exit_code=$?
+    start_reboot_unit "${delay_seconds}" "${force_allowed}" "${lock_wait_seconds}" "${description}" \
+        || systemd_run_exit_code=$?
     [[ "${systemd_run_exit_code}" -eq 0 ]] && return 0
-    # systemd-run can fail after systemd accepted the unit: killed while it
-    # waited for the reply, or failing while processing it.
+    # systemd-run can fail after systemd accepted the unit, and a request it
+    # sent may not have been processed yet; an absent unit proves nothing.
     status=$(read_scheduled_reboot_status)
     case "${status}" in
         waiting|in_progress|dispatched|failed)
             log_warning "systemd-run exited ${systemd_run_exit_code}, but ${SCHEDULED_REBOOT_UNIT} exists (${status}) - the reboot was submitted"
             return 0
             ;;
-        none)
-            log_error "systemd-run exited ${systemd_run_exit_code} and no ${SCHEDULED_REBOOT_UNIT} exists - reboot not scheduled"
-            return 1
-            ;;
     esac
-    log_error "systemd-run exited ${systemd_run_exit_code} and the state of ${SCHEDULED_REBOOT_UNIT} cannot be read - whether the reboot was scheduled is unknown"
-    return 2
-}
-
-# submit_immediate_reboot
-# Prefers an orderly reboot.  --force skips unit shutdown and remounts
-# filesystems read-only under running processes, which risks the rootfs on
-# flash-backed hosts; it is the fallback only, for when logind refuses the
-# orderly path (a leaked inhibitor lock).
-# Returns: 0 = accepted, 1 = rejected: the host is not shutting down,
-#          2 = unknown.
-submit_immediate_reboot() {
-    local shutdown_state
-    if reboot_host; then
-        log "Orderly reboot requested"
-        return 0
-    fi
-    log_warning "Orderly reboot refused - falling back to systemctl reboot --force"
-    if reboot_host --force; then
-        log "Forced reboot requested"
-        return 0
-    fi
-    shutdown_state=$(read_host_shutdown_state)
-    case "${shutdown_state}" in
-        yes) log_warning "systemctl reboot failed, but the host is shutting down"; return 0 ;;
-        no)  return 1 ;;
-    esac
-    log_error "systemctl reboot failed and the shutdown state cannot be read - whether the reboot was submitted is unknown"
+    log_error "systemd-run exited ${systemd_run_exit_code} and ${SCHEDULED_REBOOT_UNIT} is ${status}"
     return 2
 }
 
@@ -239,8 +243,16 @@ submit_immediate_reboot() {
 
 # acquire_reboot_request_lock WAIT_SECONDS - 0 when the lock is held; with
 # WAIT_SECONDS 0 it does not wait.  A process that exits releases it.
+# flock(2) grants an exclusive lock through a read-only descriptor, so any
+# user able to open the file could hold it: it is created 0600 and set to
+# 0600 before every use, in place, so a holder keeps its inode.
 acquire_reboot_request_lock() {
     local wait_seconds="$1"
+    if ! ( umask 077 && : >> "${REBOOT_REQUEST_LOCK_FILE}" ) 2>/dev/null \
+       || ! chmod 0600 "${REBOOT_REQUEST_LOCK_FILE}" 2>/dev/null; then
+        log_error "cannot create ${REBOOT_REQUEST_LOCK_FILE} with mode 0600"
+        return 1
+    fi
     exec {REBOOT_REQUEST_LOCK_DESCRIPTOR}>>"${REBOOT_REQUEST_LOCK_FILE}" || return 1
     if [[ "${wait_seconds}" -eq 0 ]]; then
         flock --nonblock "${REBOOT_REQUEST_LOCK_DESCRIPTOR}" && return 0
@@ -271,7 +283,7 @@ request_reboot() {
     local lock_wait_seconds="$1" dispatch_function="$2" pending_file_created=0 dispatch_result=0
     shift 2
     if ! acquire_reboot_request_lock "${lock_wait_seconds}"; then
-        log_error "${REBOOT_REQUEST_LOCK_FILE} still held after ${lock_wait_seconds}s - reboot not requested"
+        log_error "${REBOOT_REQUEST_LOCK_FILE} not acquired within ${lock_wait_seconds}s - reboot not requested"
         return 1
     fi
     REBOOT_REQUEST_IN_PROGRESS=1
@@ -308,7 +320,7 @@ request_reboot() {
 # reboot_request_outcome_unknown_message -> the error for a request whose
 # outcome is unknown, with the recovery commands.
 reboot_request_outcome_unknown_message() {
-    printf '%s' "whether the reboot request reached systemd is unknown. ${REBOOT_PENDING_FILE} stays, so no update run starts. Check: systemctl list-timers ${SCHEDULED_REBOOT_UNIT}.timer; then reboot, or allow updates again with: ${CANCEL_REBOOT_COMMAND}"
+    printf '%s' "whether the reboot request reached systemd is unknown. ${REBOOT_PENDING_FILE} stays, so no update run starts, and a reboot that arrives late still happens. Check: systemctl list-timers ${SCHEDULED_REBOOT_UNIT}.timer; then reboot, or allow updates again with: ${CANCEL_REBOOT_COMMAND}"
 }
 
 # report_interrupted_reboot_request - for the sourcing script's EXIT trap.

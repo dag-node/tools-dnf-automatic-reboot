@@ -473,7 +473,8 @@ schedule_reboot() {
     local reboot_time submit_result=0
     reboot_time=$(date -d "@$(( $(date +%s) + REBOOT_DELAY_SEC ))" '+%F %T %Z')
     log "scheduling reboot in ${REBOOT_DELAY_SEC}s"
-    submit_scheduled_reboot "${REBOOT_DELAY_SEC}" "dnf-automatic-reboot scheduled reboot" || submit_result=$?
+    submit_reboot "${REBOOT_DELAY_SEC}" no "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "dnf-automatic-reboot scheduled reboot" \
+        || submit_result=$?
     case "${submit_result}" in
         0)
             if [[ "${SCHEDULED_REBOOT_ALREADY_PRESENT}" -eq 1 ]]; then
@@ -498,6 +499,27 @@ schedule_reboot() {
     return 2
 }
 
+# exit_if_reboot_pending - exits 0 without updating while a scheduled reboot
+# is waiting, queued, running or dispatched, and exits 1 when that cannot be
+# read.  ConditionPathExists=! on REBOOT_PENDING_FILE normally keeps this unit
+# from starting then; this also covers a reboot timer with no marker, such as
+# one an earlier package version's watchdog scheduled during an upgrade.
+exit_if_reboot_pending() {
+    local scheduled_reboot_status
+    scheduled_reboot_status=$(read_scheduled_reboot_status)
+    case "${scheduled_reboot_status}" in
+        none|failed)
+            return 0
+            ;;
+        unknown)
+            log_error "cannot read the state of ${SCHEDULED_REBOOT_UNIT} - not updating, a reboot may be pending"
+            exit 1
+            ;;
+    esac
+    log "a reboot is pending (${scheduled_reboot_status}) - not updating before it; cancel it with: ${CANCEL_REBOOT_COMMAND}"
+    exit 0
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -510,6 +532,7 @@ main() {
     START_UPTIME_SECONDS=$(uptime_seconds)
     log "Starting (pid=${SERVICE_PID})"
     check_conflicts
+    exit_if_reboot_pending
     warn_on_unsigned_repositories
 
     # Detect concurrent dnf - warn but do not abort; dnf serialises via its
