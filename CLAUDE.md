@@ -380,11 +380,24 @@ reboot is `waiting`, `in_progress` or `dispatched`, and 1 when it is `unknown`. 
 with no marker, such as one a 1.4.0 watchdog scheduled during an upgrade to this version,
 whose `ExecStopPost=` removes the 1.4.0 hold. Nothing migrates from 1.4.0.
 
-The `systemctl show` output format (no `Job=` line, or `Job=` with an id),
-`SubState=waiting` on a transient `--on-active` timer, and `PreparingForShutdown` under a
-delay inhibitor are read from systemd 239 and 252 sources, not yet observed on a host.
-`tools/verify-reboot-protocol.sh` checks all but the last against real systemd, through the
-library's own readers, with transient probe units that run `/bin/true` or `sleep`.
+`tools/verify-reboot-protocol.sh` checks these facts against real systemd, through the
+library's own readers, with transient probe units that run `/bin/true` or `sleep`. On OL 9.8
+(systemd 252, util-linux `flock`) it observed:
+
+- An unknown unit shows `Job=` with an empty value, and a queued start shows `Job=<id>` while
+  the unit is still `inactive`.
+- A transient `--on-active` timer is `SubState=waiting` until it fires, with
+  `RemainAfterElapse=no`; once it has fired or been stopped, it and its service are
+  `not-found`.
+- Stopping a timer that has fired leaves its service's queued start job in place. Only
+  `reboot-if-pending.sh`'s own marker check stops that job from rebooting.
+- `systemd-run` without `--on-active` runs the command at once.
+- A running host can report `degraded`, which reads as not shutting down.
+- tmpfiles.d creates the lock `0600 root:root` with label `var_run_t`, and user `nobody` cannot
+  open it.
+
+The EL8 run (systemd 239) is outstanding. `PreparingForShutdown` under a delay inhibitor needs
+a real shutdown, and is read from the systemd 239 and 252 sources only.
 
 After the kill, the watchdog waits up to `watchdog_kill_confirm_sec` for systemd to report
 the unit `inactive` or `failed`. A failed `systemctl kill`, or a unit still active then,
