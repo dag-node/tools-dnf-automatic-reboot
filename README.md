@@ -70,8 +70,9 @@ Between 03:00 and 03:10 the computer:
 3. Checks whether any update needs a restart: a new kernel, or a core
    component such as `glibc` or `systemd`.
 4. If one does, warns everyone logged in with the restart time and restarts
-   one minute later. To call the restart off during that minute:
-   `sudo systemctl stop dnf-automatic-reboot-scheduled-reboot.timer`.
+   one minute later. No further update runs until then. To call the restart
+   off during that minute and allow updates again:
+   `sudo /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh`.
    If none does, restarts only the background services whose programs were
    updated, and the computer keeps running.
 5. Ends with one line in the log and on logged-in terminals: updates

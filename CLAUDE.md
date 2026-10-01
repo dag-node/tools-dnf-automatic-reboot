@@ -49,6 +49,7 @@ scripts/run.sh                  Main orchestration (inhibitor + dnf + reboot)
 scripts/watchdog.sh             Independent watchdog (soft/hard timeout)
 scripts/needs-reboot.sh         Reboot decision + false-positive filtering
 scripts/notify-failure.sh       OnFailure= notifier (wall + log)
+scripts/cancel-reboot.sh        Cancels a pending reboot and allows update runs again
 units/dnf-automatic-reboot.service    Oneshot service wrapping run.sh
 units/dnf-automatic-reboot.timer      Daily 03:00, RandomizedDelaySec=10min, Persistent
 units/dnf-automatic-watchdog.service  Oneshot service wrapping watchdog.sh
@@ -293,14 +294,37 @@ removed, and be rebooted under. The watchdog therefore creates
 `dnf-automatic-reboot.service` carries
 `ConditionPathExists=!/run/dnf-automatic-reboot.recovery`: no run starts while the file
 exists, and a run that started before it shows in the re-check. The file covers the
-kill, the state-file removal and the reboot decision. When the watchdog requests or
-schedules a reboot the file stays, so no update starts before that reboot, which empties
-`/run`; every other exit removes it through the EXIT trap. The watchdog unit's
-`ExecStopPost=` removes it when `$SERVICE_RESULT` is not `success`, covering a watchdog
-that failed or was stopped by `TimeoutStartSec=`. A timer start skipped by the
-condition waits for the next `OnCalendar=`. Cancelling a watchdog-scheduled reboot takes
-`systemctl stop dnf-automatic-reboot-scheduled-reboot.timer` and
-`rm -f /run/dnf-automatic-reboot.recovery`.
+kill, the state-file removal and the reboot decision, and never outlives the watchdog:
+the EXIT trap removes it on every exit, and the watchdog unit's `ExecStopPost=` removes it
+unconditionally, covering a watchdog stopped by `TimeoutStartSec=`. A timer start
+skipped by the condition waits for the next `OnCalendar=`.
+
+A pending reboot has its own marker, so each file has one lifetime and one set of
+removers:
+
+| Marker | Lifetime | Removed by |
+|--------|----------|------------|
+| `/run/dnf-automatic-reboot.recovery` | identity re-check, kill, state cleanup, reboot decision | the watchdog's EXIT trap; `ExecStopPost=` |
+| `/run/dnf-automatic-reboot.reboot-pending` | from before a reboot request until the reboot | the reboot (emptying `/run`); `cancel-reboot.sh`; a request that definitely failed, for the file it created |
+
+`dnf-automatic-reboot.service` carries `ConditionPathExists=!` for both. `request_reboot`
+in `run.sh` and `watchdog.sh` hands over between them: it creates `.reboot-pending`, then
+calls `schedule_reboot` or `reboot_now`. On success `.reboot-pending` stays and the
+watchdog's EXIT trap releases `.recovery`. On a definite failure it removes the
+`.reboot-pending` it created; one that already existed belongs to an earlier request and
+stays. When the process is stopped mid-request, the outcome is unknown: `.reboot-pending`
+stays and the EXIT trap logs that the operator must check the timer, then reboot or
+cancel. A run killed by SIGKILL at that point has no trap; when the watchdog then decides
+no reboot is needed, it fails its unit if `.reboot-pending` exists with no active
+`dnf-automatic-reboot-scheduled-reboot.timer`. Nothing else removes `.reboot-pending`, and
+no timeout or further condition is to be added to either marker.
+
+`cancel-reboot.sh` stops the timer, then removes `.reboot-pending`. It exits 0 only when
+the reboot will not happen: the timer stopped before it fired, the reboot service
+`failed`, or no timer and the host not `stopping` (`systemctl is-system-running`). With
+the reboot service activating or active, or the host stopping, it exits 1 and keeps the
+file. A failed reboot service starts `dnf-automatic-reboot-notify@`, whose message says
+whether `.reboot-pending` still holds update runs and names `cancel-reboot.sh`.
 
 After the kill, the watchdog waits up to `watchdog_kill_confirm_sec` for systemd to report
 the unit `inactive` or `failed`. A failed `systemctl kill`, or a unit still active then,
@@ -690,9 +714,9 @@ systemctl start dnf-automatic-reboot.service
 # during a run it acts as its timer would, kill and reboot included
 /usr/libexec/dnf-automatic-reboot/watchdog.sh
 
-# A scheduled reboot, and how to cancel it
+# A scheduled reboot, and how to cancel it (also allows update runs again)
 systemctl list-timers dnf-automatic-reboot-scheduled-reboot.timer
-systemctl stop dnf-automatic-reboot-scheduled-reboot.timer
+/usr/libexec/dnf-automatic-reboot/cancel-reboot.sh
 
 # What -r decides, and the boot time it decides against
 LC_ALL=C dnf -q -C needs-restarting -r

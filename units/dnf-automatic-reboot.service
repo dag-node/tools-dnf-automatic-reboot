@@ -19,6 +19,9 @@ ConditionPathExists=!/run/dnf-automatic-reboot.lock
 # The watchdog holds this file while it checks and kills a stuck run, so no
 # new run can start in between and be killed in its place.
 ConditionPathExists=!/run/dnf-automatic-reboot.recovery
+# Present from a reboot request until the reboot, or until
+# /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels it.
+ConditionPathExists=!/run/dnf-automatic-reboot.reboot-pending
 # A failed run is otherwise visible only in the journal; %n names the unit.
 OnFailure=dnf-automatic-reboot-notify@%n.service
 

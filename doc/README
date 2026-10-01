@@ -39,8 +39,13 @@ Files installed
                     would not apply (no reboot; the run is marked failed).
 
   /usr/libexec/dnf-automatic-reboot/notify-failure.sh
-      Failure notifier.  Started by OnFailure= from both service units;
-      writes the reason to wall(1), the journal and the log.
+      Failure notifier.  Started by OnFailure= from both service units and
+      from the scheduled reboot; writes the reason to wall(1), the journal
+      and the log.
+
+  /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh
+      Cancels a pending reboot and allows update runs again.  See
+      "Scheduled reboots".
 
   /etc/dnf/automatic-reboot.conf
       Configuration.  Preserved across upgrades (%config(noreplace) in RPM).
@@ -355,16 +360,31 @@ Scheduled reboots
   the log give the time.
 
   systemctl list-timers dnf-automatic-reboot-scheduled-reboot.timer
-  systemctl stop dnf-automatic-reboot-scheduled-reboot.timer   # cancel it
+  /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh             # cancel it
 
-  A reboot the watchdog scheduled after stopping a stuck run also keeps
-  /run/dnf-automatic-reboot.recovery, which holds off every update run until
-  the reboot.  After cancelling such a reboot, allow runs again with:
+  From before a reboot is requested until the host reboots,
+  /run/dnf-automatic-reboot.reboot-pending exists and
+  dnf-automatic-reboot.service does not start; a timer start is skipped.
+  This holds for the reboots run.sh schedules and for the ones the watchdog
+  requests or schedules after stopping a stuck run.  Only the reboot, which
+  empties /run, and cancel-reboot.sh remove the file.
 
-  rm -f /run/dnf-automatic-reboot.recovery
+  cancel-reboot.sh stops the timer and removes the file together.  It exits 0
+  only when the reboot will not happen: the timer was stopped before it fired,
+  the reboot command failed, or nothing was scheduled.  Once the reboot
+  command is running or the host is shutting down, it exits 1 and changes
+  nothing.
 
   If the reboot itself fails to start, dnf-automatic-reboot-notify@ reports
-  the failed dnf-automatic-reboot-scheduled-reboot.service.
+  the failed dnf-automatic-reboot-scheduled-reboot.service, and says whether
+  update runs are still held.  They are held while the file exists: reboot
+  the host, or run cancel-reboot.sh to allow updates again.
+
+  A run.sh or watchdog stopped while it requests a reboot cannot tell whether
+  the request reached systemd.  The file stays, and the log names the
+  outcome as unknown; check the timer, then reboot or run cancel-reboot.sh.
+  A run killed by the watchdog at that point leaves the same file; the
+  watchdog reports it and fails when no reboot timer is active.
 
 
 Forcing a manual run

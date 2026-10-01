@@ -832,7 +832,12 @@ stub_run_main() {
         return "${STUB_DNF_AUTOMATIC_RC:-0}"
     }
     run_reboot_check() { return "${STUB_NEEDS_REBOOT_RC:-0}"; }
-    schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
+    schedule_reboot() {
+        printf 'schedule_reboot reboot_pending_file=%s\n' "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
+        [[ "${STUB_SCHEDULE_FAILS:-}" == "yes" ]] && return 1
+        [[ "${STUB_SCHEDULE_INTERRUPTED:-}" == "yes" ]] && kill -TERM "${BASHPID}"
+        return 0
+    }
 }
 
 # stub_service_restarts: timeout(1) runs dnf-automatic successfully, lists
@@ -937,7 +942,7 @@ test_reboot_is_scheduled_on_a_named_unit() {
     assert_contains "${dispatch_call}" "--unit=dnf-automatic-reboot-scheduled-reboot" "an operator can find the reboot"
     assert_contains "${dispatch_call}" "OnFailure=dnf-automatic-reboot-notify@dnf-automatic-reboot-scheduled-reboot.service.service" \
         "a reboot that fails to start is reported"
-    assert_contains "${SCHEDULED_REBOOT_SUMMARY}" "cancel with: systemctl stop dnf-automatic-reboot-scheduled-reboot.timer" \
+    assert_contains "${SCHEDULED_REBOOT_SUMMARY}" "cancel with: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh" \
         "the summary says how to cancel it"
 }
 
@@ -947,6 +952,41 @@ test_reboot_already_scheduled_is_not_scheduled_twice() {
     schedule_reboot >/dev/null 2>&1
     assert_exit_code 0 "$?" "an active reboot timer is success"
     assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run" "no second transient unit"
+}
+
+test_run_scheduled_reboot_holds_update_runs() {
+    load_run_library
+    stub_run_main
+    export STUB_NEEDS_REBOOT_RC=1
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the reboot is scheduled"
+    assert_contains "$(cat "${STUB_LOG}")" "schedule_reboot reboot_pending_file=present" \
+        "marked pending before the request"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "no update may start before the scheduled reboot"
+    return 0
+}
+
+test_run_failed_schedule_removes_its_marker() {
+    load_run_library
+    stub_run_main
+    export STUB_NEEDS_REBOOT_RC=1 STUB_SCHEDULE_FAILS=yes
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "a failed dispatch fails the run"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "no reboot is pending, so runs must be allowed again"
+    return 0
+}
+
+test_run_interrupted_request_keeps_its_marker() {
+    load_run_library
+    stub_run_main
+    export STUB_NEEDS_REBOOT_RC=1 STUB_SCHEDULE_INTERRUPTED=yes
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    [[ "${exit_code}" -ne 0 ]] || fail "a stopped run is not a success"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "an interrupted request keeps update runs blocked"
+    assert_contains "${output}" "whether it was submitted is unknown" "the unknown outcome is reported"
 }
 
 test_run_helper_failure_fails_the_run() {
@@ -1355,14 +1395,18 @@ stub_watchdog_kill_path() {
         return 0
     }
     reboot_now() {
-        printf 'reboot_now recovery_file=%s state_file=%s\n' \
-            "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${STATE_FILE}")" >> "${STUB_LOG}"
+        printf 'reboot_now recovery_file=%s state_file=%s reboot_pending_file=%s\n' \
+            "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${STATE_FILE}")" \
+            "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
     }
     schedule_reboot() {
-        printf 'schedule_reboot recovery_file=%s\n' "$(file_presence "${RECOVERY_FILE}")" >> "${STUB_LOG}"
+        printf 'schedule_reboot recovery_file=%s reboot_pending_file=%s\n' \
+            "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
         [[ "${STUB_SCHEDULE_FAILS:-}" == "yes" ]] && return 1
+        [[ "${STUB_SCHEDULE_INTERRUPTED:-}" == "yes" ]] && kill -TERM "${BASHPID}"
         return 0
     }
+    scheduled_reboot_timer_is_active() { [[ "${STUB_TIMER_ACTIVE:-}" == "yes" ]]; }
 }
 
 # file_presence PATH -> present or absent
@@ -1420,9 +1464,10 @@ test_watchdog_no_run_starts_during_the_kill() {
         "the main unit is blocked from starting while its run is killed"
     # A run starting after the kill would have its state file removed and
     # be rebooted under; the marker must outlast the reboot request.
-    assert_contains "$(cat "${STUB_LOG}")" "reboot_now recovery_file=present state_file=absent" \
+    assert_contains "$(cat "${STUB_LOG}")" "reboot_now recovery_file=present state_file=absent reboot_pending_file=present" \
         "no run can start between the state cleanup and the reboot"
-    [[ -f "${RECOVERY_FILE}" ]] || fail "the marker must stay while the reboot is pending"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the reboot-pending marker must stay until the reboot"
+    [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery marker ends with recovery"
     return 0
 }
 
@@ -1436,8 +1481,10 @@ test_watchdog_scheduled_reboot_keeps_runs_blocked() {
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 0 "${exit_code}" "the reboot is scheduled"
-    assert_contains "$(cat "${STUB_LOG}")" "schedule_reboot recovery_file=present" "blocked through the decision"
-    [[ -f "${RECOVERY_FILE}" ]] || fail "no update may start before the scheduled reboot"
+    assert_contains "$(cat "${STUB_LOG}")" "schedule_reboot recovery_file=present reboot_pending_file=present" \
+        "blocked through the decision, and marked pending before the request"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "no update may start before the scheduled reboot"
+    [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery marker ends with recovery"
     return 0
 }
 
@@ -1468,16 +1515,92 @@ test_watchdog_failed_schedule_allows_runs_again() {
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 1 "${exit_code}" "the failed dispatch fails the watchdog"
     [[ -f "${RECOVERY_FILE}" ]] && fail "no reboot is pending, so runs must be allowed again"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "a request that definitely failed removes its own marker"
     return 0
 }
 
-test_watchdog_recovery_file_blocks_the_main_unit() {
+test_watchdog_markers_block_the_main_unit() {
     grep -qx 'ConditionPathExists=!/run/dnf-automatic-reboot.recovery' \
         "${REPO_ROOT}/units/dnf-automatic-reboot.service" \
         || fail "dnf-automatic-reboot.service must not start while the watchdog kills a run"
-    grep -q '^ExecStopPost=.*SERVICE_RESULT.*rm -f /run/dnf-automatic-reboot.recovery' \
+    grep -qx 'ConditionPathExists=!/run/dnf-automatic-reboot.reboot-pending' \
+        "${REPO_ROOT}/units/dnf-automatic-reboot.service" \
+        || fail "dnf-automatic-reboot.service must not start while a reboot is pending"
+    grep -qx 'ExecStopPost=/usr/bin/rm -f /run/dnf-automatic-reboot.recovery' \
         "${REPO_ROOT}/units/dnf-automatic-watchdog.service" \
-        || fail "a watchdog that failed or timed out must not leave the recovery file behind"
+        || fail "the recovery file must never outlive the watchdog"
+    grep '^ExecStopPost' "${REPO_ROOT}/units/dnf-automatic-watchdog.service" | grep -q 'reboot-pending' \
+        && fail "the watchdog unit must never remove the reboot-pending marker"
+    return 0
+}
+
+test_watchdog_later_failure_keeps_a_pending_reboot() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    # A reboot requested earlier is still pending when a later watchdog cycle
+    # fails for an unrelated reason.
+    : > "${REBOOT_PENDING_FILE}"
+    write_watchdog_state checking 200 "${background_pid}"
+    stub_watchdog_kill_path
+    export STUB_KILL_FAILS=yes
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "the later watchdog fails"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the pending reboot must keep update runs blocked"
+    [[ -f "${RECOVERY_FILE}" ]] && fail "the failed recovery's own marker is removed"
+    return 0
+}
+
+test_watchdog_interrupted_request_keeps_a_marker() {
+    sleep 60 &
+    local background_pid=$! exit_code=0 output
+    load_watchdog_library
+    write_watchdog_state checking 70 "${background_pid}"
+    stub_watchdog_kill_path
+    run_independent_reboot_check() { return 1; }
+    # Stopped at TimeoutStartSec= while systemd-run is submitting the reboot:
+    # whether the timer exists is unknown.
+    export STUB_SCHEDULE_INTERRUPTED=yes
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 143 "${exit_code}" "the watchdog was terminated"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "an interrupted request must never leave both markers absent"
+    assert_contains "${output}" "whether it was submitted is unknown" "the unknown outcome is reported"
+    assert_contains "${output}" "cancel-reboot.sh" "with the recovery command"
+}
+
+test_watchdog_failed_request_keeps_an_earlier_marker() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    : > "${REBOOT_PENDING_FILE}"
+    write_watchdog_state checking 70 "${background_pid}"
+    stub_watchdog_kill_path
+    export STUB_SCHEDULE_FAILS=yes
+    run_independent_reboot_check() { return 1; }
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "the failed dispatch fails the watchdog"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "a failed request removes only the marker it created"
+    return 0
+}
+
+test_watchdog_reports_a_marker_left_by_the_killed_run() {
+    sleep 60 &
+    local background_pid=$! exit_code=0 output
+    load_watchdog_library
+    # The stuck run was killed while it requested a reboot; no timer exists.
+    : > "${REBOOT_PENDING_FILE}"
+    write_watchdog_state checking 70 "${background_pid}"
+    stub_watchdog_kill_path
+    run_independent_reboot_check() { return 0; }
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "blocked update runs reach OnFailure="
+    assert_contains "${output}" "no reboot is scheduled" "the leftover marker is named"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the watchdog does not decide the outcome for the operator"
+    return 0
 }
 
 test_watchdog_replaced_run_is_not_killed() {
@@ -1576,6 +1699,108 @@ test_watchdog_prefers_orderly_reboot() {
     kill "${background_pid}" 2>/dev/null
     assert_not_contains "$(cat "${STUB_LOG}")" "reboot --force" \
         "--force is the fallback, never the first attempt"
+}
+
+# ---------------------------------------------------------------------------
+# cancel: a reboot is cancelled only while it is known not to happen
+# ---------------------------------------------------------------------------
+# load_cancel_reboot_library: sources cancel-reboot.sh and stubs what it reads
+# from systemd.  The timer reports STUB_TIMER_ACTIVE_STATE (active by
+# default) and STUB_TIMER_LOAD_STATE (loaded); the reboot service reports
+# STUB_SERVICE_ACTIVE_STATE (inactive); the host STUB_SYSTEM_STATE (running).
+load_cancel_reboot_library() {
+    # shellcheck source=/dev/null
+    source "${REPO_ROOT}/scripts/cancel-reboot.sh"
+    set +e
+    IFS=$' \t\n'
+    unit_property() {
+        case "$1:$2" in
+            *.timer:ActiveState)   printf '%s' "${STUB_TIMER_ACTIVE_STATE:-active}" ;;
+            *.timer:LoadState)     printf '%s' "${STUB_TIMER_LOAD_STATE:-loaded}" ;;
+            *.service:ActiveState) printf '%s' "${STUB_SERVICE_ACTIVE_STATE:-inactive}" ;;
+        esac
+    }
+    system_state() { printf '%s' "${STUB_SYSTEM_STATE:-running}"; }
+    stop_scheduled_reboot_timer() { printf 'stop timer\n' >> "${STUB_LOG}"; }
+    : > "${REBOOT_PENDING_FILE}"
+}
+
+test_cancel_stops_the_timer_and_allows_runs() {
+    load_cancel_reboot_library
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the reboot is cancelled"
+    assert_contains "$(cat "${STUB_LOG}")" "stop timer" "the timer is stopped"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "update runs must be allowed again"
+    return 0
+}
+
+test_cancel_refuses_once_the_reboot_command_runs() {
+    load_cancel_reboot_library
+    export STUB_TIMER_ACTIVE_STATE=inactive STUB_TIMER_LOAD_STATE=not-found STUB_SERVICE_ACTIVE_STATE=activating
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "a dispatched reboot is never reported as cancelled"
+    assert_contains "${output}" "NOT cancelled" "the operator is told"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the marker stays until the reboot"
+    return 0
+}
+
+test_cancel_refuses_while_shutting_down() {
+    load_cancel_reboot_library
+    # The reboot command succeeded and its unit is gone: the host is stopping.
+    export STUB_TIMER_ACTIVE_STATE=inactive STUB_TIMER_LOAD_STATE=not-found STUB_SYSTEM_STATE=stopping
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "a reboot in progress is never reported as cancelled"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the marker stays until the reboot"
+    return 0
+}
+
+test_cancel_after_a_failed_reboot_allows_runs() {
+    load_cancel_reboot_library
+    export STUB_TIMER_ACTIVE_STATE=inactive STUB_TIMER_LOAD_STATE=not-found STUB_SERVICE_ACTIVE_STATE=failed
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a reboot that failed will not happen"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "update runs must be allowed again"
+    return 0
+}
+
+test_cancel_with_nothing_pending_is_a_noop() {
+    load_cancel_reboot_library
+    rm -f "${REBOOT_PENDING_FILE}"
+    export STUB_TIMER_ACTIVE_STATE=inactive
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "nothing to cancel"
+    assert_not_contains "$(cat "${STUB_LOG}")" "stop timer" "nothing is stopped"
+}
+
+# notify: a failed deferred reboot says whether updates stay blocked
+load_notify_library() {
+    # shellcheck source=/dev/null
+    source "${REPO_ROOT}/scripts/notify-failure.sh"
+    set +e
+    IFS=$' \t\n'
+    journalctl() { :; }
+}
+
+test_notify_failed_reboot_names_blocked_updates() {
+    load_notify_library
+    : > "${REBOOT_PENDING_FILE}"
+    ( main dnf-automatic-reboot-scheduled-reboot.service ) >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "Update runs stay blocked until the host reboots" \
+        "the operator learns updates are held"
+    assert_contains "$(cat "${STUB_LOG}")" "cancel-reboot.sh" "and how to release them"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the notifier leaves the marker to the operator"
+    return 0
+}
+
+test_notify_failed_reboot_without_marker_is_not_blocked() {
+    load_notify_library
+    ( main dnf-automatic-reboot-scheduled-reboot.service ) >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "Update runs are not blocked" "no false hold reported"
 }
 
 # ---------------------------------------------------------------------------
@@ -1965,6 +2190,9 @@ printf 'run\n'
 run_test "run: refused inhibitor stops the update"   test_run_refused_inhibitor_stops_the_update
 run_test "run: update runs inside the inhibitor"     test_run_update_runs_inside_the_inhibitor
 run_test "run: helper failure fails the run"        test_run_helper_failure_fails_the_run
+run_test "run: scheduled reboot holds update runs"   test_run_scheduled_reboot_holds_update_runs
+run_test "run: failed schedule removes its marker"   test_run_failed_schedule_removes_its_marker
+run_test "run: interrupted request keeps its marker" test_run_interrupted_request_keeps_its_marker
 run_test "run: pending restart fails the run"       test_run_pending_restart_fails_the_run
 run_test "run: failed restart fails the run"        test_run_failed_restart_fails_the_run
 run_test "run: completion summary names every outcome" test_run_completion_summary_names_every_outcome
@@ -2018,7 +2246,18 @@ run_test "watchdog: no run starts during the kill"   test_watchdog_no_run_starts
 run_test "watchdog: scheduled reboot keeps runs blocked" test_watchdog_scheduled_reboot_keeps_runs_blocked
 run_test "watchdog: recovery without reboot allows runs" test_watchdog_recovery_without_reboot_allows_runs_again
 run_test "watchdog: failed schedule allows runs again" test_watchdog_failed_schedule_allows_runs_again
-run_test "watchdog: recovery file blocks the main unit" test_watchdog_recovery_file_blocks_the_main_unit
+run_test "watchdog: markers block the main unit"     test_watchdog_markers_block_the_main_unit
+run_test "watchdog: later failure keeps a pending reboot" test_watchdog_later_failure_keeps_a_pending_reboot
+run_test "watchdog: interrupted request keeps a marker" test_watchdog_interrupted_request_keeps_a_marker
+run_test "watchdog: failed request keeps an earlier marker" test_watchdog_failed_request_keeps_an_earlier_marker
+run_test "watchdog: reports a marker left by the killed run" test_watchdog_reports_a_marker_left_by_the_killed_run
+run_test "cancel: stops the timer and allows runs"   test_cancel_stops_the_timer_and_allows_runs
+run_test "cancel: refuses once the reboot command runs" test_cancel_refuses_once_the_reboot_command_runs
+run_test "cancel: refuses while shutting down"       test_cancel_refuses_while_shutting_down
+run_test "cancel: after a failed reboot allows runs" test_cancel_after_a_failed_reboot_allows_runs
+run_test "cancel: nothing pending is a noop"         test_cancel_with_nothing_pending_is_a_noop
+run_test "notify: failed reboot names blocked updates" test_notify_failed_reboot_names_blocked_updates
+run_test "notify: failed reboot without marker is not blocked" test_notify_failed_reboot_without_marker_is_not_blocked
 run_test "watchdog: unknown identity is not acted on" test_watchdog_unknown_identity_is_not_acted_on
 run_test "watchdog: dispatch failure fails the watchdog" test_watchdog_dispatch_failure_fails_the_watchdog
 run_test "watchdog: unit has a start timeout"        test_watchdog_unit_has_a_start_timeout

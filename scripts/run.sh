@@ -42,6 +42,10 @@ readonly DNF_CONFIG_FILE="${TEST_ROOT}/etc/dnf/dnf.conf"
 readonly REPOSITORY_CONFIG_DIRECTORY="${TEST_ROOT}/etc/yum.repos.d"
 readonly STATE_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.state"
 readonly LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.lock"
+# Present from a reboot request until the reboot; the unit does not start then.
+# watchdog.sh uses the same file.
+readonly REBOOT_PENDING_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-pending"
+readonly CANCEL_REBOOT_COMMAND=/usr/libexec/dnf-automatic-reboot/cancel-reboot.sh
 readonly UPTIME_FILE="${TEST_ROOT}/proc/uptime"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
@@ -226,13 +230,19 @@ PENDING_SERVICE_NAMES=()
 EXCLUDED_SERVICE_NAMES=()
 SERVICE_RESTART_SUMMARY="stale services not checked"
 SCHEDULED_REBOOT_SUMMARY=""
+# 1 from before REBOOT_PENDING_FILE is created until the request's outcome is
+# known.
+REBOOT_REQUEST_IN_PROGRESS=0
 
 # ---------------------------------------------------------------------------
 # Cleanup handler - run by the EXIT trap
-# Removes state/lock files.
+# Removes state/lock files, and reports a reboot request cut short.
 # ---------------------------------------------------------------------------
 cleanup() {
     local exit_code=$?
+    if [[ "${REBOOT_REQUEST_IN_PROGRESS}" -eq 1 ]]; then
+        log_err "stopped while requesting a reboot - whether it was submitted is unknown. ${REBOOT_PENDING_FILE} stays, so no update run starts. Check: systemctl list-timers ${SCHEDULED_REBOOT_UNIT}.timer; then reboot, or allow updates again with: ${CANCEL_REBOOT_COMMAND}"
+    fi
     rm -f "${STATE_FILE}" "${LOCK_FILE}"
     log "Exiting rc=${exit_code}"
     exit "${exit_code}"
@@ -467,9 +477,9 @@ run_reboot_check() {
 schedule_reboot() {
     local systemd_run_exit_code=0 reboot_time
     reboot_time=$(date -d "@$(( $(date +%s) + REBOOT_DELAY_SEC ))" '+%F %T %Z')
-    SCHEDULED_REBOOT_SUMMARY="reboot scheduled for ${reboot_time}; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+    SCHEDULED_REBOOT_SUMMARY="reboot scheduled for ${reboot_time}; update runs held until then; cancel with: ${CANCEL_REBOOT_COMMAND}"
     if "${SYSTEMCTL_BIN}" is-active --quiet "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null; then
-        SCHEDULED_REBOOT_SUMMARY="reboot already scheduled; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+        SCHEDULED_REBOOT_SUMMARY="reboot already scheduled; update runs held until then; cancel with: ${CANCEL_REBOOT_COMMAND}"
         log "${SCHEDULED_REBOOT_UNIT}.timer is already active - not scheduling a second reboot"
         return 0
     fi
@@ -478,7 +488,7 @@ schedule_reboot() {
     "${SYSTEMCTL_BIN}" reset-failed "${SCHEDULED_REBOOT_UNIT}.service" "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null || true
     log "scheduling reboot in ${REBOOT_DELAY_SEC}s"
     wall_msg "dnf-automatic-reboot: Updates installed. System will reboot at ${reboot_time}." \
-             "Cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+             "Cancel with: ${CANCEL_REBOOT_COMMAND}"
     # A named unit an operator can find and stop; OnFailure= reports a reboot
     # that systemctl could not start, such as one blocked by an inhibitor.
     "${SYSTEMD_RUN_BIN}" \
@@ -489,12 +499,41 @@ schedule_reboot() {
         --description="dnf-automatic-reboot scheduled reboot" \
         "${SYSTEMCTL_BIN}" reboot || systemd_run_exit_code=$?
     if [[ "${systemd_run_exit_code}" -eq 0 ]]; then
-        log "Reboot dispatch confirmed: ${SCHEDULED_REBOOT_UNIT}.timer fires at ${reboot_time}; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+        log "Reboot dispatch confirmed: ${SCHEDULED_REBOOT_UNIT}.timer fires at ${reboot_time}; cancel with: ${CANCEL_REBOOT_COMMAND}"
         return 0
     fi
     log_err "Reboot dispatch FAILED: systemd-run exited ${systemd_run_exit_code} - system will NOT reboot"
     wall_msg "dnf-automatic-reboot: ERROR - failed to schedule reboot (systemd-run exited ${systemd_run_exit_code})." \
              "Manual reboot required."
+    return 1
+}
+
+# request_reboot
+# Creates REBOOT_PENDING_FILE, which keeps this unit from starting until the
+# reboot, then calls schedule_reboot.  Returns 0 when the reboot was
+# scheduled; 1 when it was not, having removed the REBOOT_PENDING_FILE this
+# call created.  A file that existed before belongs to an earlier request and
+# is left alone.  When the run is stopped during the request, the file stays
+# and cleanup reports it.
+request_reboot() {
+    local pending_file_created=0
+    REBOOT_REQUEST_IN_PROGRESS=1
+    if [[ ! -e "${REBOOT_PENDING_FILE}" ]]; then
+        if ! : > "${REBOOT_PENDING_FILE}" 2>/dev/null; then
+            REBOOT_REQUEST_IN_PROGRESS=0
+            log_err "cannot create ${REBOOT_PENDING_FILE} - an update run could start before the reboot, reboot not requested"
+            return 1
+        fi
+        pending_file_created=1
+    fi
+    if schedule_reboot; then
+        REBOOT_REQUEST_IN_PROGRESS=0
+        return 0
+    fi
+    if [[ "${pending_file_created}" -eq 1 ]]; then
+        rm -f "${REBOOT_PENDING_FILE}"
+    fi
+    REBOOT_REQUEST_IN_PROGRESS=0
     return 1
 }
 
@@ -558,7 +597,7 @@ main() {
             report_completion "no reboot needed" "${service_restart_exit_code}"
             ;;
         1)
-            schedule_reboot || exit 1
+            request_reboot || exit 1
             SERVICE_RESTART_SUMMARY="service restarts skipped, the reboot replaces them"
             report_completion "${SCHEDULED_REBOOT_SUMMARY}" 0
             ;;

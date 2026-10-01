@@ -88,6 +88,7 @@ install -m 0750 scripts/run.sh            %{buildroot}%{pkglibexecdir}/run.sh
 install -m 0750 scripts/watchdog.sh       %{buildroot}%{pkglibexecdir}/watchdog.sh
 install -m 0750 scripts/needs-reboot.sh   %{buildroot}%{pkglibexecdir}/needs-reboot.sh
 install -m 0750 scripts/notify-failure.sh %{buildroot}%{pkglibexecdir}/notify-failure.sh
+install -m 0750 scripts/cancel-reboot.sh  %{buildroot}%{pkglibexecdir}/cancel-reboot.sh
 
 # systemd units
 install -d -m 0755 %{buildroot}%{_unitdir}
@@ -425,6 +426,7 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %attr(0750, root, root) %{pkglibexecdir}/watchdog.sh
 %attr(0750, root, root) %{pkglibexecdir}/needs-reboot.sh
 %attr(0750, root, root) %{pkglibexecdir}/notify-failure.sh
+%attr(0750, root, root) %{pkglibexecdir}/cancel-reboot.sh
 
 # systemd units
 %{_unitdir}/dnf-automatic-reboot.service

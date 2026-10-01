@@ -47,6 +47,10 @@ readonly STATE_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.state"
 readonly LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.lock"
 # Present while the watchdog kills a run; the main unit does not start then.
 readonly RECOVERY_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.recovery"
+# Present from a reboot request until the reboot; the main unit does not start
+# then either.  run.sh uses the same file.
+readonly REBOOT_PENDING_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-pending"
+readonly CANCEL_REBOOT_COMMAND=/usr/libexec/dnf-automatic-reboot/cancel-reboot.sh
 readonly UPTIME_FILE="${TEST_ROOT}/proc/uptime"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
@@ -211,17 +215,25 @@ signal_unit_processes() {
 }
 
 # ---------------------------------------------------------------------------
-# Recovery marker.
+# Recovery and reboot-pending markers.
 #
-# RECOVERY_FILE exists from before the identity re-check until recovery ends,
-# and the main unit's ConditionPathExists=! refuses to start while it does.
-# No new run can start between the re-check and the kill, while the state file
+# The main unit's ConditionPathExists=! refuses to start while either exists.
+#
+# RECOVERY_FILE exists from before the identity re-check until recovery ends:
+# no new run can start between the re-check and the kill, while the state file
 # is removed, or during the reboot decision; a run started before the file
-# existed shows in the re-check.  When recovery requests or schedules a reboot
-# the file stays, so no update starts before that reboot, and /run is emptied
-# by it.  Every other exit removes it, through the EXIT trap.
+# existed shows in the re-check.  The EXIT trap removes it on every exit, and
+# the unit's ExecStopPost= removes it when the watchdog is killed.
+#
+# REBOOT_PENDING_FILE is created before a reboot is requested and outlives
+# the watchdog, so no update starts before that reboot, which empties /run.
+# A request that definitely failed removes the file it created.  A request
+# whose outcome is unknown, because the watchdog was stopped during it, keeps
+# the file.  cancel-reboot.sh is the only other remover.
 # ---------------------------------------------------------------------------
-RECOVERY_REBOOT_PENDING=0
+# 1 from before REBOOT_PENDING_FILE is created until the request's outcome is
+# known.
+REBOOT_REQUEST_IN_PROGRESS=0
 # Set by schedule_reboot.
 SCHEDULED_REBOOT_SUMMARY=""
 
@@ -234,14 +246,61 @@ begin_recovery() {
     trap end_recovery EXIT
 }
 
-# end_recovery - the EXIT trap: removes RECOVERY_FILE unless a reboot is
-# pending.
+# end_recovery - the EXIT trap: reports a reboot request cut short, and
+# removes RECOVERY_FILE.
 end_recovery() {
-    if [[ "${RECOVERY_REBOOT_PENDING}" -eq 1 ]]; then
-        log "no update run starts before the reboot; to cancel the reboot and allow runs again: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer; rm -f /run/dnf-automatic-reboot.recovery"
-        return 0
+    if [[ "${REBOOT_REQUEST_IN_PROGRESS}" -eq 1 ]]; then
+        log_err "stopped while requesting a reboot - whether it was submitted is unknown. ${REBOOT_PENDING_FILE} stays, so no update run starts. Check: systemctl list-timers ${SCHEDULED_REBOOT_UNIT}.timer; then reboot, or allow updates again with: ${CANCEL_REBOOT_COMMAND}"
     fi
     rm -f "${RECOVERY_FILE}"
+}
+
+# request_reboot DISPATCH_FUNCTION
+# Creates REBOOT_PENDING_FILE, then calls DISPATCH_FUNCTION (reboot_now or
+# schedule_reboot).  Returns 0 when the reboot was submitted; 1 when it was
+# not, having removed the REBOOT_PENDING_FILE this call created.  A file that
+# existed before belongs to an earlier request and is left alone.
+request_reboot() {
+    local dispatch_function="$1" pending_file_created=0
+    REBOOT_REQUEST_IN_PROGRESS=1
+    if [[ ! -e "${REBOOT_PENDING_FILE}" ]]; then
+        if ! : > "${REBOOT_PENDING_FILE}" 2>/dev/null; then
+            REBOOT_REQUEST_IN_PROGRESS=0
+            log_err "cannot create ${REBOOT_PENDING_FILE} - an update run could start before the reboot, reboot not requested"
+            return 1
+        fi
+        pending_file_created=1
+    fi
+    if "${dispatch_function}"; then
+        REBOOT_REQUEST_IN_PROGRESS=0
+        return 0
+    fi
+    if [[ "${pending_file_created}" -eq 1 ]]; then
+        rm -f "${REBOOT_PENDING_FILE}"
+    fi
+    REBOOT_REQUEST_IN_PROGRESS=0
+    return 1
+}
+
+# scheduled_reboot_timer_is_active - 0 when the timer that carries a
+# scheduled reboot is active.
+scheduled_reboot_timer_is_active() {
+    "${SYSTEMCTL_BIN}" is-active --quiet "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null
+}
+
+# report_reboot_pending_without_reboot
+# Returns 0 when no reboot is pending, or when the scheduled reboot timer is
+# active; 1 after logging an error when REBOOT_PENDING_FILE exists with no
+# active timer.  Called when the watchdog itself does not reboot: a run killed
+# while it requested a reboot leaves the file, and nothing else reports it.
+report_reboot_pending_without_reboot() {
+    [[ -e "${REBOOT_PENDING_FILE}" ]] || return 0
+    if scheduled_reboot_timer_is_active; then
+        log "a reboot is already scheduled: systemctl list-timers ${SCHEDULED_REBOOT_UNIT}.timer"
+        return 0
+    fi
+    log_err "${REBOOT_PENDING_FILE} exists but no reboot is scheduled - the killed run was requesting one. No update run starts until the host reboots; allow updates again with: ${CANCEL_REBOOT_COMMAND}"
+    return 1
 }
 
 # kill_service_cgroup PHASE START_UPTIME PID
@@ -312,9 +371,9 @@ reboot_now() {
 schedule_reboot() {
     local systemd_run_exit_code=0 reboot_time
     reboot_time=$(date -d "@$(( $(date +%s) + REBOOT_DELAY_SEC ))" '+%F %T %Z')
-    SCHEDULED_REBOOT_SUMMARY="reboot scheduled for ${reboot_time}; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
-    if "${SYSTEMCTL_BIN}" is-active --quiet "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null; then
-        SCHEDULED_REBOOT_SUMMARY="reboot already scheduled; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+    SCHEDULED_REBOOT_SUMMARY="reboot scheduled for ${reboot_time}; update runs held until then; cancel with: ${CANCEL_REBOOT_COMMAND}"
+    if scheduled_reboot_timer_is_active; then
+        SCHEDULED_REBOOT_SUMMARY="reboot already scheduled; update runs held until then; cancel with: ${CANCEL_REBOOT_COMMAND}"
         log "${SCHEDULED_REBOOT_UNIT}.timer is already active - not scheduling a second reboot"
         return 0
     fi
@@ -323,7 +382,7 @@ schedule_reboot() {
     "${SYSTEMCTL_BIN}" reset-failed "${SCHEDULED_REBOOT_UNIT}.service" "${SCHEDULED_REBOOT_UNIT}.timer" 2>/dev/null || true
     log "Watchdog scheduling reboot in ${REBOOT_DELAY_SEC}s"
     wall_msg "dnf-automatic-reboot: Watchdog detected stuck check. System will reboot at ${reboot_time}." \
-             "Cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+             "Cancel with: ${CANCEL_REBOOT_COMMAND}"
     # A named unit an operator can find and stop; OnFailure= reports a reboot
     # that systemctl could not start, such as one blocked by an inhibitor.
     "${SYSTEMD_RUN_BIN}" \
@@ -334,7 +393,7 @@ schedule_reboot() {
         --description="dnf-automatic-reboot watchdog reboot" \
         "${SYSTEMCTL_BIN}" reboot || systemd_run_exit_code=$?
     if [[ "${systemd_run_exit_code}" -eq 0 ]]; then
-        log "Reboot dispatch confirmed: ${SCHEDULED_REBOOT_UNIT}.timer fires at ${reboot_time}; cancel with: systemctl stop ${SCHEDULED_REBOOT_UNIT}.timer"
+        log "Reboot dispatch confirmed: ${SCHEDULED_REBOOT_UNIT}.timer fires at ${reboot_time}; cancel with: ${CANCEL_REBOOT_COMMAND}"
         return 0
     fi
     log_err "Reboot dispatch FAILED: systemd-run exited ${systemd_run_exit_code} - system will NOT reboot"
@@ -430,11 +489,10 @@ main() {
         if [[ "${run_phase}" == "checking" || "${FORCE_REBOOT_ON_HARD_TIMEOUT}" == "yes" ]]; then
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded." \
                      "Killed the stuck run and rebooting now."
-            if ! reboot_now; then
+            if ! request_reboot reboot_now; then
                 log_err "reboot request failed - the host was not rebooted"
                 exit 1
             fi
-            RECOVERY_REBOOT_PENDING=1
         else
             log_err "phase=${run_phase} at hard timeout - an rpm transaction may be incomplete, NOT rebooting; set force_reboot_on_hard_timeout=yes to override"
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded in phase=${run_phase}." \
@@ -482,10 +540,10 @@ main() {
             case "${needs_reboot_exit_code}" in
                 0)
                     log "Watchdog: no reboot needed - stuck run killed"
+                    report_reboot_pending_without_reboot || exit 1
                     ;;
                 1)
-                    schedule_reboot || exit 1
-                    RECOVERY_REBOOT_PENDING=1
+                    request_reboot schedule_reboot || exit 1
                     log "Watchdog: stuck run killed; ${SCHEDULED_REBOOT_SUMMARY}"
                     ;;
                 *)

@@ -16,7 +16,8 @@ LOGROTATEDIR = /etc/logrotate.d
 SCRIPTS = scripts/run.sh \
           scripts/watchdog.sh \
           scripts/needs-reboot.sh \
-          scripts/notify-failure.sh
+          scripts/notify-failure.sh \
+          scripts/cancel-reboot.sh
 UNITS   = units/dnf-automatic-reboot.service \
           units/dnf-automatic-reboot.timer \
           units/dnf-automatic-watchdog.service \
