@@ -494,6 +494,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   when it cannot tell.
 - FIX: A timer that has elapsed is no longer taken for a reboot still to come, so a reboot that
   failed earlier no longer stops a new one from being scheduled.
+- FIX: The kernel reboot attempt count is cleared once the target kernel runs, also on a host
+  with a correct clock. There needs-restarting stops flagging the kernel after the reboot, and
+  the count stayed until the next kernel update replaced it.
 - FIX: A failed scheduled reboot's notice says whether update runs are still held and how to
   release them.
 

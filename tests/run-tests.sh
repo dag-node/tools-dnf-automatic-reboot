@@ -649,6 +649,39 @@ test_state_kernel_attempts_keyed_on_target() {
         "a new target starts a fresh budget"
 }
 
+test_state_attempts_cleared_when_target_runs_unflagged() {
+    load_needs_reboot_library
+    # A host with a correct clock: after the reboot into the target kernel,
+    # needs-restarting flags nothing, and the row must still go.
+    export STUB_UNAME_R="4.18.0-553.170.1.el8_10.x86_64" STUB_UNAME_M=x86_64
+    write_kernel_reboot_attempts kernel "4.18.0-553.170.1.el8_10.x86_64" 1 old-boot
+    write_kernel_reboot_attempts kernel-uek "6.12.0-9.el9uek.aarch64" 2 old-boot
+    run_needs_restarting() { return 0; }
+    ( main ) >/dev/null 2>&1
+    assert_equals "0" "$(read_kernel_reboot_attempts kernel '4.18.0-553.170.1.el8_10.x86_64')" \
+        "the reboot reached its target"
+    assert_equals "2" "$(read_kernel_reboot_attempts kernel-uek '6.12.0-9.el9uek.aarch64')" \
+        "a target that is not running keeps its count"
+}
+
+test_state_attempts_cleared_for_arch_stripped_release() {
+    load_needs_reboot_library
+    export STUB_UNAME_R="6.12.0-9.el9uek" STUB_UNAME_M=aarch64
+    write_kernel_reboot_attempts kernel-uek "6.12.0-9.el9uek.aarch64" 1 old-boot
+    clear_kernel_reboot_attempts_for_running_kernel >/dev/null
+    assert_equals "0" "$(read_kernel_reboot_attempts kernel-uek '6.12.0-9.el9uek.aarch64')" \
+        "uname -r without the arch suffix matches"
+}
+
+test_state_attempts_kept_while_old_kernel_runs() {
+    load_needs_reboot_library
+    export STUB_UNAME_R="4.18.0-553.169.1.el8_10.x86_64" STUB_UNAME_M=x86_64
+    write_kernel_reboot_attempts kernel "4.18.0-553.170.1.el8_10.x86_64" 1 old-boot
+    clear_kernel_reboot_attempts_for_running_kernel >/dev/null
+    assert_equals "1" "$(read_kernel_reboot_attempts kernel '4.18.0-553.170.1.el8_10.x86_64')" \
+        "a boot that came back on the old kernel keeps the count"
+}
+
 test_state_kernel_attempts_cleared() {
     load_needs_reboot_library
     write_kernel_reboot_attempts kernel-uek "6.12.0-1.aarch64" 2
@@ -2891,6 +2924,9 @@ run_test "state: round trip"                         test_state_round_trip
 run_test "state: replacement is exact field"         test_state_replacement_is_exact_field
 run_test "state: kernel attempts keyed on target"    test_state_kernel_attempts_keyed_on_target
 run_test "state: kernel attempts cleared"            test_state_kernel_attempts_cleared
+run_test "state: attempts cleared when target runs unflagged" test_state_attempts_cleared_when_target_runs_unflagged
+run_test "state: attempts cleared for arch-stripped release" test_state_attempts_cleared_for_arch_stripped_release
+run_test "state: attempts kept while old kernel runs" test_state_attempts_kept_while_old_kernel_runs
 
 printf 'learning\n'
 run_test "learning: confirmed same evr is skipped"   test_learning_confirmed_same_evr_is_skipped

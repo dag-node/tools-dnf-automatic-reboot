@@ -83,7 +83,8 @@ Files installed
 
   /var/lib/dnf-automatic-reboot/kernel-reboot-attempts
       Consecutive reboots scheduled for a kernel version that has not become
-      the running one.  Cleared as soon as it does.  See "Kernel reboot loop
+      the running one.  Cleared by the first check after it does: the next
+      nightly run, or needs-reboot.sh run by hand.  See "Kernel reboot loop
       guard" below.
 
 

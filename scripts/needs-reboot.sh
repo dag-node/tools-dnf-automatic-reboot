@@ -173,6 +173,32 @@ write_kernel_reboot_attempts() {
     ) 9>>"${STATE_LOCK_FILE}" 2>/dev/null || true
 }
 
+# clear_kernel_reboot_attempts_for_running_kernel
+# Removes every kernel-reboot-attempts row whose target is the running kernel:
+# that reboot worked.  Runs at every check, whatever needs-restarting reports:
+# on a host with a correct clock it no longer flags the kernel once the new one
+# runs, so the false-positive branch that also clears the row is not reached.
+clear_kernel_reboot_attempts_for_running_kernel() {
+    local running_kernel_version machine_architecture
+    [[ -s "${KERNEL_REBOOT_ATTEMPT_FILE}" ]] || return 0
+    running_kernel_version=$(uname -r)
+    machine_architecture=$(uname -m)
+    awk -F'\t' -v running="${running_kernel_version}" -v arch="${machine_architecture}" \
+        '$2 == running || $2 == running "." arch { found = 1 } END { exit !found }' \
+        "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || return 0
+    (
+        flock -w 10 9 || exit 0
+        local temporary_file
+        temporary_file=$(mktemp "${KERNEL_REBOOT_ATTEMPT_FILE}.XXXXXX") || exit 0
+        awk -F'\t' -v running="${running_kernel_version}" -v arch="${machine_architecture}" \
+            '!($2 == running || $2 == running "." arch)' "${KERNEL_REBOOT_ATTEMPT_FILE}" \
+            > "${temporary_file}" 2>/dev/null || { rm -f "${temporary_file}"; exit 0; }
+        chmod 0640 "${temporary_file}" 2>/dev/null || true
+        mv -f "${temporary_file}" "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || rm -f "${temporary_file}"
+        log "kernel ${running_kernel_version} is running - its reboot attempts are cleared"
+    ) 9>>"${STATE_LOCK_FILE}" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # Read config
 # ---------------------------------------------------------------------------
@@ -620,6 +646,8 @@ apply_restart_state_learning() {
 # ---------------------------------------------------------------------------
 main() {
     local needs_restarting_exit_code=0
+
+    clear_kernel_reboot_attempts_for_running_kernel
 
     NEEDS_RESTARTING_OUTPUT=""
     run_needs_restarting || needs_restarting_exit_code=$?
