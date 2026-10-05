@@ -705,6 +705,14 @@ the completion line adds `(metadata refresh failed, cached metadata used)`: "No 
 installed" then describes the cache, not the repositories. `refresh_metadata = no` turns
 the step off.
 
+`dnf-makecache.timer` is dnf's, enabled by the distribution preset, and the package neither
+requires, checks nor disables it. After a run's refresh, `dnf makecache --timer`
+(`update_cache` in `dnf/base.py`) fetches nothing still valid for `metadata_timer_sync`,
+rebuilds the sack from the cache, and logs `will expire after N seconds`; `--refresh` does
+not touch `last_makecache`, so the timer keeps its own cadence. It still serves every other
+reader of the cache: interactive `dnf`, anything running `dnf -C`, and `needs-reboot.sh`
+outside `run.sh`. With `refresh_metadata = no` the run depends on it again.
+
 ## UEK GRUB BLS default (kernel not booted after update)
 
 On OL9 UEK hosts a newly installed `kernel-uek-core` is not selected at the next
