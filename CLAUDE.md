@@ -689,6 +689,22 @@ dnf check-update --security; echo "rc=$?"     # 100 = actionable, 0 = nothing
 dnf --assumeno --setopt='*.priority=99' update --security   # levels priorities
 ```
 
+## Repository metadata is refreshed before every update
+
+`dnf-automatic` installs from the metadata dnf has cached and fetches only what is older
+than `metadata_expire` (48 hours by dnf's default). `dnf-makecache.timer`, where enabled,
+refreshes it about every `metadata_timer_sync` (3 hours). An advisory published after the
+last refresh waits for the next run, however often the run timer fires. `/var/log/dnf.log`
+records which a run had, one line per repository: `using cache for` or `has expired and
+will be refreshed`.
+
+`run.sh` runs `dnf -q makecache --refresh` after the clock check and before the state file,
+under `timeout` at `metadata_refresh_timeout_sec` (default 900). A refresh that fails or
+runs out of time warns, the run continues from the cache as `dnf-automatic` alone would, and
+the completion line adds `(metadata refresh failed, cached metadata used)`: "No updates
+installed" then describes the cache, not the repositories. `refresh_metadata = no` turns
+the step off.
+
 ## UEK GRUB BLS default (kernel not booted after update)
 
 On OL9 UEK hosts a newly installed `kernel-uek-core` is not selected at the next

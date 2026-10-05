@@ -6,12 +6,14 @@
 #
 # Sequence:
 #   1. Detect concurrent dnf processes and warn via wall(1).
-#   2. Write a state file consumed by watchdog.sh.
-#   3. Run dnf-automatic under a hard wall-clock timeout, as the child of a
+#   2. Fetch current repository metadata, so dnf-automatic sees the
+#      advisories published since dnf last refreshed its cache.
+#   3. Write a state file consumed by watchdog.sh.
+#   4. Run dnf-automatic under a hard wall-clock timeout, as the child of a
 #      systemd inhibitor lock that blocks shutdown and reboot until it exits.
-#   4. Call needs-reboot.sh to decide whether a reboot is required,
+#   5. Call needs-reboot.sh to decide whether a reboot is required,
 #      filtering known false positives.
-#   5. Schedule a reboot if needed; otherwise restart the services whose
+#   6. Schedule a reboot if needed; otherwise restart the services whose
 #      running processes still map pre-update files.
 #
 # State file /run/dnf-automatic-reboot.state
@@ -230,6 +232,9 @@ REBOOT_INHIBITED_WAIT_SEC=$(get_config_integer reboot_inhibited_wait_sec 1800 0 
 REQUIRE_CLOCK_SYNC=$(get_config_value require_clock_sync yes)
 REQUIRE_CLOCK_SYNC="${REQUIRE_CLOCK_SYNC//[[:space:]]/}"
 CLOCK_SYNC_WAIT_SEC=$(get_config_integer clock_sync_wait_sec 600 10 3600)
+REFRESH_METADATA=$(get_config_value refresh_metadata yes)
+REFRESH_METADATA="${REFRESH_METADATA//[[:space:]]/}"
+METADATA_REFRESH_TIMEOUT_SEC=$(get_config_integer metadata_refresh_timeout_sec 900 10 3600)
 ALWAYS_REBOOT=$(get_config_value always_reboot no)
 DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 60 1)
 KILL_GRACE_SEC=$(get_config_integer kill_grace_sec 30)
@@ -252,6 +257,10 @@ SCHEDULED_REBOOT_SUMMARY=""
 PUBLISHED_RUN_STATE=""
 # What dnf-automatic installed, for the completion line; set once it returns.
 UPDATE_SUMMARY="update result unknown"
+# Empty after a successful or disabled metadata refresh; otherwise the
+# qualification the completion line carries, since "No updates installed" may
+# then describe a stale cache.
+METADATA_REFRESH_FAILURE_SUMMARY=""
 
 # ---------------------------------------------------------------------------
 # Cleanup handler - run by the EXIT trap
@@ -570,6 +579,39 @@ wait_for_clock_sync() {
     return 1
 }
 
+# refresh_repository_metadata - 0 once dnf has fetched current metadata for
+# every enabled repository, or when refresh_metadata = no; 1 when the fetch
+# fails or is still running at METADATA_REFRESH_TIMEOUT_SEC.  dnf-automatic
+# installs from the cache and fetches only what is older than
+# metadata_expire, so without this step an advisory published since the last
+# refresh waits for the next run.  timeout(1) bounds the fetch: the watchdog
+# does not supervise the run yet.  The caller continues on failure:
+# dnf-automatic then uses the cache as it did before, and the completion
+# line says so.
+refresh_repository_metadata() {
+    local refresh_exit_code=0 refresh_output refresh_failure_detail=""
+    if [[ "${REFRESH_METADATA}" == "no" ]]; then
+        log "refresh_metadata=no - dnf-automatic uses the repository metadata dnf has cached"
+        return 0
+    fi
+    refresh_output=$(timeout --kill-after="${KILL_GRACE_SEC}s" "${METADATA_REFRESH_TIMEOUT_SEC}s" \
+        "${DNF_BIN}" -q makecache --refresh 2>&1) || refresh_exit_code=$?
+    if [[ "${refresh_exit_code}" -eq 0 ]]; then
+        log "repository metadata refreshed (dnf makecache --refresh)"
+        return 0
+    fi
+    # 124: still fetching at the deadline; 137: killed after the grace.
+    if [[ "${refresh_exit_code}" -eq 124 || "${refresh_exit_code}" -eq 137 ]]; then
+        log_warning "dnf makecache --refresh was still running at ${METADATA_REFRESH_TIMEOUT_SEC}s and was stopped - updating from the metadata dnf has cached"
+    else
+        if [[ -n "${refresh_output}" ]]; then
+            refresh_failure_detail=": $(printf '%s\n' "${refresh_output}" | tail -1)"
+        fi
+        log_warning "dnf makecache --refresh exited ${refresh_exit_code}${refresh_failure_detail} - updating from the metadata dnf has cached"
+    fi
+    return 1
+}
+
 # describe_installed_updates EPOCH -> the update part of the completion line,
 # from the packages whose rpm INSTALLTIME is at or after EPOCH, taken just
 # before dnf-automatic started.  dnf-automatic exits 0 whether or not it
@@ -634,6 +676,9 @@ main() {
                  "will wait for the dnf lock. Do not reboot manually until this completes."
     fi
 
+    refresh_repository_metadata \
+        || METADATA_REFRESH_FAILURE_SUMMARY=" (metadata refresh failed, cached metadata used)"
+
     if ! write_state "updating"; then
         log_error "cannot publish ${STATE_FILE} - the watchdog could not supervise this run, not updating"
         exit 1
@@ -652,7 +697,7 @@ main() {
     fi
 
     log "dnf-automatic completed successfully"
-    UPDATE_SUMMARY=$(describe_installed_updates "${update_started_epoch}")
+    UPDATE_SUMMARY="$(describe_installed_updates "${update_started_epoch}")${METADATA_REFRESH_FAILURE_SUMMARY}"
     warn_on_unapplied_security_advisories
     # Still supervised when this fails: the file keeps phase=updating, which
     # the watchdog treats the more cautiously of the two.

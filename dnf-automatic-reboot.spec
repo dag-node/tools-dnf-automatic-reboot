@@ -537,6 +537,12 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   warning no longer claims updates were installed.
 - FIX: A failed scheduled reboot's notice says whether update runs are still held and how to
   release them.
+- FIX: Every run fetches current repository metadata (dnf makecache --refresh) before
+  dnf-automatic starts, within metadata_refresh_timeout_sec (new, default 900).
+  dnf-automatic installed from the cache dnf-makecache.timer or metadata_expire had left, so
+  an advisory published since waited for the next run. A refresh that fails or runs out of
+  time is logged, the run continues from the cache, and the completion line says so.
+  refresh_metadata = no (new) turns the step off.
 
 * Wed Sep 30 2026 DagNode <packages@dagnode.com> - 1.4.0-1
 - LICENSE: The project license is now GPL-2.0-or-later. Releases through 1.3 were licensed MIT,
