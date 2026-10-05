@@ -66,17 +66,19 @@ The last command turns on the nightly run and the watchdog that looks after it.
 
 Between 03:00 and 03:10 the package:
 
-1. Blocks shutdown and restart, so an update is never cut off halfway.
-2. Installs the available updates with `dnf-automatic`.
-3. Checks whether any update needs a restart: a new kernel, or a core
+1. Fetches the current list of updates, so one published today is not missed
+   because `dnf` still had yesterday's.
+2. Blocks shutdown and restart, so an update is never cut off halfway.
+3. Installs the available updates with `dnf-automatic`.
+4. Checks whether any update needs a restart: a new kernel, or a core
    component such as `glibc` or `systemd`.
-4. If one does, warns everyone logged in with the restart time and restarts
+5. If one does, warns everyone logged in with the restart time and restarts
    five minutes later. No further update runs until then. To call the restart
    off in those five minutes and allow updates again:
    `sudo /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh`.
    If none does, restarts only the background services whose programs were
    updated, and the system keeps running.
-5. Ends with one line in the log and on logged-in terminals: updates
+6. Ends with one line in the log and on logged-in terminals: updates
    installed, whether a restart is scheduled, and which services were
    restarted, failed to restart, or are left on the old program. A failed
    service restart counts as a failed run.

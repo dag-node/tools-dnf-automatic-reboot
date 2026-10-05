@@ -4,6 +4,8 @@ dnf-automatic-reboot
 Unattended update + conditional reboot for EL8 and EL9 (RHEL, Oracle Linux).
 Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
 
+  - Refreshes the repository metadata before each update, so dnf-automatic
+    sees today's advisories rather than the cache's.
   - Runs dnf-automatic under a systemd shutdown inhibitor, so an accidental
     reboot does not corrupt a partial update; when logind refuses the lock,
     no update runs and the run fails.
@@ -184,6 +186,29 @@ Unsigned repositories
 
   # Same check by hand
   grep -rh gpgcheck /etc/yum.repos.d/ /etc/dnf/dnf.conf | sort | uniq -c
+
+
+Repository metadata freshness
+-----------------------------
+
+  dnf-automatic installs from the metadata dnf has cached and fetches only
+  what is older than metadata_expire (48 hours by dnf's default).
+  dnf-makecache.timer, where enabled, refreshes it about every three hours.
+  An advisory published after the last refresh waits for the next run,
+  however often the run timer fires.
+
+  Every run fetches current metadata (dnf makecache --refresh) before
+  dnf-automatic starts, within metadata_refresh_timeout_sec.  A fetch that
+  fails or runs out of time is logged, the run continues from the cache as
+  dnf-automatic alone would, and the completion line adds "(metadata
+  refresh failed, cached metadata used)".
+
+  # Which a run had, one line per repository
+  grep -E 'has expired|using cache for' /var/log/dnf.log | tail -20
+
+  # Turn the refresh off in /etc/dnf/automatic-reboot.conf
+  [updates]
+  refresh_metadata = no
 
 
 Advisories dnf will not apply

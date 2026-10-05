@@ -387,7 +387,8 @@ test_config_every_key_resolves() {
                       watchdog_hard_timeout_min force_reboot_on_hard_timeout \
                       enable_chrony_wait wall_messages reboot_request_lock_wait_sec \
                       watchdog_kill_confirm_sec restart_service_timeout_sec \
-                      reboot_inhibited_wait_sec require_clock_sync clock_sync_wait_sec; do
+                      reboot_inhibited_wait_sec require_clock_sync clock_sync_wait_sec \
+                      refresh_metadata metadata_refresh_timeout_sec; do
         resolved_value=$(get_config_value "${config_key}" "MISSING")
         if [[ "${resolved_value}" == "MISSING" ]]; then
             fail "shipped config does not define ${config_key}"
@@ -971,7 +972,8 @@ stub_run_main() {
         "$@"
     }
     # chronyc runs under timeout too: the stub passes it through, or reports
-    # it stopped at the deadline with STUB_CHRONYC_TIMED_OUT=yes.
+    # it stopped at the deadline with STUB_CHRONYC_TIMED_OUT=yes.  The
+    # metadata refresh exits STUB_MAKECACHE_RC and prints STUB_MAKECACHE_OUTPUT.
     timeout() {
         printf 'timeout %s\n' "$*" >> "${STUB_LOG}"
         if [[ "$*" == *chronyc* ]]; then
@@ -979,6 +981,10 @@ stub_run_main() {
             while [[ "$1" != chronyc ]]; do shift; done
             "$@"
             return
+        fi
+        if [[ "$*" == *makecache* ]]; then
+            printf '%s' "${STUB_MAKECACHE_OUTPUT:-}"
+            return "${STUB_MAKECACHE_RC:-0}"
         fi
         return "${STUB_DNF_AUTOMATIC_RC:-0}"
     }
@@ -1176,7 +1182,7 @@ test_run_refused_inhibitor_stops_the_update() {
     local exit_code=0
     ( main ) >/dev/null 2>&1 || exit_code=$?
     assert_exit_code 1 "${exit_code}" "the run fails"
-    assert_equals "0" "$(grep -c "^timeout .*dnf-automatic" "${STUB_LOG}")" "dnf-automatic never starts without the lock"
+    assert_equals "0" "$(grep -c "^timeout .*/usr/bin/dnf-automatic$" "${STUB_LOG}")" "dnf-automatic never starts without the lock"
 }
 
 test_run_update_runs_inside_the_inhibitor() {
@@ -2490,6 +2496,57 @@ test_run_clock_requirement_can_be_turned_off() {
     assert_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "and the update runs"
 }
 
+# ---------------------------------------------------------------------------
+# run: the update sees the advisories published since dnf last refreshed
+# ---------------------------------------------------------------------------
+test_run_refreshes_metadata_before_updating() {
+    load_run_library
+    stub_run_main
+    local exit_code=0 refresh_line_number inhibitor_line_number
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a refreshed cache is the normal run"
+    assert_contains "$(cat "${STUB_LOG}")" "timeout --kill-after=30s 900s ${TEST_ROOT_DIR}/usr/bin/dnf -q makecache --refresh" \
+        "every repository is marked expired and fetched, bounded at metadata_refresh_timeout_sec"
+    refresh_line_number=$(grep -n 'makecache --refresh' "${STUB_LOG}" | cut -d: -f1 | head -1)
+    inhibitor_line_number=$(grep -n '^systemd-inhibit' "${STUB_LOG}" | cut -d: -f1 | head -1)
+    if [[ -z "${refresh_line_number}" || -z "${inhibitor_line_number}" \
+          || "${refresh_line_number}" -ge "${inhibitor_line_number}" ]]; then
+        fail "the refresh (line ${refresh_line_number:-none}) must precede dnf-automatic (line ${inhibitor_line_number:-none})"
+    fi
+    return 0
+}
+
+test_run_failed_metadata_refresh_still_updates() {
+    load_run_library
+    stub_run_main
+    export STUB_MAKECACHE_RC=1 STUB_MAKECACHE_OUTPUT=$'Errors during downloading metadata for repository \'ol9_baseos_latest\':\nError: Failed to download metadata for repo \'ol9_baseos_latest\''
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a failed refresh does not stop the update"
+    assert_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "dnf-automatic runs from the cache, as it did before"
+    assert_contains "${output}" "dnf makecache --refresh exited 1: Error: Failed to download metadata for repo 'ol9_baseos_latest' - updating from the metadata dnf has cached" \
+        "the warning names dnf's last line"
+    assert_contains "${output}" "Updates installed (packages: 2) (metadata refresh failed, cached metadata used); no reboot needed" \
+        "the completion line says the count may describe a stale cache"
+    export STUB_MAKECACHE_RC=124 STUB_MAKECACHE_OUTPUT=""
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a refresh stopped at the deadline does not stop the update either"
+    assert_contains "${output}" "still running at 900s and was stopped" "and says why"
+}
+
+test_run_metadata_refresh_can_be_turned_off() {
+    printf '\n[updates]\nrefresh_metadata = no\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    sed -i 's/^refresh_metadata = yes$//' "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    load_run_library
+    stub_run_main
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the operator opted out"
+    assert_not_contains "$(cat "${STUB_LOG}")" "makecache" "nothing is fetched"
+    assert_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "and the update runs"
+    assert_contains "${output}" "Updates installed (packages: 2); no reboot needed" "with no qualification on the completion line"
+}
+
 test_run_does_not_update_before_a_pending_reboot() {
     load_run_library
     stub_run_main
@@ -3337,6 +3394,9 @@ run_test "run: unsynchronised clock does not update" test_run_unsynchronised_clo
 run_test "run: clock wait has a hard deadline"      test_run_clock_wait_has_a_hard_deadline
 run_test "run: without chronyc does not update"      test_run_without_chronyc_does_not_update
 run_test "run: clock requirement can be turned off"  test_run_clock_requirement_can_be_turned_off
+run_test "run: refreshes metadata before updating"   test_run_refreshes_metadata_before_updating
+run_test "run: failed metadata refresh still updates" test_run_failed_metadata_refresh_still_updates
+run_test "run: metadata refresh can be turned off"   test_run_metadata_refresh_can_be_turned_off
 run_test "run: does not update before a pending reboot" test_run_does_not_update_before_a_pending_reboot
 run_test "run: unknown reboot state does not update" test_run_unknown_reboot_state_does_not_update
 run_test "invariant: only reboot-if-pending reboots" test_invariant_only_reboot_if_pending_reboots
