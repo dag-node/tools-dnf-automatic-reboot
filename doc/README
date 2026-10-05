@@ -203,6 +203,11 @@ Repository metadata freshness
   dnf-automatic alone would, and the completion line adds "(metadata
   refresh failed, cached metadata used)".
 
+  dnf-makecache.timer is dnf's and is left alone.  After a run's refresh it
+  fetches nothing until the metadata nears expiry, and it still serves
+  interactive dnf, anything running dnf -C, and needs-reboot.sh run on its
+  own.  With refresh_metadata = no the run depends on it again.
+
   # Which a run had, one line per repository
   grep -E 'has expired|using cache for' /var/log/dnf.log | tail -20
 
