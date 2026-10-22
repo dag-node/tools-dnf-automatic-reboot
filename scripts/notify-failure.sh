@@ -9,8 +9,9 @@
 # "failed", and a needs-reboot.sh tool error leaves the host unrebooted with
 # no operator-facing signal at all.
 #
-# Argument 1 is the name of the unit that failed, passed as %I from the
-# templated dnf-automatic-reboot-notify@.service.  For the scheduled reboot's
+# Argument 1 is the name of the unit that failed, passed as %i from the
+# templated dnf-automatic-reboot-notify@.service.  %I would unescape it and
+# turn every "-" into "/".  For the scheduled reboot's
 # transient service, the message says whether update runs stay blocked and
 # how to recover.
 #
@@ -61,14 +62,43 @@ failed_reboot_recovery_hint() {
     fi
 }
 
+# failed_invocation_id UNIT -> the InvocationID systemd reports for UNIT,
+# which still names the run that failed, or nothing when it reports none of
+# the 32-hex-digit form.
+failed_invocation_id() {
+    local invocation_id
+    invocation_id=$(systemctl show --property=InvocationID --value "$1" 2>/dev/null) || invocation_id=""
+    if [[ "${invocation_id}" =~ ^[0-9a-f]{32}$ ]]; then
+        printf '%s' "${invocation_id}"
+    fi
+}
+
+# failed_run_journal_excerpt UNIT -> the last JOURNAL_EXCERPT_LINES journal
+# lines of UNIT's failed run: its own output and systemd's messages about it.
+# Without an invocation ID, or when that selects nothing, the unit's last
+# lines, which can reach into the run before.
+failed_run_journal_excerpt() {
+    local failed_unit_name="$1" invocation_id journal_excerpt=""
+    invocation_id=$(failed_invocation_id "${failed_unit_name}")
+    if [[ -n "${invocation_id}" ]]; then
+        journal_excerpt=$(journalctl -n "${JOURNAL_EXCERPT_LINES}" --no-pager --output=cat \
+                              "_SYSTEMD_INVOCATION_ID=${invocation_id}" + "INVOCATION_ID=${invocation_id}" \
+                              2>/dev/null) || journal_excerpt=""
+    fi
+    if [[ -z "${journal_excerpt}" ]]; then
+        journal_excerpt=$(journalctl -u "${failed_unit_name}" -n "${JOURNAL_EXCERPT_LINES}" \
+                              --no-pager --output=cat 2>/dev/null) || journal_excerpt=""
+    fi
+    printf '%s' "${journal_excerpt}"
+}
+
 main() {
     local failed_unit_name="${1:-dnf-automatic-reboot.service}" journal_excerpt="" journal_line
     local outcome_summary="Automatic updates or the reboot decision did not complete."
 
     log_error "${failed_unit_name} FAILED - the host may be running unpatched or unrebooted"
 
-    journal_excerpt=$(journalctl -u "${failed_unit_name}" -n "${JOURNAL_EXCERPT_LINES}" \
-                      --no-pager --output=cat 2>/dev/null) || true
+    journal_excerpt=$(failed_run_journal_excerpt "${failed_unit_name}")
     if [[ -n "${journal_excerpt}" ]]; then
         while IFS= read -r journal_line; do
             if [[ -n "${journal_line}" ]]; then

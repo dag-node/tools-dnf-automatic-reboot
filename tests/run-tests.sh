@@ -2665,6 +2665,17 @@ test_invariant_reboots_check_inhibitors_and_never_force() {
     return 0
 }
 
+test_invariant_notifier_gets_the_unit_name_unescaped() {
+    # %I unescapes the instance: dnf-automatic-reboot.service would arrive as
+    # dnf/automatic/reboot.service, and the scheduled reboot's notice would
+    # never match its unit.
+    local notifier_unit="${REPO_ROOT}/units/dnf-automatic-reboot-notify@.service"
+    grep -q '^ExecStart=/usr/libexec/dnf-automatic-reboot/notify-failure\.sh %i$' "${notifier_unit}" \
+        || fail "the notifier must be passed %i"
+    grep -q '%I' "${notifier_unit}" && fail "no %I in the notifier unit"
+    return 0
+}
+
 test_invariant_flock_uses_documented_short_options() {
     # util-linux documents -w as --timeout; --wait is an undocumented alias.
     script_lines 'flock --' | grep -q . && fail "flock long options in a shipped script"
@@ -2934,6 +2945,7 @@ load_notify_library() {
     set +e
     IFS=$' \t\n'
     journalctl() { :; }
+    systemctl() { :; }
 }
 
 test_notify_failed_reboot_names_blocked_updates() {
@@ -2955,6 +2967,55 @@ test_notify_failed_dispatched_reboot_says_reboot() {
     assert_contains "$(cat "${STUB_LOG}")" "whether systemd accepted it is unknown" \
         "a reboot command with an unknown outcome is named"
     assert_not_contains "$(cat "${STUB_LOG}")" "cancel-reboot.sh" "cancellation would be refused"
+}
+
+# stub_notify_journal: systemctl show reports STUB_INVOCATION_ID; journalctl
+# records its arguments and prints STUB_INVOCATION_LINES for a query by
+# invocation ID, STUB_UNIT_LINES for one by unit.
+stub_notify_journal() {
+    systemctl() { printf '%s\n' "${STUB_INVOCATION_ID:-}"; }
+    journalctl() {
+        printf 'journalctl %s\n' "$*" >> "${STUB_LOG}"
+        if [[ "$*" == *INVOCATION_ID=* ]]; then
+            printf '%s' "${STUB_INVOCATION_LINES:-}"
+        else
+            printf '%s' "${STUB_UNIT_LINES:-}"
+        fi
+    }
+}
+
+test_notify_quotes_only_the_failed_run() {
+    load_notify_library
+    stub_notify_journal
+    export STUB_INVOCATION_ID=0123456789abcdef0123456789abcdef \
+           STUB_INVOCATION_LINES="run: chronyd did not report a synchronised clock" \
+           STUB_UNIT_LINES="run: Exiting rc=1 from the run before"
+    ( main dnf-automatic-reboot.service ) >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" \
+        "_SYSTEMD_INVOCATION_ID=0123456789abcdef0123456789abcdef + INVOCATION_ID=0123456789abcdef0123456789abcdef" \
+        "the run's output and systemd's messages about it"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/var/log/dnf-automatic-reboot.log")" \
+        "dnf-automatic-reboot.service: run: chronyd did not report" "the failed run is quoted"
+    assert_not_contains "$(cat "${TEST_ROOT_DIR}/var/log/dnf-automatic-reboot.log")" "the run before" \
+        "nothing from the run before"
+}
+
+test_notify_without_invocation_falls_back_to_the_unit() {
+    local stub_setting
+    for stub_setting in STUB_INVOCATION_ID= STUB_INVOCATION_ID=not-an-id \
+                        STUB_INVOCATION_ID=0123456789abcdef0123456789abcdef; do
+        (
+            load_notify_library
+            stub_notify_journal
+            export "${stub_setting?}" STUB_INVOCATION_LINES= STUB_UNIT_LINES="run: Exiting rc=1"
+            ( main dnf-automatic-reboot.service ) >/dev/null 2>&1
+            assert_contains "$(cat "${STUB_LOG}")" "journalctl -u dnf-automatic-reboot.service" \
+                "${stub_setting}: the unit's last lines"
+            assert_contains "$(cat "${TEST_ROOT_DIR}/var/log/dnf-automatic-reboot.log")" \
+                "dnf-automatic-reboot.service: run: Exiting rc=1" "${stub_setting}: are quoted"
+        ) || fail "${stub_setting} must still quote the unit"
+    done
+    return 0
 }
 
 test_notify_failed_reboot_without_marker_is_not_blocked() {
@@ -3474,6 +3535,7 @@ run_test "invariant: marker removers are known"     test_invariant_marker_remove
 run_test "invariant: dispatched file removed only on refusal" test_invariant_dispatched_file_is_removed_only_on_refusal
 run_test "invariant: lock file is never removed"    test_invariant_lock_file_is_never_removed
 run_test "invariant: reboots check inhibitors and never force" test_invariant_reboots_check_inhibitors_and_never_force
+run_test "invariant: notifier gets the unit name unescaped" test_invariant_notifier_gets_the_unit_name_unescaped
 run_test "invariant: flock uses documented short options" test_invariant_flock_uses_documented_short_options
 run_test "invariant: state file written only by rename" test_invariant_state_file_written_only_by_rename
 run_test "invariant: probe assigns its library before use" test_invariant_probe_assigns_its_library_before_use
@@ -3494,6 +3556,8 @@ run_test "watchdog: scheduled reboot is not reported as leftover" test_watchdog_
 run_test "notify: failed reboot names blocked updates" test_notify_failed_reboot_names_blocked_updates
 run_test "notify: failed dispatched reboot says reboot" test_notify_failed_dispatched_reboot_says_reboot
 run_test "notify: failed reboot without marker is not blocked" test_notify_failed_reboot_without_marker_is_not_blocked
+run_test "notify: quotes only the failed run"         test_notify_quotes_only_the_failed_run
+run_test "notify: without invocation falls back to the unit" test_notify_without_invocation_falls_back_to_the_unit
 run_test "watchdog: unknown identity is not acted on" test_watchdog_unknown_identity_is_not_acted_on
 run_test "watchdog: dispatch failure fails the watchdog" test_watchdog_dispatch_failure_fails_the_watchdog
 run_test "watchdog: unit has a start timeout"        test_watchdog_unit_has_a_start_timeout

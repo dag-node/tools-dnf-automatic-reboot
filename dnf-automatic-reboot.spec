@@ -541,6 +541,10 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   warning no longer claims updates were installed.
 - FIX: A failed scheduled reboot's notice says whether update runs are still held and how to
   release them.
+- FIX: Failure notices name the failed unit as it is: every '-' in the name was printed as '/',
+  dnf/automatic/reboot.service, in the message and in the journalctl command it suggests.
+- FIX: A failure notice quotes only the journal lines of the run that failed; the unit's last
+  lines could reach into the run before.
 - FIX: Every run fetches current repository metadata (dnf makecache --refresh) before
   dnf-automatic starts, within metadata_refresh_timeout_sec (new, default 900).
   dnf-automatic installed from the cache dnf-makecache.timer or metadata_expire had left, so
