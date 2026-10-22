@@ -185,7 +185,10 @@ STUB
 
     cat > "${TEST_ROOT_DIR}/usr/bin/busctl" <<'STUB'
 #!/bin/bash
-printf 'b false\n'
+case "${*: -1}" in
+    BlockInhibited) printf 's ""\n' ;;
+    *)              printf 'b false\n' ;;
+esac
 STUB
 
     cat > "${TEST_ROOT_DIR}/usr/bin/systemd-run" <<'STUB'
@@ -1942,11 +1945,13 @@ test_watchdog_reboots_through_the_pending_check() {
 # service STUB_SERVICE_LOAD_STATE (not-found), STUB_SERVICE_ACTIVE_STATE
 # (inactive) and STUB_SERVICE_JOB (no Job line).  STUB_PROPERTY_READ_FAILS=yes
 # makes every read fail.  The host reports STUB_SYSTEM_STATE (running) and
-# logind STUB_PREPARING_FOR_SHUTDOWN ("b false").  systemd-run exits
-# STUB_SYSTEMD_RUN_RC (0) and, with STUB_TIMER_SUB_STATE_AFTER_SUBMIT, leaves
-# the timer loaded in that state.  systemctl reboot exits STUB_REBOOT_RC (0),
-# systemctl_checks_inhibitors fails with STUB_NO_CHECK_INHIBITORS=yes.  State changes go through files, since
-# each read runs in a command substitution.
+# logind STUB_PREPARING_FOR_SHUTDOWN ("b false") and STUB_BLOCK_INHIBITED
+# ('s ""'), or the content of stub-logind-BlockInhibited when that file
+# exists; STUB_BLOCK_INHIBITED_READ_FAILS=yes makes that read fail.
+# systemd-run exits STUB_SYSTEMD_RUN_RC (0) and, with
+# STUB_TIMER_SUB_STATE_AFTER_SUBMIT, leaves the timer loaded in that state.
+# systemctl reboot exits STUB_REBOOT_RC (0).  State changes go through files,
+# since each read runs in a command substitution.
 stub_reboot_unit_state() {
     stub_property() {
         local override_file="${TEST_ROOT_DIR}/stub-$1-$2"
@@ -1977,6 +1982,10 @@ stub_reboot_unit_state() {
         [[ "${STUB_LOGIND_READ_FAILS:-}" == "yes" ]] && return 1
         printf '%s' "${STUB_PREPARING_FOR_SHUTDOWN-b false}"
     }
+    get_logind_block_inhibited() {
+        [[ "${STUB_BLOCK_INHIBITED_READ_FAILS:-}" == "yes" ]] && return 1
+        stub_property logind BlockInhibited "${STUB_BLOCK_INHIBITED-s \"\"}"
+    }
     stop_unit() {
         printf 'stop %s\n' "$1" >> "${STUB_LOG}"
         [[ "${STUB_STOP_FAILS:-}" == "yes" ]] && return 1
@@ -1998,7 +2007,6 @@ stub_reboot_unit_state() {
         printf 'reboot attempt\n' >> "${STUB_LOG}"
         return "${STUB_REBOOT_RC:-0}"
     }
-    systemctl_checks_inhibitors() { [[ "${STUB_NO_CHECK_INHIBITORS:-}" != "yes" ]]; }
     systemd-inhibit() { printf 'dnf  0 root 4242 dnf shutdown:sleep update block\n'; }
     # A sleep that only moves the clock; STUB_DURING_SLEEP runs inside it.
     sleep() {
@@ -2208,16 +2216,17 @@ test_reboot_unknown_shutdown_state_is_not_forced() {
     return 0
 }
 
-test_reboot_refused_releases_the_dispatch() {
+test_reboot_failed_releases_the_dispatch() {
     load_reboot_if_pending_library
     : > "${REBOOT_PENDING_FILE}"
     export STUB_REBOOT_RC=1
     local exit_code=0
     run_reboot_if_pending 0 || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "a refused reboot fails the unit, so OnFailure= reports it"
+    assert_exit_code 1 "${exit_code}" "a reboot that did not start fails the unit, so OnFailure= reports it"
     assert_equals "1" "$(reboot_attempt_count)" "with no wait configured, one attempt"
-    assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "shutdown inhibitor" "the likely cause is named"
-    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a refused reboot can be cancelled"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "systemctl reboot failed while the host stayed up" \
+        "the cause is named"
+    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a reboot that did not start can be cancelled"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "update runs stay held until a reboot or cancellation"
     return 0
 }
@@ -2226,14 +2235,16 @@ test_reboot_inhibited_is_retried_until_the_wait_ends() {
     load_reboot_if_pending_library
     : > "${REBOOT_PENDING_FILE}"
     # A package transaction started by hand holds a block inhibitor throughout.
-    export STUB_REBOOT_RC=1
+    export STUB_BLOCK_INHIBITED='s "shutdown:sleep"'
     local exit_code=0
     run_reboot_if_pending 60 || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "still refused when the wait ends"
-    assert_equals "3" "$(reboot_attempt_count)" "attempts at 0, 30 and 60 seconds"
+    assert_exit_code 1 "${exit_code}" "still blocked when the wait ends"
+    assert_equals "0" "$(reboot_attempt_count)" "systemctl reboot is never called under the inhibitor"
+    assert_equals "2" "$(grep -c '^sleep 30' "${STUB_LOG}")" "checks at 0, 30 and 60 seconds"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "a shutdown inhibitor blocks it" "the cause is named"
     assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "dnf shutdown:sleep update block" \
-        "the blocking inhibitor is named"
-    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a refused reboot can be cancelled"
+        "and the blocking inhibitor"
+    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a blocked reboot can be cancelled"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "update runs stay held"
     return 0
 }
@@ -2242,24 +2253,39 @@ test_reboot_inhibited_proceeds_once_released() {
     load_reboot_if_pending_library
     : > "${REBOOT_PENDING_FILE}"
     # The inhibitor is released during the first wait.
-    reboot_host() {
-        printf 'reboot attempt\n' >> "${STUB_LOG}"
-        [[ -f "${TEST_ROOT_DIR}/inhibitor-released" ]]
-    }
-    release_inhibitor() { : > "${TEST_ROOT_DIR}/inhibitor-released"; }
+    printf 's "shutdown"' > "${TEST_ROOT_DIR}/stub-logind-BlockInhibited"
+    release_inhibitor() { printf 's ""' > "${TEST_ROOT_DIR}/stub-logind-BlockInhibited"; }
     export STUB_DURING_SLEEP=release_inhibitor
     local exit_code=0
     run_reboot_if_pending 1800 || exit_code=$?
     assert_exit_code 0 "${exit_code}" "the reboot goes ahead"
-    assert_equals "2" "$(reboot_attempt_count)" "refused once, then accepted"
+    assert_equals "1" "$(reboot_attempt_count)" "blocked once, then one reboot"
     [[ -f "${REBOOT_DISPATCHED_FILE}" ]] || fail "the accepted reboot is recorded"
+    return 0
+}
+
+test_reboot_unreadable_inhibitors_do_not_reboot() {
+    local stub_setting
+    for stub_setting in STUB_BLOCK_INHIBITED_READ_FAILS=yes 'STUB_BLOCK_INHIBITED=b false' \
+                        STUB_BLOCK_INHIBITED= 'STUB_BLOCK_INHIBITED=s "shutdown" trailing'; do
+        (
+            load_reboot_if_pending_library
+            : > "${REBOOT_PENDING_FILE}"
+            export "${stub_setting?}"
+            local exit_code=0
+            run_reboot_if_pending 0 || exit_code=$?
+            assert_exit_code 1 "${exit_code}" "${stub_setting}: cannot tell fails the unit"
+            assert_equals "0" "$(reboot_attempt_count)" "${stub_setting}: rather than reboot under an inhibitor"
+            assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "inhibitors cannot be read" "${stub_setting}: and says so"
+        ) || fail "${stub_setting} must not reboot"
+    done
     return 0
 }
 
 test_reboot_can_be_cancelled_while_inhibited() {
     load_reboot_if_pending_library
     : > "${REBOOT_PENDING_FILE}"
-    export STUB_REBOOT_RC=1
+    export STUB_BLOCK_INHIBITED='s "shutdown"'
     # Between attempts the lock is free: cancel-reboot.sh takes it and
     # removes the marker.
     cancel_between_attempts() {
@@ -2273,18 +2299,8 @@ test_reboot_can_be_cancelled_while_inhibited() {
     run_reboot_if_pending 1800 || exit_code=$?
     assert_exit_code 0 "${exit_code}" "a cancelled reboot is no failure"
     assert_contains "$(cat "${STUB_LOG}")" "lock free between attempts" "the lock was released while waiting"
-    assert_equals "1" "$(reboot_attempt_count)" "no attempt after the cancellation"
+    assert_equals "0" "$(reboot_attempt_count)" "no reboot, before or after the cancellation"
     assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "the reboot was cancelled" "and it says so"
-}
-
-test_reboot_refuses_without_inhibitor_checking() {
-    load_reboot_if_pending_library
-    : > "${REBOOT_PENDING_FILE}"
-    export STUB_NO_CHECK_INHIBITORS=yes
-    local exit_code=0
-    run_reboot_if_pending || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "a systemctl that cannot check inhibitors fails the unit"
-    assert_equals "0" "$(reboot_attempt_count)" "rather than reboot under an inhibitor"
 }
 
 test_reboot_waits_for_a_cancellation_in_progress() {
@@ -2615,9 +2631,14 @@ test_invariant_lock_file_is_never_removed() {
 }
 
 test_invariant_reboots_check_inhibitors_and_never_force() {
+    local attempt_body
     script_lines '\-\-force' | grep -q . && fail "no script may override inhibitors with --force"
-    script_lines '"\$\{SYSTEMCTL_BIN\}" reboot' | grep -vq -- '--check-inhibitors=yes' \
-        && fail "every systemctl reboot must check inhibitors"
+    # systemctl's check also refuses while another user has a session.
+    script_lines '"\$\{SYSTEMCTL_BIN\}" reboot' | grep -q -- '--check-inhibitors' \
+        && fail "the reboot must not depend on who is logged in"
+    attempt_body=$(sed -n '/^attempt_reboot() {/,/^}/p' "${REPO_ROOT}/scripts/reboot-if-pending.sh")
+    [[ "${attempt_body}" == *'read_shutdown_block_state'*'if reboot_host'* ]] \
+        || fail "reboot_host must follow the block-inhibitor check"
     return 0
 }
 
@@ -2718,6 +2739,31 @@ TABLE
     export STUB_PROPERTY_READ_FAILS=yes
     assert_equals "dispatched" "$(read_scheduled_reboot_status)" \
         "the dispatched file wins over everything systemd says, even an unreadable state"
+}
+
+test_reader_shutdown_block_state_table() {
+    load_request_library
+    local expected block_inhibited read_fails
+    while IFS='|' read -r expected block_inhibited read_fails; do
+        [[ -n "${expected}" ]] || continue
+        (
+            export STUB_BLOCK_INHIBITED="${block_inhibited}" STUB_BLOCK_INHIBITED_READ_FAILS="${read_fails}"
+            assert_equals "${expected}" "$(read_shutdown_block_state)" "[${block_inhibited}|${read_fails}]"
+        ) || fail "block table row ${expected}|${block_inhibited}|${read_fails}"
+    done <<'TABLE'
+free|s ""|
+free|s "sleep:idle:handle-lid-switch"|
+blocked|s "shutdown"|
+blocked|s "sleep:shutdown:idle"|
+blocked|s "shutdown:sleep"|
+free|s "noshutdown:shutdowns"|
+unknown|s "shutdown"|yes
+unknown||
+unknown|b false|
+unknown|s "shutdown" |
+unknown|s "Shutdown sleep"|
+unknown|shutdown|
+TABLE
 }
 
 test_reader_host_shutdown_state_table() {
@@ -3372,11 +3418,11 @@ run_test "cancel: nothing pending is a noop"         test_cancel_with_nothing_pe
 run_test "reboot: pending reboots and records it"   test_reboot_pending_reboots_and_records_it
 run_test "reboot: accepted by logind is not forced"  test_reboot_accepted_by_logind_is_not_forced
 run_test "reboot: unknown shutdown state is not forced" test_reboot_unknown_shutdown_state_is_not_forced
-run_test "reboot: refused releases the dispatch"    test_reboot_refused_releases_the_dispatch
+run_test "reboot: failed releases the dispatch"     test_reboot_failed_releases_the_dispatch
 run_test "reboot: inhibited is retried until the wait ends" test_reboot_inhibited_is_retried_until_the_wait_ends
 run_test "reboot: inhibited proceeds once released" test_reboot_inhibited_proceeds_once_released
 run_test "reboot: can be cancelled while inhibited" test_reboot_can_be_cancelled_while_inhibited
-run_test "reboot: refuses without inhibitor checking" test_reboot_refuses_without_inhibitor_checking
+run_test "reboot: unreadable inhibitors do not reboot" test_reboot_unreadable_inhibitors_do_not_reboot
 run_test "reboot: waits for a cancellation in progress" test_reboot_waits_for_a_cancellation_in_progress
 run_test "lock: created owner-only"                  test_lock_is_created_owner_only
 run_test "lock: permissions corrected in place"      test_lock_permissions_are_corrected_in_place
@@ -3412,6 +3458,7 @@ run_test "invariant: versions agree"                test_invariant_versions_agre
 run_test "reader: unit snapshot job forms"          test_reader_unit_snapshot_job_forms
 run_test "reader: scheduled reboot status table"    test_reader_scheduled_reboot_status_table
 run_test "reader: host shutdown state table"        test_reader_host_shutdown_state_table
+run_test "reader: shutdown block state table"       test_reader_shutdown_block_state_table
 run_test "reboot: no dispatched record, no reboot"  test_reboot_without_dispatched_record_does_not_reboot
 run_test "cancel: unstoppable timer still cancels"  test_cancel_with_unstoppable_timer_still_cancels
 run_test "cancel: running service before dispatch cancels" test_cancel_with_running_reboot_service_before_dispatch_cancels

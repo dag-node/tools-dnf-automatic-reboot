@@ -85,6 +85,32 @@ get_logind_preparing_for_shutdown() {
         org.freedesktop.login1.Manager PreparingForShutdown 2>/dev/null
 }
 
+# get_logind_block_inhibited -> busctl's 's "WHAT:WHAT"': every operation a
+# block-mode inhibitor of any user holds, colon-separated, or 's ""'.
+get_logind_block_inhibited() {
+    "${BUSCTL_BIN}" get-property org.freedesktop.login1 /org/freedesktop/login1 \
+        org.freedesktop.login1.Manager BlockInhibited 2>/dev/null
+}
+
+# read_shutdown_block_state -> blocked, free or unknown.  blocked when a
+# block-mode inhibitor names shutdown, such as the one a package transaction
+# holds; free when logind answered and none does; unknown for no answer or an
+# answer of any other shape.  The operation names are matched whole, so
+# "shutdown" never matches inside another name.
+read_shutdown_block_state() {
+    local block_inhibited block_inhibited_pattern='^s "([a-z:-]*)"$'
+    if ! block_inhibited=$(get_logind_block_inhibited) \
+       || [[ ! "${block_inhibited}" =~ ${block_inhibited_pattern} ]]; then
+        printf 'unknown'
+        return 0
+    fi
+    if [[ ":${BASH_REMATCH[1]}:" == *:shutdown:* ]]; then
+        printf 'blocked'
+    else
+        printf 'free'
+    fi
+}
+
 # read_scheduled_reboot_status -> one of
 #   none         nothing waiting, queued or running, and no reboot dispatched
 #   waiting      the timer is waiting to fire
@@ -184,17 +210,14 @@ start_reboot_unit() {
         "${REBOOT_IF_PENDING_COMMAND}" "${lock_wait_seconds}" "${inhibited_wait_seconds}"
 }
 
-# reboot_host -> systemctl reboot's exit code.  Run from a service, outside a
-# terminal, systemctl does not check shutdown inhibitors unless asked to, and
-# would reboot under a package transaction that holds one.
+# reboot_host -> systemctl reboot's exit code.  Run by root outside a
+# terminal, systemctl checks neither shutdown inhibitors nor other users'
+# sessions, and logind lets root override a block inhibitor, so the caller
+# checks read_shutdown_block_state first.  --check-inhibitors=yes is not
+# used: it also refuses while any other user has a session, so one open SSH
+# login would withhold every reboot.
 reboot_host() {
-    "${SYSTEMCTL_BIN}" reboot --check-inhibitors=yes
-}
-
-# systemctl_checks_inhibitors - 0 when systemctl accepts --check-inhibitors.
-# systemctl parses every option before it acts on --version.
-systemctl_checks_inhibitors() {
-    "${SYSTEMCTL_BIN}" --check-inhibitors=yes --version >/dev/null 2>&1
+    "${SYSTEMCTL_BIN}" reboot
 }
 
 # submit_reboot DELAY_SECONDS LOCK_WAIT_SECONDS INHIBITED_WAIT_SECONDS DESCRIPTION
