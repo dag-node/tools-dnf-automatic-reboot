@@ -34,7 +34,7 @@ Linux, Rocky Linux, AlmaLinux) with the standard GRUB boot menu.
 ```bash
 sudo dnf install dnf-automatic
 sudoedit /etc/dnf/automatic.conf
-sudo dnf install ./dnf-automatic-reboot-1.5.0-*.el9.noarch.rpm
+sudo dnf install ./dnf-automatic-reboot-1.6.0-*.el9.noarch.rpm
 sudo systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
 ```
 
@@ -248,7 +248,7 @@ Enterprise Linux 8 into the `el8` folder beside it; each build replaces only
 its own folder. Building in the container gives the file the
 right `.el8` or `.el9` tag whatever the build host runs, and keeps the
 test suite off that host. The file carries a local snapshot version,
-`1.5.0-0.local.git<commit>`, which a released `1.5.0-1` replaces as an
+`1.6.0-0.local.git<commit>`, which a released `1.6.0-1` replaces as an
 ordinary upgrade. Copy it to the system it is for and install it as in
 [Quick start](#quick-start).
 
