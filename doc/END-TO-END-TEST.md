@@ -13,7 +13,7 @@ steps below.
 
 - Root on the host, with `dnf-automatic-reboot` installed and both timers enabled.
 - No reboot pending: `ls /run/dnf-automatic-reboot.*` lists only `.lock` files.
-- A window in which the host may reboot, away from the nightly run at 03:00.
+- A window in which the host may reboot, away from the nightly run at 03:00 UTC.
 - No `dnf` transaction of your own while the test runs.
 - Three terminals on the host.
 - `tools/verify-reboot-protocol.sh` from this repository, copied to the host.

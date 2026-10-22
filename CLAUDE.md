@@ -54,7 +54,7 @@ scripts/reboot-if-pending.sh    The scheduled reboot's command: reboots only whi
 scripts/reboot-request.sh       Reboot request/cancel protocol, sourced by the scripts that request, run or cancel reboots
 scripts/run-state.sh            State file protocol (atomic publish, snapshot, checked removal), sourced by run and watchdog
 units/dnf-automatic-reboot.service    Oneshot service wrapping run.sh
-units/dnf-automatic-reboot.timer      Daily 03:00, RandomizedDelaySec=10min, Persistent
+units/dnf-automatic-reboot.timer      Daily 03:00 UTC, RandomizedDelaySec=600, Persistent
 units/dnf-automatic-watchdog.service  Oneshot service wrapping watchdog.sh
 units/dnf-automatic-watchdog.timer    Every 5 minutes
 units/dnf-automatic-reboot-notify@.service  Failure notifier, instantiated by OnFailure=
