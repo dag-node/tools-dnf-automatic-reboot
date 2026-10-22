@@ -13,9 +13,11 @@ steps below.
 
 - Root on the host, with `dnf-automatic-reboot` installed and both timers enabled.
 - No reboot pending: `ls /run/dnf-automatic-reboot.*` lists only `.lock` files.
-- A window in which the host may reboot, away from the nightly run at 03:00.
+- A window in which the host may reboot, away from the nightly run at 03:00 UTC.
 - No `dnf` transaction of your own while the test runs.
-- Three terminals on the host.
+- Three terminals on the host, logged in as a user other than root who becomes
+  root with `sudo`. Section 5 then also shows that a logged-in user does not
+  hold the reboot.
 - `tools/verify-reboot-protocol.sh` from this repository, copied to the host.
 
 ## 1. Check the platform
@@ -25,11 +27,11 @@ sudo bash verify-reboot-protocol.sh > "$(hostname -s)-reboot-protocol.txt" 2>&1;
 ```
 
 It must end with `0 FAIL`. The probe starts short-lived
-`dnf-automatic-reboot-probe-*` units that run `/bin/true` or `sleep`, and never
-reboots. Two lines matter most here: `systemctl accepts
---check-inhibitors=yes`, without which no reboot of this package happens, and
-`chronyc waitsync reports the clock synchronised`, without which no update run
-starts.
+`dnf-automatic-reboot-probe-*` units that run `/bin/true` or `sleep`, one of
+them under a shutdown inhibitor, and never reboots. Two lines matter most here:
+`a held block-mode shutdown inhibitor reads as blocked`, without which the
+package cannot tell that a transaction holds the reboot off, and `chronyc
+waitsync reports the clock synchronised`, without which no update run starts.
 
 ## 2. Prepare
 
@@ -67,8 +69,8 @@ No reboot.
 3. Terminal 2 shows `always_reboot=yes in config - scheduling reboot regardless`,
    then `Reboot dispatch confirmed: … fires at <T>`. From `<T>` on, every
    30 seconds:
-   `the reboot was refused, most likely by a shutdown inhibitor (… exercise … block) - retrying in 30s`.
-4. After the first refusal, terminal 1:
+   `the reboot did not start: a shutdown inhibitor blocks it (… exercise … block) - retrying in 30s`.
+4. After the first such line, terminal 1:
 
    ```bash
    /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh; echo "exit: $?"; ls /run/dnf-automatic-reboot.*
@@ -87,8 +89,8 @@ No reboot.
 
 1. Terminal 3: start the inhibitor.
 2. Terminal 1: `systemctl start --no-block dnf-automatic-reboot.service`
-3. Terminal 2 shows refusals at `<T>`, `<T>`+30 s, … `<T>`+120 s, then
-   `the reboot was refused for 120s while the host stayed up … update runs stay held`.
+3. Terminal 2 shows `did not start` at `<T>`, `<T>`+30 s, … `<T>`+120 s, then
+   `the reboot did not start within 120s: a shutdown inhibitor blocks it … update runs stay held`.
    The reboot unit fails, and logged-in terminals receive
    `The scheduled reboot did not happen. Update runs stay blocked until the host reboots`.
 4. Terminal 1 checks that update runs are held:
@@ -123,16 +125,16 @@ Reboots the host.
    ```
 
    Expected: `0`.
-4. After the first `refused … retrying in 30s`, terminal 3: Ctrl-C.
+4. After the first `did not start … retrying in 30s`, terminal 3: Ctrl-C.
 5. Within 30 seconds terminal 2 shows `reboot-if-pending: Orderly reboot requested`,
-   and the host reboots.
+   and the host reboots, although your user is still logged in.
 6. After the reboot:
 
    ```bash
    journalctl -b -1 --no-pager -u dnf-automatic-reboot-scheduled-reboot.service | tail -6; ls /run/dnf-automatic-reboot.*
    ```
 
-   Expected: one or more refusals, then `Orderly reboot requested`; and only
+   Expected: one or more `did not start` lines, then `Orderly reboot requested`; and only
    `.lock` files, since `/run` starts empty.
 
 ## Stopping early

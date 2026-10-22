@@ -64,7 +64,7 @@ The last command turns on the nightly run and the watchdog that looks after it.
 
 ## What happens every night
 
-Between 03:00 and 03:10 the package:
+Between 03:00 and 03:10 UTC the package:
 
 1. Fetches the current list of updates, so one published today is not missed
    because `dnf` still had yesterday's.
@@ -168,7 +168,7 @@ To run at another time, override the timer:
 sudo systemctl edit dnf-automatic-reboot.timer
 ```
 
-and enter, for example for 01:30:
+and enter, for example for 01:30 local time:
 
 ```ini
 [Timer]
@@ -176,8 +176,9 @@ OnCalendar=
 OnCalendar=*-*-* 01:30:00
 ```
 
-The empty `OnCalendar=` line clears the 03:00 default, so the new time
-replaces it.
+The empty `OnCalendar=` line clears the 03:00 UTC default, so the new time
+replaces it. A time without a zone is the host's local time; add `UTC` or a
+zone such as `Europe/Prague` after it to pin it.
 
 ## Computers without a clock battery
 

@@ -543,6 +543,20 @@ chronyc_available() {
     command -v chronyc >/dev/null 2>&1
 }
 
+# Bound on the one chronyc query a failed clock check makes for its message.
+readonly CHRONYC_REPLY_TIMEOUT_SEC=10
+
+# chronyc_sync_reply -> the last line chronyc prints for one synchronisation
+# query, its "try:" line or its error, as printable ASCII, or a note that none
+# came.  It goes into the log only; nothing parses it.
+chronyc_sync_reply() {
+    local chronyc_reply
+    chronyc_reply=$(timeout --kill-after="${KILL_GRACE_SEC}s" "${CHRONYC_REPLY_TIMEOUT_SEC}s" \
+                        chronyc waitsync 1 0.1 0 1 2>&1 \
+                    | tail -n 1 | tr -cd '[:print:]' | cut -c1-200) || true
+    printf '%s' "${chronyc_reply:-no reply within ${CHRONYC_REPLY_TIMEOUT_SEC}s}"
+}
+
 # wait_for_clock_sync - 0 once chronyd reports the clock synchronised, within
 # CLOCK_SYNC_WAIT_SEC; 1 when it does not, or cannot be asked.
 # The unit's ordering on time-sync.target does not require a successful
@@ -570,11 +584,13 @@ wait_for_clock_sync() {
         log "clock synchronised (chronyc waitsync)"
         return 0
     fi
+    # The waiting query's output is discarded: a client stopped by timeout(1)
+    # can lose what it buffered.  One more query states why for the log.
     # 124: still waiting at the deadline; 137: killed after the grace.
     if [[ "${waitsync_exit_code}" -eq 124 || "${waitsync_exit_code}" -eq 137 ]]; then
-        log_error "chronyc waitsync was still running at ${CLOCK_SYNC_WAIT_SEC}s and was stopped - check: chronyc tracking"
+        log_error "chronyc waitsync was still running at ${CLOCK_SYNC_WAIT_SEC}s and was stopped (chronyc: $(chronyc_sync_reply)) - check: systemctl status chronyd; chronyc tracking"
     else
-        log_error "chronyd did not report a synchronised clock within ${CLOCK_SYNC_WAIT_SEC}s - check: chronyc tracking"
+        log_error "chronyd did not report a synchronised clock within ${CLOCK_SYNC_WAIT_SEC}s (chronyc: $(chronyc_sync_reply)) - check: systemctl status chronyd; chronyc tracking"
     fi
     return 1
 }

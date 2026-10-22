@@ -121,6 +121,12 @@ for systemd_run_option in --on-active --timer-property --description; do
         report_fail run.sh "systemd-run has no ${systemd_run_option}; schedule_reboot uses it"
     fi
 done
+# dnf-automatic-reboot.timer names its time zone in OnCalendar=.
+if systemd-analyze calendar '*-*-* 03:00:00 UTC' >/dev/null 2>&1; then
+    report_pass timer "systemd-analyze calendar accepts '*-*-* 03:00:00 UTC'"
+else
+    report_fail timer "systemd-analyze calendar rejects '*-*-* 03:00:00 UTC'; dnf-automatic-reboot.timer's OnCalendar= uses it"
+fi
 if systemctl cat chrony-wait.service >/dev/null 2>&1; then
     report_info "%post" "chrony-wait.service exists, enabled: $(systemctl is-enabled chrony-wait.service 2>&1)"
 else

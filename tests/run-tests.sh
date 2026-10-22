@@ -185,7 +185,10 @@ STUB
 
     cat > "${TEST_ROOT_DIR}/usr/bin/busctl" <<'STUB'
 #!/bin/bash
-printf 'b false\n'
+case "${*: -1}" in
+    BlockInhibited) printf 's ""\n' ;;
+    *)              printf 'b false\n' ;;
+esac
 STUB
 
     cat > "${TEST_ROOT_DIR}/usr/bin/systemd-run" <<'STUB'
@@ -992,7 +995,11 @@ stub_run_main() {
     describe_installed_updates() { printf '%s' "Updates installed (packages: 2)"; }
     read_scheduled_reboot_status() { printf '%s' "${STUB_SCHEDULED_REBOOT_STATUS:-none}"; }
     chronyc_available() { [[ "${STUB_CHRONYC_MISSING:-}" != "yes" ]]; }
-    chronyc() { printf 'chronyc %s\n' "$*" >> "${STUB_LOG}"; return "${STUB_CHRONYC_RC:-0}"; }
+    chronyc() {
+        printf 'chronyc %s\n' "$*" >> "${STUB_LOG}"
+        printf '%s\n' "${STUB_CHRONYC_REPLY:-}"
+        return "${STUB_CHRONYC_RC:-0}"
+    }
     schedule_reboot() {
         printf 'schedule_reboot reboot_pending_file=%s\n' "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
         [[ "${STUB_SCHEDULE_FAILS:-}" == "yes" ]] && return 1
@@ -1942,11 +1949,13 @@ test_watchdog_reboots_through_the_pending_check() {
 # service STUB_SERVICE_LOAD_STATE (not-found), STUB_SERVICE_ACTIVE_STATE
 # (inactive) and STUB_SERVICE_JOB (no Job line).  STUB_PROPERTY_READ_FAILS=yes
 # makes every read fail.  The host reports STUB_SYSTEM_STATE (running) and
-# logind STUB_PREPARING_FOR_SHUTDOWN ("b false").  systemd-run exits
-# STUB_SYSTEMD_RUN_RC (0) and, with STUB_TIMER_SUB_STATE_AFTER_SUBMIT, leaves
-# the timer loaded in that state.  systemctl reboot exits STUB_REBOOT_RC (0),
-# systemctl_checks_inhibitors fails with STUB_NO_CHECK_INHIBITORS=yes.  State changes go through files, since
-# each read runs in a command substitution.
+# logind STUB_PREPARING_FOR_SHUTDOWN ("b false") and STUB_BLOCK_INHIBITED
+# ('s ""'), or the content of stub-logind-BlockInhibited when that file
+# exists; STUB_BLOCK_INHIBITED_READ_FAILS=yes makes that read fail.
+# systemd-run exits STUB_SYSTEMD_RUN_RC (0) and, with
+# STUB_TIMER_SUB_STATE_AFTER_SUBMIT, leaves the timer loaded in that state.
+# systemctl reboot exits STUB_REBOOT_RC (0).  State changes go through files,
+# since each read runs in a command substitution.
 stub_reboot_unit_state() {
     stub_property() {
         local override_file="${TEST_ROOT_DIR}/stub-$1-$2"
@@ -1977,6 +1986,10 @@ stub_reboot_unit_state() {
         [[ "${STUB_LOGIND_READ_FAILS:-}" == "yes" ]] && return 1
         printf '%s' "${STUB_PREPARING_FOR_SHUTDOWN-b false}"
     }
+    get_logind_block_inhibited() {
+        [[ "${STUB_BLOCK_INHIBITED_READ_FAILS:-}" == "yes" ]] && return 1
+        stub_property logind BlockInhibited "${STUB_BLOCK_INHIBITED-s \"\"}"
+    }
     stop_unit() {
         printf 'stop %s\n' "$1" >> "${STUB_LOG}"
         [[ "${STUB_STOP_FAILS:-}" == "yes" ]] && return 1
@@ -1998,7 +2011,6 @@ stub_reboot_unit_state() {
         printf 'reboot attempt\n' >> "${STUB_LOG}"
         return "${STUB_REBOOT_RC:-0}"
     }
-    systemctl_checks_inhibitors() { [[ "${STUB_NO_CHECK_INHIBITORS:-}" != "yes" ]]; }
     systemd-inhibit() { printf 'dnf  0 root 4242 dnf shutdown:sleep update block\n'; }
     # A sleep that only moves the clock; STUB_DURING_SLEEP runs inside it.
     sleep() {
@@ -2208,16 +2220,17 @@ test_reboot_unknown_shutdown_state_is_not_forced() {
     return 0
 }
 
-test_reboot_refused_releases_the_dispatch() {
+test_reboot_failed_releases_the_dispatch() {
     load_reboot_if_pending_library
     : > "${REBOOT_PENDING_FILE}"
     export STUB_REBOOT_RC=1
     local exit_code=0
     run_reboot_if_pending 0 || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "a refused reboot fails the unit, so OnFailure= reports it"
+    assert_exit_code 1 "${exit_code}" "a reboot that did not start fails the unit, so OnFailure= reports it"
     assert_equals "1" "$(reboot_attempt_count)" "with no wait configured, one attempt"
-    assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "shutdown inhibitor" "the likely cause is named"
-    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a refused reboot can be cancelled"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "systemctl reboot failed while the host stayed up" \
+        "the cause is named"
+    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a reboot that did not start can be cancelled"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "update runs stay held until a reboot or cancellation"
     return 0
 }
@@ -2226,14 +2239,16 @@ test_reboot_inhibited_is_retried_until_the_wait_ends() {
     load_reboot_if_pending_library
     : > "${REBOOT_PENDING_FILE}"
     # A package transaction started by hand holds a block inhibitor throughout.
-    export STUB_REBOOT_RC=1
+    export STUB_BLOCK_INHIBITED='s "shutdown:sleep"'
     local exit_code=0
     run_reboot_if_pending 60 || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "still refused when the wait ends"
-    assert_equals "3" "$(reboot_attempt_count)" "attempts at 0, 30 and 60 seconds"
+    assert_exit_code 1 "${exit_code}" "still blocked when the wait ends"
+    assert_equals "0" "$(reboot_attempt_count)" "systemctl reboot is never called under the inhibitor"
+    assert_equals "2" "$(grep -c '^sleep 30' "${STUB_LOG}")" "checks at 0, 30 and 60 seconds"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "a shutdown inhibitor blocks it" "the cause is named"
     assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "dnf shutdown:sleep update block" \
-        "the blocking inhibitor is named"
-    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a refused reboot can be cancelled"
+        "and the blocking inhibitor"
+    [[ -f "${REBOOT_DISPATCHED_FILE}" ]] && fail "a blocked reboot can be cancelled"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "update runs stay held"
     return 0
 }
@@ -2242,24 +2257,39 @@ test_reboot_inhibited_proceeds_once_released() {
     load_reboot_if_pending_library
     : > "${REBOOT_PENDING_FILE}"
     # The inhibitor is released during the first wait.
-    reboot_host() {
-        printf 'reboot attempt\n' >> "${STUB_LOG}"
-        [[ -f "${TEST_ROOT_DIR}/inhibitor-released" ]]
-    }
-    release_inhibitor() { : > "${TEST_ROOT_DIR}/inhibitor-released"; }
+    printf 's "shutdown"' > "${TEST_ROOT_DIR}/stub-logind-BlockInhibited"
+    release_inhibitor() { printf 's ""' > "${TEST_ROOT_DIR}/stub-logind-BlockInhibited"; }
     export STUB_DURING_SLEEP=release_inhibitor
     local exit_code=0
     run_reboot_if_pending 1800 || exit_code=$?
     assert_exit_code 0 "${exit_code}" "the reboot goes ahead"
-    assert_equals "2" "$(reboot_attempt_count)" "refused once, then accepted"
+    assert_equals "1" "$(reboot_attempt_count)" "blocked once, then one reboot"
     [[ -f "${REBOOT_DISPATCHED_FILE}" ]] || fail "the accepted reboot is recorded"
+    return 0
+}
+
+test_reboot_unreadable_inhibitors_do_not_reboot() {
+    local stub_setting
+    for stub_setting in STUB_BLOCK_INHIBITED_READ_FAILS=yes 'STUB_BLOCK_INHIBITED=b false' \
+                        STUB_BLOCK_INHIBITED= 'STUB_BLOCK_INHIBITED=s "shutdown" trailing'; do
+        (
+            load_reboot_if_pending_library
+            : > "${REBOOT_PENDING_FILE}"
+            export "${stub_setting?}"
+            local exit_code=0
+            run_reboot_if_pending 0 || exit_code=$?
+            assert_exit_code 1 "${exit_code}" "${stub_setting}: cannot tell fails the unit"
+            assert_equals "0" "$(reboot_attempt_count)" "${stub_setting}: rather than reboot under an inhibitor"
+            assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "inhibitors cannot be read" "${stub_setting}: and says so"
+        ) || fail "${stub_setting} must not reboot"
+    done
     return 0
 }
 
 test_reboot_can_be_cancelled_while_inhibited() {
     load_reboot_if_pending_library
     : > "${REBOOT_PENDING_FILE}"
-    export STUB_REBOOT_RC=1
+    export STUB_BLOCK_INHIBITED='s "shutdown"'
     # Between attempts the lock is free: cancel-reboot.sh takes it and
     # removes the marker.
     cancel_between_attempts() {
@@ -2273,18 +2303,8 @@ test_reboot_can_be_cancelled_while_inhibited() {
     run_reboot_if_pending 1800 || exit_code=$?
     assert_exit_code 0 "${exit_code}" "a cancelled reboot is no failure"
     assert_contains "$(cat "${STUB_LOG}")" "lock free between attempts" "the lock was released while waiting"
-    assert_equals "1" "$(reboot_attempt_count)" "no attempt after the cancellation"
+    assert_equals "0" "$(reboot_attempt_count)" "no reboot, before or after the cancellation"
     assert_contains "$(cat "${TEST_ROOT_DIR}/reboot.out")" "the reboot was cancelled" "and it says so"
-}
-
-test_reboot_refuses_without_inhibitor_checking() {
-    load_reboot_if_pending_library
-    : > "${REBOOT_PENDING_FILE}"
-    export STUB_NO_CHECK_INHIBITORS=yes
-    local exit_code=0
-    run_reboot_if_pending || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "a systemctl that cannot check inhibitors fails the unit"
-    assert_equals "0" "$(reboot_attempt_count)" "rather than reboot under an inhibitor"
 }
 
 test_reboot_waits_for_a_cancellation_in_progress() {
@@ -2472,6 +2492,25 @@ test_run_clock_wait_has_a_hard_deadline() {
         "SIGTERM at clock_sync_wait_sec, SIGKILL kill_grace_sec later"
     assert_not_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "nothing is installed"
     assert_contains "${output}" "still running at 600s" "and says why"
+    assert_contains "${output}" "(chronyc: no reply within 10s)" "and that chronyc did not answer either"
+}
+
+test_run_unsynchronised_clock_names_chronyc_reply() {
+    load_run_library
+    stub_run_main
+    # chronyd was never started: every query fails the same way.  The last
+    # line is what the log keeps, without its control character.
+    export STUB_CHRONYC_RC=1 STUB_CHRONYC_REPLY=$'try: 1, refid: 7F7F0101, correction: 0.0, skew: 0.0\n506 Cannot talk to daemon\x07'
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "an unconfirmed clock fails the run"
+    assert_contains "$(cat "${STUB_LOG}")" "chronyc waitsync 1 0.1 0 1" "one bounded query for the message"
+    assert_contains "${output}" "(chronyc: 506 Cannot talk to daemon) - check: systemctl status chronyd" \
+        "the failure says what chronyc answered"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/var/log/dnf-automatic-reboot.log")" "(chronyc: 506 Cannot talk to daemon)" \
+        "in the log file too"
+    [[ "${output}" == *$'\x07'* ]] && fail "the reply reaches the log as printable ASCII only"
+    return 0
 }
 
 test_run_without_chronyc_does_not_update() {
@@ -2615,9 +2654,25 @@ test_invariant_lock_file_is_never_removed() {
 }
 
 test_invariant_reboots_check_inhibitors_and_never_force() {
+    local attempt_body
     script_lines '\-\-force' | grep -q . && fail "no script may override inhibitors with --force"
-    script_lines '"\$\{SYSTEMCTL_BIN\}" reboot' | grep -vq -- '--check-inhibitors=yes' \
-        && fail "every systemctl reboot must check inhibitors"
+    # systemctl's check also refuses while another user has a session.
+    script_lines '"\$\{SYSTEMCTL_BIN\}" reboot' | grep -q -- '--check-inhibitors' \
+        && fail "the reboot must not depend on who is logged in"
+    attempt_body=$(sed -n '/^attempt_reboot() {/,/^}/p' "${REPO_ROOT}/scripts/reboot-if-pending.sh")
+    [[ "${attempt_body}" == *'read_shutdown_block_state'*'if reboot_host'* ]] \
+        || fail "reboot_host must follow the block-inhibitor check"
+    return 0
+}
+
+test_invariant_notifier_gets_the_unit_name_unescaped() {
+    # %I unescapes the instance: dnf-automatic-reboot.service would arrive as
+    # dnf/automatic/reboot.service, and the scheduled reboot's notice would
+    # never match its unit.
+    local notifier_unit="${REPO_ROOT}/units/dnf-automatic-reboot-notify@.service"
+    grep -q '^ExecStart=/usr/libexec/dnf-automatic-reboot/notify-failure\.sh %i$' "${notifier_unit}" \
+        || fail "the notifier must be passed %i"
+    grep -q '%I' "${notifier_unit}" && fail "no %I in the notifier unit"
     return 0
 }
 
@@ -2718,6 +2773,31 @@ TABLE
     export STUB_PROPERTY_READ_FAILS=yes
     assert_equals "dispatched" "$(read_scheduled_reboot_status)" \
         "the dispatched file wins over everything systemd says, even an unreadable state"
+}
+
+test_reader_shutdown_block_state_table() {
+    load_request_library
+    local expected block_inhibited read_fails
+    while IFS='|' read -r expected block_inhibited read_fails; do
+        [[ -n "${expected}" ]] || continue
+        (
+            export STUB_BLOCK_INHIBITED="${block_inhibited}" STUB_BLOCK_INHIBITED_READ_FAILS="${read_fails}"
+            assert_equals "${expected}" "$(read_shutdown_block_state)" "[${block_inhibited}|${read_fails}]"
+        ) || fail "block table row ${expected}|${block_inhibited}|${read_fails}"
+    done <<'TABLE'
+free|s ""|
+free|s "sleep:idle:handle-lid-switch"|
+blocked|s "shutdown"|
+blocked|s "sleep:shutdown:idle"|
+blocked|s "shutdown:sleep"|
+free|s "noshutdown:shutdowns"|
+unknown|s "shutdown"|yes
+unknown||
+unknown|b false|
+unknown|s "shutdown" |
+unknown|s "Shutdown sleep"|
+unknown|shutdown|
+TABLE
 }
 
 test_reader_host_shutdown_state_table() {
@@ -2865,6 +2945,7 @@ load_notify_library() {
     set +e
     IFS=$' \t\n'
     journalctl() { :; }
+    systemctl() { :; }
 }
 
 test_notify_failed_reboot_names_blocked_updates() {
@@ -2886,6 +2967,55 @@ test_notify_failed_dispatched_reboot_says_reboot() {
     assert_contains "$(cat "${STUB_LOG}")" "whether systemd accepted it is unknown" \
         "a reboot command with an unknown outcome is named"
     assert_not_contains "$(cat "${STUB_LOG}")" "cancel-reboot.sh" "cancellation would be refused"
+}
+
+# stub_notify_journal: systemctl show reports STUB_INVOCATION_ID; journalctl
+# records its arguments and prints STUB_INVOCATION_LINES for a query by
+# invocation ID, STUB_UNIT_LINES for one by unit.
+stub_notify_journal() {
+    systemctl() { printf '%s\n' "${STUB_INVOCATION_ID:-}"; }
+    journalctl() {
+        printf 'journalctl %s\n' "$*" >> "${STUB_LOG}"
+        if [[ "$*" == *INVOCATION_ID=* ]]; then
+            printf '%s' "${STUB_INVOCATION_LINES:-}"
+        else
+            printf '%s' "${STUB_UNIT_LINES:-}"
+        fi
+    }
+}
+
+test_notify_quotes_only_the_failed_run() {
+    load_notify_library
+    stub_notify_journal
+    export STUB_INVOCATION_ID=0123456789abcdef0123456789abcdef \
+           STUB_INVOCATION_LINES="run: chronyd did not report a synchronised clock" \
+           STUB_UNIT_LINES="run: Exiting rc=1 from the run before"
+    ( main dnf-automatic-reboot.service ) >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" \
+        "_SYSTEMD_INVOCATION_ID=0123456789abcdef0123456789abcdef + INVOCATION_ID=0123456789abcdef0123456789abcdef" \
+        "the run's output and systemd's messages about it"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/var/log/dnf-automatic-reboot.log")" \
+        "dnf-automatic-reboot.service: run: chronyd did not report" "the failed run is quoted"
+    assert_not_contains "$(cat "${TEST_ROOT_DIR}/var/log/dnf-automatic-reboot.log")" "the run before" \
+        "nothing from the run before"
+}
+
+test_notify_without_invocation_falls_back_to_the_unit() {
+    local stub_setting
+    for stub_setting in STUB_INVOCATION_ID= STUB_INVOCATION_ID=not-an-id \
+                        STUB_INVOCATION_ID=0123456789abcdef0123456789abcdef; do
+        (
+            load_notify_library
+            stub_notify_journal
+            export "${stub_setting?}" STUB_INVOCATION_LINES= STUB_UNIT_LINES="run: Exiting rc=1"
+            ( main dnf-automatic-reboot.service ) >/dev/null 2>&1
+            assert_contains "$(cat "${STUB_LOG}")" "journalctl -u dnf-automatic-reboot.service" \
+                "${stub_setting}: the unit's last lines"
+            assert_contains "$(cat "${TEST_ROOT_DIR}/var/log/dnf-automatic-reboot.log")" \
+                "dnf-automatic-reboot.service: run: Exiting rc=1" "${stub_setting}: are quoted"
+        ) || fail "${stub_setting} must still quote the unit"
+    done
+    return 0
 }
 
 test_notify_failed_reboot_without_marker_is_not_blocked() {
@@ -3372,11 +3502,11 @@ run_test "cancel: nothing pending is a noop"         test_cancel_with_nothing_pe
 run_test "reboot: pending reboots and records it"   test_reboot_pending_reboots_and_records_it
 run_test "reboot: accepted by logind is not forced"  test_reboot_accepted_by_logind_is_not_forced
 run_test "reboot: unknown shutdown state is not forced" test_reboot_unknown_shutdown_state_is_not_forced
-run_test "reboot: refused releases the dispatch"    test_reboot_refused_releases_the_dispatch
+run_test "reboot: failed releases the dispatch"     test_reboot_failed_releases_the_dispatch
 run_test "reboot: inhibited is retried until the wait ends" test_reboot_inhibited_is_retried_until_the_wait_ends
 run_test "reboot: inhibited proceeds once released" test_reboot_inhibited_proceeds_once_released
 run_test "reboot: can be cancelled while inhibited" test_reboot_can_be_cancelled_while_inhibited
-run_test "reboot: refuses without inhibitor checking" test_reboot_refuses_without_inhibitor_checking
+run_test "reboot: unreadable inhibitors do not reboot" test_reboot_unreadable_inhibitors_do_not_reboot
 run_test "reboot: waits for a cancellation in progress" test_reboot_waits_for_a_cancellation_in_progress
 run_test "lock: created owner-only"                  test_lock_is_created_owner_only
 run_test "lock: permissions corrected in place"      test_lock_permissions_are_corrected_in_place
@@ -3392,6 +3522,7 @@ run_test "request: waiting timer is not scheduled twice" test_request_waiting_ti
 run_test "request: coherent snapshot sees a running service" test_request_coherent_snapshot_sees_a_running_service
 run_test "run: unsynchronised clock does not update" test_run_unsynchronised_clock_does_not_update
 run_test "run: clock wait has a hard deadline"      test_run_clock_wait_has_a_hard_deadline
+run_test "run: unsynchronised clock names chronyc reply" test_run_unsynchronised_clock_names_chronyc_reply
 run_test "run: without chronyc does not update"      test_run_without_chronyc_does_not_update
 run_test "run: clock requirement can be turned off"  test_run_clock_requirement_can_be_turned_off
 run_test "run: refreshes metadata before updating"   test_run_refreshes_metadata_before_updating
@@ -3404,6 +3535,7 @@ run_test "invariant: marker removers are known"     test_invariant_marker_remove
 run_test "invariant: dispatched file removed only on refusal" test_invariant_dispatched_file_is_removed_only_on_refusal
 run_test "invariant: lock file is never removed"    test_invariant_lock_file_is_never_removed
 run_test "invariant: reboots check inhibitors and never force" test_invariant_reboots_check_inhibitors_and_never_force
+run_test "invariant: notifier gets the unit name unescaped" test_invariant_notifier_gets_the_unit_name_unescaped
 run_test "invariant: flock uses documented short options" test_invariant_flock_uses_documented_short_options
 run_test "invariant: state file written only by rename" test_invariant_state_file_written_only_by_rename
 run_test "invariant: probe assigns its library before use" test_invariant_probe_assigns_its_library_before_use
@@ -3412,6 +3544,7 @@ run_test "invariant: versions agree"                test_invariant_versions_agre
 run_test "reader: unit snapshot job forms"          test_reader_unit_snapshot_job_forms
 run_test "reader: scheduled reboot status table"    test_reader_scheduled_reboot_status_table
 run_test "reader: host shutdown state table"        test_reader_host_shutdown_state_table
+run_test "reader: shutdown block state table"       test_reader_shutdown_block_state_table
 run_test "reboot: no dispatched record, no reboot"  test_reboot_without_dispatched_record_does_not_reboot
 run_test "cancel: unstoppable timer still cancels"  test_cancel_with_unstoppable_timer_still_cancels
 run_test "cancel: running service before dispatch cancels" test_cancel_with_running_reboot_service_before_dispatch_cancels
@@ -3423,6 +3556,8 @@ run_test "watchdog: scheduled reboot is not reported as leftover" test_watchdog_
 run_test "notify: failed reboot names blocked updates" test_notify_failed_reboot_names_blocked_updates
 run_test "notify: failed dispatched reboot says reboot" test_notify_failed_dispatched_reboot_says_reboot
 run_test "notify: failed reboot without marker is not blocked" test_notify_failed_reboot_without_marker_is_not_blocked
+run_test "notify: quotes only the failed run"         test_notify_quotes_only_the_failed_run
+run_test "notify: without invocation falls back to the unit" test_notify_without_invocation_falls_back_to_the_unit
 run_test "watchdog: unknown identity is not acted on" test_watchdog_unknown_identity_is_not_acted_on
 run_test "watchdog: dispatch failure fails the watchdog" test_watchdog_dispatch_failure_fails_the_watchdog
 run_test "watchdog: unit has a start timeout"        test_watchdog_unit_has_a_start_timeout

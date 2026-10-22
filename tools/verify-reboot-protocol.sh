@@ -15,7 +15,9 @@
 #
 # It never reboots and never touches the package's markers or lock.  It
 # starts transient units named dnf-automatic-reboot-probe-*, which run
-# /bin/true or sleep, and stops and resets them on exit.  The one fact it
+# /bin/true or sleep, one of them under a block-mode shutdown inhibitor for
+# up to a minute, and one /bin/sh that fails on purpose, and stops and resets
+# them on exit.  The one fact it
 # cannot reach without a shutdown, logind's PreparingForShutdown under a
 # delay inhibitor, is reported as INFO.
 #
@@ -33,6 +35,8 @@ readonly PROBE_QUEUED_UNIT="${PROBE_PREFIX}-queued"
 readonly PROBE_LATE_UNIT="${PROBE_PREFIX}-late"
 readonly PROBE_NOW_UNIT="${PROBE_PREFIX}-now"
 readonly PROBE_ELAPSED_UNIT="${PROBE_PREFIX}-elapsed"
+readonly PROBE_INHIBITOR_UNIT="${PROBE_PREFIX}-inhibitor"
+readonly PROBE_FAILING_UNIT="${PROBE_PREFIX}-failing"
 readonly PROBE_MISSING_UNIT="${PROBE_PREFIX}-does-not-exist.service"
 readonly INSTALLED_LIBRARY=/usr/libexec/dnf-automatic-reboot/reboot-request.sh
 readonly LOCK_FILE=/run/dnf-automatic-reboot.reboot-request.lock
@@ -60,7 +64,8 @@ probe_units() {
     printf '%s\n' "${PROBE_TIMER_UNIT}.timer" "${PROBE_LATE_UNIT}.timer" \
         "${PROBE_TIMER_UNIT}.service" "${PROBE_LATE_UNIT}.service" "${PROBE_QUEUED_UNIT}.service" \
         "${PROBE_BLOCKER_UNIT}.service" "${PROBE_NOW_UNIT}.service" \
-        "${PROBE_ELAPSED_UNIT}.timer" "${PROBE_ELAPSED_UNIT}.service"
+        "${PROBE_ELAPSED_UNIT}.timer" "${PROBE_ELAPSED_UNIT}.service" \
+        "${PROBE_INHIBITOR_UNIT}.service" "${PROBE_FAILING_UNIT}.service"
 }
 
 remove_probe_units() {
@@ -117,12 +122,38 @@ if bash -c 'set -u; empty_options=(); printf "%s" "${empty_options[@]}"' >/dev/n
 else
     report_fail start_reboot_unit "bash ${BASH_VERSION} fails on an empty array under set -u"
 fi
-if systemctl_checks_inhibitors; then
-    report_pass reboot-if-pending.sh "systemctl accepts --check-inhibitors=yes"
-else
-    report_fail reboot-if-pending.sh "systemctl rejects --check-inhibitors=yes; reboot-if-pending.sh refuses every reboot here"
-fi
+# reboot-if-pending.sh reboots only while read_shutdown_block_state is free.
+# The probe holds a block-mode shutdown inhibitor in a transient unit and
+# expects the reader to report it, then releases it.
+shutdown_block_state_before=$(read_shutdown_block_state)
+case "${shutdown_block_state_before}" in
+    free|blocked)
+        report_pass reboot-if-pending.sh "logind BlockInhibited reads as ${shutdown_block_state_before}: $(get_logind_block_inhibited)"
+        ;;
+    *)
+        report_fail reboot-if-pending.sh "logind BlockInhibited unreadable ('$(get_logind_block_inhibited 2>&1 || true)'); reboot-if-pending.sh never reboots here"
+        ;;
+esac
 report_info reboot-if-pending.sh "block inhibitors now: $(systemd-inhibit --list --mode=block --no-pager --no-legend 2>/dev/null | wc -l)"
+report_info reboot-if-pending.sh "login sessions now: $(loginctl list-sessions --no-legend 2>/dev/null | wc -l); they do not hold a reboot"
+if systemd-run --quiet --unit="${PROBE_INHIBITOR_UNIT}" /usr/bin/systemd-inhibit --what=shutdown --mode=block \
+       --who="${PROBE_PREFIX}" --why="reboot protocol probe" /usr/bin/sleep 60 >/dev/null 2>&1; then
+    shutdown_block_state_held=unknown
+    for probe_attempt in 1 2 3 4 5 6 7 8 9 10; do
+        shutdown_block_state_held=$(read_shutdown_block_state)
+        [[ "${shutdown_block_state_held}" == "blocked" ]] && break
+        sleep 0.5
+    done
+    if [[ "${shutdown_block_state_held}" == "blocked" ]]; then
+        report_pass reboot-if-pending.sh "a held block-mode shutdown inhibitor reads as blocked: $(get_logind_block_inhibited)"
+    else
+        report_fail reboot-if-pending.sh "a held block-mode shutdown inhibitor reads as ${shutdown_block_state_held} after ${probe_attempt} reads: $(get_logind_block_inhibited 2>&1 || true)"
+    fi
+    systemctl stop "${PROBE_INHIBITOR_UNIT}.service" >/dev/null 2>&1 || true
+    report_info reboot-if-pending.sh "after release: $(read_shutdown_block_state) (before the probe: ${shutdown_block_state_before})"
+else
+    report_fail reboot-if-pending.sh "could not start ${PROBE_INHIBITOR_UNIT} to hold a shutdown inhibitor"
+fi
 report_info lock "$(flock --version 2>&1 | head -n 1)"
 # The invocations acquire_reboot_request_lock uses, on a scratch file: -n and
 # -w on a free lock succeed; held by another process, -n fails at once and
@@ -249,6 +280,42 @@ else
 fi
 report_info read_host_shutdown_state "not probed: PreparingForShutdown=true under a delay inhibitor needs a real shutdown"
 report_info read_host_shutdown_state "delay inhibitors now: $(systemd-inhibit --list --no-pager 2>/dev/null | awk '$NF == "delay"' | wc -l)"
+
+# ---------------------------------------------------------------------------
+printf '== failure notice journal\n'
+# ---------------------------------------------------------------------------
+# notify-failure.sh quotes a failed run by the unit's InvocationID: its own
+# output carries _SYSTEMD_INVOCATION_ID, systemd's messages about it
+# INVOCATION_ID.  A unit that fails keeps the ID until it starts again.
+if systemd-run --quiet --unit="${PROBE_FAILING_UNIT}" /bin/sh -c 'echo probe-failing-output; exit 3' >/dev/null 2>&1; then
+    for probe_attempt in 1 2 3 4 5 6 7 8 9 10; do
+        systemctl is-failed --quiet "${PROBE_FAILING_UNIT}.service" && break
+        sleep 0.5
+    done
+    sleep 1
+    failing_invocation_id=$(systemctl show --property=InvocationID --value "${PROBE_FAILING_UNIT}.service" 2>/dev/null || true)
+    if [[ "${failing_invocation_id}" =~ ^[0-9a-f]{32}$ ]]; then
+        report_pass notify-failure.sh "a failed unit reports InvocationID ${failing_invocation_id}"
+        failing_run_lines=$(journalctl --no-pager --output=cat \
+                                "_SYSTEMD_INVOCATION_ID=${failing_invocation_id}" + "INVOCATION_ID=${failing_invocation_id}" 2>&1 || true)
+        if grep -qx 'probe-failing-output' <<< "${failing_run_lines}"; then
+            report_pass notify-failure.sh "_SYSTEMD_INVOCATION_ID selects the failed run's output"
+        else
+            report_fail notify-failure.sh "_SYSTEMD_INVOCATION_ID does not select the failed run's output"
+        fi
+        if grep -q 'Failed with result' <<< "${failing_run_lines}"; then
+            report_pass notify-failure.sh "INVOCATION_ID selects systemd's messages about the failed run"
+        else
+            report_fail notify-failure.sh "INVOCATION_ID does not select systemd's 'Failed with result' message"
+        fi
+        report_info notify-failure.sh "lines selected: $(printf '%s\n' "${failing_run_lines}" | grep -c .)"
+    else
+        report_fail notify-failure.sh "a failed unit reports InvocationID '${failing_invocation_id}' after ${probe_attempt} checks; the notice falls back to the unit's last lines"
+    fi
+    systemctl reset-failed "${PROBE_FAILING_UNIT}.service" >/dev/null 2>&1 || true
+else
+    report_fail notify-failure.sh "could not start ${PROBE_FAILING_UNIT}"
+fi
 
 # ---------------------------------------------------------------------------
 printf '== clock synchronisation\n'

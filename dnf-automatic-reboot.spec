@@ -485,6 +485,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   holds when upgrading from 1.4.0 while its watchdog has a reboot scheduled.
 - CHANGE: reboot_delay_sec defaults to 300, giving five minutes between the warning and the
   reboot to cancel it. An edited automatic-reboot.conf keeps its own value.
+- CHANGE: dnf-automatic-reboot.timer runs at 03:00 UTC instead of 03:00 local time, so the run
+  no longer moves with the host's time zone or daylight saving time. An OnCalendar= override
+  keeps its own time. The timer does not start on a host booted from rpm-ostree.
 - NEW: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels a pending reboot and allows
   update runs again; a timer that fires afterwards does not reboot. It exits 1 without
   changing anything while a reboot is being requested or carried out, once systemctl reboot
@@ -510,12 +513,13 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   most clock_sync_wait_sec (new, default 600, enforced with timeout); otherwise it fails. The
   package now requires chrony. The unit's ordering after
   time-sync.target did not require synchronisation to succeed, so a failed chrony-wait.service
-  let updates run with a wrong clock. require_clock_sync = no (new) turns the check off.
+  let updates run with a wrong clock. require_clock_sync = no (new) turns the check off. The
+  failure carries chronyc's last answer, which says whether chronyd answered at all.
 - FIX: The reboot respects shutdown inhibitors. From a service, systemctl reboot skipped the
   inhibitor check, so a package transaction started by hand during reboot_delay_sec could be cut
-  off. A refused reboot is retried every 30 seconds for reboot_inhibited_wait_sec (new, default
-  1800) and can be cancelled meanwhile. The watchdog no longer falls back to
-  systemctl reboot --force.
+  off. While a block inhibitor holds shutdown, the reboot is retried every 30 seconds for
+  reboot_inhibited_wait_sec (new, default 1800) and can be cancelled meanwhile. Logged-in users
+  do not hold it. The watchdog no longer falls back to systemctl reboot --force.
 - FIX: The watchdog no longer removes the state file of a run it did not inspect. run.sh wrote the
   file in place, and a watchdog reading it at that moment found it empty and deleted it as
   malformed; cleanup after a dead run could delete the state of the run that started next. Either
@@ -537,6 +541,10 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   warning no longer claims updates were installed.
 - FIX: A failed scheduled reboot's notice says whether update runs are still held and how to
   release them.
+- FIX: Failure notices name the failed unit as it is: every '-' in the name was printed as '/',
+  dnf/automatic/reboot.service, in the message and in the journalctl command it suggests.
+- FIX: A failure notice quotes only the journal lines of the run that failed; the unit's last
+  lines could reach into the run before.
 - FIX: Every run fetches current repository metadata (dnf makecache --refresh) before
   dnf-automatic starts, within metadata_refresh_timeout_sec (new, default 900).
   dnf-automatic installed from the cache dnf-makecache.timer or metadata_expire had left, so

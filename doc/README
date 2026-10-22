@@ -58,7 +58,8 @@ Files installed
 
   /usr/lib/systemd/system/dnf-automatic-reboot.service
   /usr/lib/systemd/system/dnf-automatic-reboot.timer
-      Main service + daily timer (default: 03:00 +/- 10min random).
+      Main service + timer (default: daily at 03:00 UTC, plus up to
+      10 min random delay).
 
   /usr/lib/systemd/system/dnf-automatic-watchdog.service
   /usr/lib/systemd/system/dnf-automatic-watchdog.timer
@@ -416,10 +417,11 @@ Scheduled reboots
   systemd's state cannot be read.  In the last two cases, reboot the host.
 
   The reboot respects shutdown inhibitors, such as the one a package
-  transaction started by hand holds.  While one refuses it, the reboot is
+  transaction started by hand holds.  While one blocks it, the reboot is
   tried again every 30 seconds for reboot_inhibited_wait_sec (default 1800),
   and can be cancelled in between; systemd-inhibit --list shows what holds
-  it.  The reboot is never forced.
+  it.  The reboot is never forced.  Logged-in users do not hold it: they
+  get the warning reboot_delay_sec ahead, with the cancel command.
 
   If the reboot does not happen, dnf-automatic-reboot-notify@ reports the
   failed dnf-automatic-reboot-scheduled-reboot.service and says whether
