@@ -14,13 +14,22 @@
 # completes before an attempt, and the reboot does not happen, or sees the
 # dispatched file and refuses.
 #
-# systemctl reboot runs with --check-inhibitors=yes: from a service it would
-# otherwise ignore shutdown inhibitors, such as one a package transaction
-# holds.  A reboot it refuses while the host stays up is retried every
+# Before each attempt it reads logind's block inhibitors, and does not call
+# systemctl reboot while one names shutdown, such as the one a package
+# transaction holds.  logind lets root override a block inhibitor, and
+# systemctl run by root outside a terminal checks none, so this check is what
+# keeps a reboot from interrupting a transaction.  systemctl's own
+# --check-inhibitors=yes is not used: it also refuses while any other user
+# has a session.  An inhibitor taken between the check and the call is not
+# honoured; systemctl's check reads logind the same way before it calls it.
+#
+# A reboot that does not start - blocked, inhibitors unreadable, or a failed
+# systemctl reboot while the host stays up - is retried every
 # REBOOT_RETRY_INTERVAL_SEC until INHIBITED_WAIT_SECONDS have passed; between
 # attempts the dispatched file is removed and the lock released, so the
-# reboot can still be cancelled.  It never uses --force.  A refusal is checked
-# against the host's shutdown state first: logind may have accepted it.
+# reboot can still be cancelled.  It never uses --force.  A failed systemctl
+# reboot is checked against the host's shutdown state first: logind may have
+# accepted it.
 #
 # Exit: 0 = reboot submitted, or nothing pending; 1 = the reboot did not
 # happen or its outcome is unknown (OnFailure= reports it).  The dispatched
@@ -71,14 +80,17 @@ blocking_inhibitors() {
     printf '%s' "${inhibitor_lines:-none listed}"
 }
 
+# Why the last attempt that returned 2 did not start the reboot; main names it.
+REBOOT_NOT_STARTED_REASON=""
+
 # attempt_reboot LOCK_WAIT_SECONDS
 # Returns: 0 = the reboot was submitted (the lock stays held until exit), or
 #              no reboot is pending
 #          1 = the reboot did not happen, or its outcome is unknown; logged
-#          2 = refused while the host stays up: dispatched file removed, lock
-#              released, worth another attempt
+#          2 = not started while the host stays up: no dispatched file, lock
+#              released, REBOOT_NOT_STARTED_REASON set, worth another attempt
 attempt_reboot() {
-    local lock_wait_seconds="$1" shutdown_state
+    local lock_wait_seconds="$1" shutdown_block_state shutdown_state
     if ! acquire_reboot_request_lock "${lock_wait_seconds}"; then
         log_error "${REBOOT_REQUEST_LOCK_FILE} not acquired within ${lock_wait_seconds}s - not rebooting; update runs stay held"
         return 1
@@ -86,6 +98,16 @@ attempt_reboot() {
     if [[ ! -e "${REBOOT_PENDING_FILE}" ]]; then
         log "the reboot was cancelled - not rebooting"
         return 0
+    fi
+    shutdown_block_state=$(read_shutdown_block_state)
+    if [[ "${shutdown_block_state}" != "free" ]]; then
+        if [[ "${shutdown_block_state}" == "blocked" ]]; then
+            REBOOT_NOT_STARTED_REASON="a shutdown inhibitor blocks it ($(blocking_inhibitors))"
+        else
+            REBOOT_NOT_STARTED_REASON="logind's shutdown inhibitors cannot be read"
+        fi
+        release_reboot_request_lock
+        return 2
     fi
     if ! : > "${REBOOT_DISPATCHED_FILE}" 2>/dev/null; then
         log_error "cannot create ${REBOOT_DISPATCHED_FILE} - not rebooting; update runs stay held"
@@ -108,6 +130,7 @@ attempt_reboot() {
     esac
     rm -f "${REBOOT_DISPATCHED_FILE}"
     release_reboot_request_lock
+    REBOOT_NOT_STARTED_REASON="systemctl reboot failed while the host stayed up"
     return 2
 }
 
@@ -117,10 +140,6 @@ main() {
     [[ "${inhibited_wait_seconds}" =~ ^[0-9]{1,9}$ ]] || inhibited_wait_seconds=0
     lock_wait_seconds=$(( 10#${lock_wait_seconds} ))
     inhibited_wait_seconds=$(( 10#${inhibited_wait_seconds} ))
-    if ! systemctl_checks_inhibitors; then
-        log_error "systemctl does not accept --check-inhibitors=yes, so a reboot would override shutdown inhibitors - not rebooting; update runs stay held"
-        exit 1
-    fi
     retry_deadline=$(( SECONDS + inhibited_wait_seconds ))
     while true; do
         attempt_result=0
@@ -130,10 +149,10 @@ main() {
             1) exit 1 ;;
         esac
         if (( SECONDS >= retry_deadline )); then
-            log_error "the reboot was refused for ${inhibited_wait_seconds}s while the host stayed up, most likely by a shutdown inhibitor ($(blocking_inhibitors)) - update runs stay held; reboot the host, or allow updates again with: ${CANCEL_REBOOT_COMMAND}"
+            log_error "the reboot did not start within ${inhibited_wait_seconds}s: ${REBOOT_NOT_STARTED_REASON} - update runs stay held; reboot the host, or allow updates again with: ${CANCEL_REBOOT_COMMAND}"
             exit 1
         fi
-        log_warning "the reboot was refused, most likely by a shutdown inhibitor ($(blocking_inhibitors)) - retrying in ${REBOOT_RETRY_INTERVAL_SEC}s"
+        log_warning "the reboot did not start: ${REBOOT_NOT_STARTED_REASON} - retrying in ${REBOOT_RETRY_INTERVAL_SEC}s"
         sleep "${REBOOT_RETRY_INTERVAL_SEC}"
     done
 }

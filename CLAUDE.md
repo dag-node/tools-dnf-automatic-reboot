@@ -362,19 +362,24 @@ unit; a late reboot still happens, because the marker is there. A run killed by 
 mid-request has no trap: when the watchdog then decides no reboot is needed, it fails its
 unit if `.reboot-pending` exists with no reboot waiting or under way.
 
-**Reboot outcomes.** `reboot-if-pending.sh` calls `systemctl reboot --check-inhibitors=yes`.
-Run from a service, outside a terminal, `systemctl` otherwise skips the inhibitor check and
-reboots under a package transaction that holds a block inhibitor. A `systemctl` that rejects
-the option makes the script fail without rebooting. It exits 0 when the reboot is accepted,
-and when no reboot is pending. When the call fails it reads the shutdown state first: `yes`
-(logind accepted, perhaps delaying for an inhibitor) is success and is never requested again;
-`unknown` fails with the dispatched file kept. Only `no` counts as a refusal, most likely by a
-block inhibitor: the script removes the dispatched file, releases the lock, and tries again
-every 30 seconds until `reboot_inhibited_wait_sec` (default 1800) has passed, then fails,
-naming the block inhibitors logind lists. Between attempts the reboot can be cancelled. Nothing
-in the package uses `--force`: the watchdog's kill ends the stuck run's own inhibitor, and any
-other inhibitor belongs to somebody else. Its `OnFailure=` notice says whether update runs are
-still held, and names `cancel-reboot.sh` unless the dispatched file makes cancellation refuse.
+**Reboot outcomes.** Holding the lock, `reboot-if-pending.sh` reads logind's `BlockInhibited`
+before each attempt (`read_shutdown_block_state`): `blocked` while a block-mode inhibitor names
+`shutdown`, as a package transaction's does, `unknown` for any answer not shaped `s "a:b"`.
+Only `free` reaches plain `systemctl reboot`. The check is the package's own: logind lets root
+override a block inhibitor, and `systemctl` run by root outside a terminal checks none.
+`--check-inhibitors=yes` would check too, but it also refuses while any other user has a
+session, so one open SSH login would hold every reboot and, through the marker, every update
+run. An inhibitor taken between the read and the call is not honoured, as with `systemctl`'s
+own check. The script exits 0 when the reboot is accepted, and when no reboot is pending. When
+the call fails it reads the shutdown state first: `yes` (logind accepted, perhaps delaying for
+an inhibitor) is success and is never requested again; `unknown` fails with the dispatched
+file kept; `no` removes it. Blocked, unreadable and `no` release the lock and try again every
+30 seconds until `reboot_inhibited_wait_sec` (default 1800) has passed, then fail, naming the
+reason and the block inhibitors logind lists. Between attempts the reboot can be cancelled.
+Nothing in the package uses `--force`: the watchdog's kill ends the stuck run's own inhibitor,
+and any other inhibitor belongs to somebody else. Its `OnFailure=` notice says whether update
+runs are still held, and names `cancel-reboot.sh` unless the dispatched file makes
+cancellation refuse.
 
 **Reading systemd.** `read_unit_snapshot` reads `LoadState`, `ActiveState`, `SubState` and
 `Job` of one unit from one `systemctl show`, so the values describe one moment; a missing
@@ -416,12 +421,13 @@ library's own readers, with transient probe units that run `/bin/true` or `sleep
 
 - On both hosts `flock -n` and `flock -w` behave as the library expects, free and held, and
   bash expands an empty array under `set -u`.
-- `systemctl` accepts `--check-inhibitors=yes` on both: systemd 252 has it, and RHEL 8.10's
-  239-82.el8_10 carries the backport.
 - `chronyc waitsync` confirms the clock on both, with `rtcsync` set on one and not the other.
 
 `PreparingForShutdown` under a delay inhibitor needs a real shutdown, and is read from the
-systemd 239 and 252 sources only.
+systemd 239 and 252 sources only. So are logind letting root override a block inhibitor and
+`systemctl reboot` by root outside a terminal checking neither inhibitors nor sessions. The
+probe holds a block-mode shutdown inhibitor and checks that `read_shutdown_block_state` reports
+it.
 
 After the kill, the watchdog waits up to `watchdog_kill_confirm_sec` for systemd to report
 the unit `inactive` or `failed`. A failed `systemctl kill`, or a unit still active then,
@@ -952,8 +958,9 @@ tail -f /var/log/dnf-automatic-reboot.log
   check is their sole, more authoritative, source of truth.
 - Do not kill the run by PID — `systemctl kill` the whole unit, or
   `dnf-automatic` survives behind `timeout(1)`.
-- Do not use `systemctl reboot --force`, and do not call `systemctl reboot` without
-  `--check-inhibitors=yes`; reboot only through `reboot-if-pending.sh`.
+- Do not use `systemctl reboot --force`, nor `--check-inhibitors=yes`, which also refuses
+  while another user is logged in. Reboot only through `reboot-if-pending.sh`, after
+  `read_shutdown_block_state` reports `free`.
 - Do not install anything under `/usr/local` from the RPM.
 - Do not edit `/etc/dnf/automatic.conf` from a scriptlet, a script or the docs'
   commands. It belongs to the operator and may predate this package: check it and
