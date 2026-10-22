@@ -40,6 +40,11 @@ Requires:       logrotate
 # (require_clock_sync = yes by default).  Installed is not running: the
 # runtime check stays.
 Requires:       chrony
+# rpm's systemd_inhibit plugin holds a block-mode shutdown inhibitor for every
+# rpm transaction, a `dnf upgrade` started by hand included; the scheduled
+# reboot waits while one is held.  Without it, that reboot can stop such a
+# transaction halfway.
+Requires:       rpm-plugin-systemd-inhibit
 
 # We install systemd unit files
 BuildRequires:  systemd-rpm-macros
@@ -184,7 +189,7 @@ fi
 # The packages every decision depends on.  Requires: covers a normal install;
 # this catches `rpm -i --nodeps`, which would otherwise leave the build-id or
 # GRUB check silently disabled at runtime.
-for required_package in dnf-automatic yum-utils elfutils grubby chrony; do
+for required_package in dnf-automatic yum-utils elfutils grubby chrony rpm-plugin-systemd-inhibit; do
     if ! rpm -q "${required_package}" >/dev/null 2>&1; then
         echo "ERROR: ${required_package} is not installed." >&2
         echo "       Install it first:  dnf install ${required_package}" >&2
@@ -484,6 +489,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   watchdog_transaction_stall_min (new, default 180), so a long silent scriptlet is not killed,
   and tells logged-in users once that the run is still going. An edited automatic-reboot.conf
   keeps its own values; set dnf_timeout_min = 0 there.
+- CHANGE: The package requires rpm-plugin-systemd-inhibit. With it, an rpm transaction started
+  by hand holds the scheduled reboot until it ends, instead of being stopped halfway.
 - NEW: run.sh warns at every start when watchdog_stall_min = 0 and a non-zero dnf_timeout_min
   reaches past watchdog_hard_timeout_min, since the watchdog would then kill a long update first.
 - NEW: When the watchdog stops a run whose rpm transaction may be incomplete, its message names

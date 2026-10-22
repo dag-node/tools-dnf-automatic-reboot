@@ -887,6 +887,11 @@ compares ELF notes and does not read the clock, so skew does not affect it.
 - `Requires: chrony` — `run.sh` runs `chronyc waitsync` before every update; `%pre` checks
   it too, for `--nodeps`. Installed does not mean running or synchronised, so the runtime
   check stays.
+- `Requires: rpm-plugin-systemd-inhibit` — rpm's plugin holds a block-mode shutdown inhibitor
+  for every transaction, one started by hand included, and `reboot-if-pending.sh` waits while
+  one is held. dnf 4 takes none of its own. `%pre` checks it for `--nodeps`. On both surveyed
+  hosts it is installed and loaded (`%{__transaction_systemd_inhibit}`), from AppStream on
+  OL 9.8 and BaseOS on RHEL 8.10.
 - `Requires: systemd >= 239` — EL8's systemd. Every unit directive and systemctl
   option the package uses exists there; the one renamed option is chosen at runtime
   (see the state file section).

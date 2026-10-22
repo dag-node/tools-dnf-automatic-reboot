@@ -313,6 +313,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+printf '== rpm systemd_inhibit plugin\n'
+# ---------------------------------------------------------------------------
+# Requires: rpm-plugin-systemd-inhibit.  The scheduled reboot waits while a
+# block inhibitor is held; with the plugin, every rpm transaction holds one.
+report_info spec "$(rpm -q rpm-plugin-systemd-inhibit 2>&1)"
+timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C repoquery --qf '%{name}-%{evr}.%{arch} %{repoid}' rpm-plugin-systemd-inhibit 2>&1 \
+    | report_lines spec "available" || true
+if rpm -q rpm-plugin-systemd-inhibit >/dev/null 2>&1 \
+   || [[ -n "$(timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C repoquery rpm-plugin-systemd-inhibit 2>/dev/null)" ]]; then
+    report_pass spec "rpm-plugin-systemd-inhibit is installed or available; Requires: can be met"
+else
+    report_fail spec "rpm-plugin-systemd-inhibit is neither installed nor available from an enabled repository"
+fi
+report_info reboot-if-pending.sh "rpm --eval %{__transaction_systemd_inhibit}: $(rpm --eval '%{?__transaction_systemd_inhibit}' 2>&1)"
+
+# ---------------------------------------------------------------------------
 printf '== boot loader\n'
 # ---------------------------------------------------------------------------
 if [[ -d /sys/firmware/efi ]]; then

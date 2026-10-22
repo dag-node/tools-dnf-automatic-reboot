@@ -3719,13 +3719,15 @@ test_preflight_accepts_operator_automatic_conf() {
 test_preflight_refuses_missing_dependencies() {
     make_preflight_host
     # --nodeps without elfutils would disable the build-id check at runtime.
-    export STUB_MISSING_PACKAGES="dnf-automatic elfutils chrony"
+    export STUB_MISSING_PACKAGES="dnf-automatic elfutils chrony rpm-plugin-systemd-inhibit"
     local output exit_code=0
     output=$(run_preflight 1) || exit_code=$?
     assert_exit_code 1 "${exit_code}" "--nodeps install refused"
     assert_contains "${output}" "dnf install dnf-automatic" "names each missing package"
     assert_contains "${output}" "dnf install elfutils" "names each missing package"
     assert_contains "${output}" "dnf install chrony" "the clock check needs chronyc"
+    assert_contains "${output}" "dnf install rpm-plugin-systemd-inhibit" \
+        "without it the scheduled reboot does not wait for a transaction started by hand"
     assert_not_contains "${output}" "dnf install grubby" "installed packages not reported"
 }
 
