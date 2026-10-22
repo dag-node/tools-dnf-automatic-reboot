@@ -22,6 +22,9 @@
 #   start_uptime=  seconds since boot; the watchdog times the run from this
 #                  because a host with no RTC steps its wall clock mid-run
 #   pid=           PID of this script
+#   dnf_log_inode= dnf.log's inode and size before dnf-automatic started,
+#   dnf_log_offset= or "none" and 0; the watchdog reads the run's dnf phase
+#                  from the lines after them
 #
 # Sourcing this file defines its functions without running the update, so
 # tests/run-tests.sh can exercise them directly.
@@ -49,6 +52,9 @@ readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
 readonly DNF_BIN="${TEST_ROOT}/usr/bin/dnf"
 readonly DNF_AUTOMATIC_BIN="${TEST_ROOT}/usr/bin/dnf-automatic"
+# Its position before dnf-automatic starts goes into the state file: the
+# watchdog reads the run's transaction phase from the lines after it.
+readonly DNF_LOG_FILE="${TEST_ROOT}/var/log/dnf.log"
 # shellcheck disable=SC2034  # read by reboot-request.sh
 readonly SYSTEMD_RUN_BIN="${TEST_ROOT}/usr/bin/systemd-run"
 readonly SYSTEMCTL_BIN="${TEST_ROOT}/usr/bin/systemctl"
@@ -259,6 +265,10 @@ SERVICE_RESTART_SUMMARY="stale services not checked"
 SCHEDULED_REBOOT_SUMMARY=""
 # The state file content this run last published; empty before the first.
 PUBLISHED_RUN_STATE=""
+# dnf.log's inode and size before dnf-automatic started; "none" and 0 when it
+# did not exist.  Set by record_dnf_log_position.
+DNF_LOG_INODE="none"
+DNF_LOG_OFFSET=0
 # What dnf-automatic installed, for the completion line; set once it returns.
 UPDATE_SUMMARY="update result unknown"
 # Empty after a successful or disabled metadata refresh; otherwise the
@@ -289,10 +299,27 @@ cleanup() {
 # Returns 1 when it could not, and the previous file stays.
 write_state() {
     local run_phase="$1" state_content
-    state_content=$(printf 'phase=%s\nstart=%s\nstart_uptime=%s\npid=%s\n' \
-        "${run_phase}" "${START_TIMESTAMP}" "${START_UPTIME_SECONDS}" "${SERVICE_PID}")
+    state_content=$(printf 'phase=%s\nstart=%s\nstart_uptime=%s\npid=%s\ndnf_log_inode=%s\ndnf_log_offset=%s\n' \
+        "${run_phase}" "${START_TIMESTAMP}" "${START_UPTIME_SECONDS}" "${SERVICE_PID}" \
+        "${DNF_LOG_INODE}" "${DNF_LOG_OFFSET}")
     write_run_state "${state_content}" || return 1
     PUBLISHED_RUN_STATE="${state_content}"
+}
+
+# record_dnf_log_position - sets DNF_LOG_INODE and DNF_LOG_OFFSET from
+# dnf.log as it is now, so the watchdog reads only what this run's
+# dnf-automatic writes.  A log that does not exist yet is "none" at 0, which
+# the watchdog reads as an unknown phase.
+record_dnf_log_position() {
+    local inode_and_size=""
+    inode_and_size=$(stat -c '%i %s' "${DNF_LOG_FILE}" 2>/dev/null) || inode_and_size=""
+    if [[ "${inode_and_size}" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then
+        DNF_LOG_INODE="${BASH_REMATCH[1]}"
+        DNF_LOG_OFFSET="${BASH_REMATCH[2]}"
+    else
+        DNF_LOG_INODE="none"
+        DNF_LOG_OFFSET=0
+    fi
 }
 
 # uptime_seconds -> whole seconds since boot, empty when unreadable.
@@ -714,6 +741,7 @@ main() {
     refresh_repository_metadata \
         || METADATA_REFRESH_FAILURE_SUMMARY=" (metadata refresh failed, cached metadata used)"
 
+    record_dnf_log_position
     if ! write_state "updating"; then
         log_error "cannot publish ${STATE_FILE} - the watchdog could not supervise this run, not updating"
         exit 1

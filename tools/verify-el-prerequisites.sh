@@ -269,6 +269,50 @@ timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C check-update --security >/dev/null 2>
 report_info run.sh "dnf -q -C check-update --security exited ${check_update_exit_code} (0 none, 100 available)"
 
 # ---------------------------------------------------------------------------
+printf '== dnf.log phase lines\n'
+# ---------------------------------------------------------------------------
+# watchdog.sh dnf_run_phase reads these whole messages from dnf.log, each as
+# "<timestamp> INFO <message>".  It stops a stalled run early only once it has
+# recognised dnf-automatic's start line and no "Running transaction".
+dnf_base_file=$(first_file /usr/lib/python3*/site-packages/dnf/base.py)
+dnf_logging_file=$(first_file /usr/lib/python3*/site-packages/dnf/logging.py)
+dnf_const_file=$(first_file /usr/lib/python3*/site-packages/dnf/const.py)
+for dnf_phase_message in 'Running transaction check' 'Transaction check succeeded.' \
+                         'Running transaction test' 'Transaction test succeeded.' 'Running transaction'; do
+    if grep -qF "logger.info(_('${dnf_phase_message}'))" "${dnf_base_file:-/dev/null}" 2>/dev/null; then
+        report_pass watchdog.sh "base.py logs '${dnf_phase_message}' at INFO"
+    else
+        report_fail watchdog.sh "base.py does not log '${dnf_phase_message}' at INFO; dnf_run_phase never sees it"
+    fi
+done
+if grep -qF "LOG_MARKER='--- logging initialized ---'" "${dnf_const_file:-/dev/null}" 2>/dev/null; then
+    report_pass watchdog.sh "const.py LOG_MARKER is '--- logging initialized ---'"
+else
+    report_fail watchdog.sh "no LOG_MARKER '--- logging initialized ---' in const.py; every run reads as phase unknown"
+fi
+if grep -qF '"%(asctime)s %(levelname)s %(message)s"' "${dnf_logging_file:-/dev/null}" 2>/dev/null; then
+    report_pass watchdog.sh "dnf.log lines are '<asctime> <levelname> <message>'"
+else
+    report_fail watchdog.sh "dnf.log format differs from '<asctime> <levelname> <message>'; every run reads as phase unknown"
+fi
+dnf_main_config=$(timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C config-manager --dump 2>/dev/null) || true
+grep -E '^(logdir|log_size|log_rotate|log_compress|logfilelevel) = ' <<< "${dnf_main_config}" \
+    | report_lines watchdog.sh "dnf.conf" || true
+# The lines the parser recognises in the log as it is now: how many of each,
+# and the last ones with their timestamps.
+if [[ -r /var/log/dnf.log ]]; then
+    for dnf_phase_message in '--- logging initialized ---' 'Running transaction check' 'Transaction check succeeded.' \
+                             'Running transaction test' 'Transaction test succeeded.' 'Running transaction'; do
+        report_info watchdog.sh "dnf.log lines '<time> INFO ${dnf_phase_message}': $(awk -v message="${dnf_phase_message}" \
+            '{ line = $0 } sub(/^[^ ]+ INFO /, "", line) && line == message { count++ } END { print count + 0 }' /var/log/dnf.log)"
+    done
+    grep -nE '^[^ ]+ INFO (Running transaction( check| test)?|Transaction (check|test) succeeded\.)$' /var/log/dnf.log \
+        | tail -n 10 | report_lines watchdog.sh "dnf.log" || true
+else
+    report_fail watchdog.sh "/var/log/dnf.log is not readable"
+fi
+
+# ---------------------------------------------------------------------------
 printf '== boot loader\n'
 # ---------------------------------------------------------------------------
 if [[ -d /sys/firmware/efi ]]; then

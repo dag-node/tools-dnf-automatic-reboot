@@ -476,13 +476,18 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   keeps its own time. The timer does not start on a host booted from rpm-ostree.
 - CHANGE: An update is not stopped while dnf is still working, so a download over a slow link
   or an upgrade to the next minor EL release on a slow host is not cut off halfway.
-  dnf_timeout_min defaults to 0, no deadline (was 60). Past watchdog_hard_timeout_min (now 320,
-  was 180) the watchdog stops an updating run only once nothing in /var/cache/dnf or dnf's logs
-  has changed for watchdog_stall_min (new, default 60), and tells logged-in users once that the
-  run is still going. An edited automatic-reboot.conf keeps its own values; set
-  dnf_timeout_min = 0 there.
+  dnf_timeout_min defaults to 0, no deadline (was 60). The watchdog reads from dnf.log whether
+  rpm's transaction has started. Before it has, a run in which nothing in /var/cache/dnf or dnf's
+  logs changed for watchdog_stall_min (new, default 60) is stopped at any age; nothing was
+  installed, and the next run retries. Once it has, the watchdog waits past
+  watchdog_hard_timeout_min (now 320, was 180) until nothing has changed for
+  watchdog_transaction_stall_min (new, default 180), so a long silent scriptlet is not killed,
+  and tells logged-in users once that the run is still going. An edited automatic-reboot.conf
+  keeps its own values; set dnf_timeout_min = 0 there.
 - NEW: run.sh warns at every start when watchdog_stall_min = 0 and a non-zero dnf_timeout_min
   reaches past watchdog_hard_timeout_min, since the watchdog would then kill a long update first.
+- NEW: When the watchdog stops a run whose rpm transaction may be incomplete, its message names
+  the commands that show what to repair: dnf history info last; dnf check.
 - FIX: A scheduled reboot goes ahead while users are logged in. systemctl reboot
   --check-inhibitors=yes also refused while any other user had a session, so one open SSH login
   failed the reboot after reboot_inhibited_wait_sec and held update runs until a manual reboot

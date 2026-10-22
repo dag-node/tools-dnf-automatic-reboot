@@ -273,6 +273,8 @@ phase=updating|checking
 start=<unix timestamp>
 start_uptime=<whole seconds of /proc/uptime>
 pid=<PID of run.sh>
+dnf_log_inode=<inode of /var/log/dnf.log before dnf-automatic, or none>
+dnf_log_offset=<its size then, or 0>
 ```
 
 The watchdog measures elapsed time from `start_uptime` (`CLOCK_BOOTTIME`);
@@ -441,10 +443,11 @@ number may belong to another process.
 
 Watchdog decisions by phase:
 
-| Phase | Soft timeout + dnf idle | Hard timeout |
-|-------|------------------------|--------------|
-| `updating` | Leave for hard timeout (unknown completion) | Once dnf has changed nothing for `watchdog_stall_min`: kill cgroup + alert; reboot only if `force_reboot_on_hard_timeout=yes` |
-| `checking` | Run independent needs-reboot check, kill cgroup | Kill cgroup + reboot (dnf already returned cleanly) |
+| Phase | dnf phase | Stall, any age | Soft timeout + dnf idle | Hard timeout |
+|-------|-----------|----------------|------------------------|--------------|
+| `updating` | `download`, `checked` | No change for `watchdog_stall_min`: kill cgroup + alert, never reboot | Leave | Same stall rule |
+| `updating` | `transaction`, `unknown` | Leave | Leave for hard timeout (unknown completion) | Once dnf has changed nothing for `watchdog_transaction_stall_min`: kill cgroup + alert naming `dnf history info last; dnf check`; reboot only if `force_reboot_on_hard_timeout=yes` |
+| `checking` | not read | Leave | Run independent needs-reboot check, kill cgroup | Kill cgroup + reboot (dnf already returned cleanly) |
 
 The independent check can hang like the one it replaces, so it runs under `timeout`
 at three times `needs_restarting_timeout_sec` and counts as undecidable (code 2) when
@@ -468,15 +471,40 @@ take days, and an upgrade to the next minor EL release on a Raspberry Pi takes h
 updating run records dnf's progress signature in `/run/dnf-automatic-reboot.progress`: the
 number and total size of the files under `/var/cache/dnf` and the sizes of `dnf.rpm.log`,
 `dnf.librepo.log` and `dnf.log`. One package can take hours with no log line, so the cache bytes
-are the download signal; rpm's log is the transaction's. Past `watchdog_hard_timeout_min`
-(default 320) the watchdog kills an updating run only once the signature has not changed for
-`watchdog_stall_min` (default 60), and announces the slow run once. Any change counts, a
-shrinking cache included. The record carries the run's `pid` and `start_uptime`; a cycle that
-finds another run's record, or none, counts as progress now. A record that cannot be written
-kills nothing and fails the watchdog. `watchdog_stall_min = 0` kills at the hard timeout as
-before, and `run.sh` then warns when a non-zero `dnf_timeout_min` reaches past it. dnf's own
-`minrate`, `timeout` and `retries` are left alone. Whether a download grows its cache file
-while bytes arrive, rather than appearing whole at the end, needs a host reading.
+are the download signal; rpm's log is the transaction's. Any change counts, a shrinking cache
+included. The record carries the run's `pid` and `start_uptime`; a cycle that finds another
+run's record, or none, counts as progress now. A record that cannot be written kills nothing and
+fails the watchdog. dnf's own `minrate`, `timeout` and `retries` are left alone. Whether a
+download grows its cache file while bytes arrive, rather than appearing whole at the end, needs
+a host reading.
+
+How long a stall is tolerated depends on whether rpm has started changing the system, which
+`dnf_run_phase` reads from the run's part of `dnf.log`. dnf 4 writes each line as
+`<timestamp> <LEVEL> <message>`; its logging setup writes `--- logging initialized ---` at
+start, and `base.py` writes, at `INFO`, `Running transaction check`, `Transaction check
+succeeded.`, `Running transaction test`, `Transaction test succeeded.` and, right before rpm's
+transaction, `Running transaction`. Only those whole messages count (allowlist). `run.sh` records
+the log's inode and size in the state file before dnf-automatic starts; the watchdog reads from
+there, through one rotation to `dnf.log.1`. A run whose start line the parser has not
+recognised is `unknown`, as is a log it cannot follow (no position, a second rotation,
+`log_compress`): a log format other than the expected one never reads as "before the
+transaction". Another dnf command during the run can only add a `Running transaction`, which
+is the cautious direction.
+
+- `download` or `checked`: nothing installed. A stall of `watchdog_stall_min` (default 60) is
+  killed at any age; the next run finds the downloads in the cache.
+- `transaction` or `unknown`: a scriptlet rebuilding SELinux policy or an initramfs can run
+  long without a log line. Past `watchdog_hard_timeout_min` (default 320) the run is killed once
+  the signature has not changed for `watchdog_transaction_stall_min` (default 180); the slow run
+  is announced once.
+
+`watchdog_stall_min = 0` turns the stall check off: an updating run is killed at the hard
+timeout whatever dnf does, and `run.sh` then warns when a non-zero `dnf_timeout_min` reaches past
+it. `watchdog_transaction_stall_min = 0` does the same once the
+transaction may have started. `tools/verify-el-prerequisites.sh` checks the messages, the line
+format and the log settings. On the surveyed OL 9.8 (dnf 4.14) and RHEL 8.10 (dnf 4.7) hosts it
+found all six messages in the source and in `dnf.log` as `<timestamp> INFO <message>`, in this
+order for every transaction, with `log_size` 1 MB, `log_rotate` 4 and `log_compress` off.
 
 320 stays below the six hours between runs of a four-a-day timer. A timer elapse during a run
 requests a start of an activating oneshot, which joins the running start job: that elapse is
@@ -484,7 +512,7 @@ skipped, never overlapped. This is systemd's job model; the probe checks it.
 
 At hard timeout in `phase=updating` an rpm transaction may be half-applied. That is
 the same uncertainty for which the dead-PID path already refuses to reboot, so the
-default is to kill and alert. The reboot never uses `--force`, which remounts filesystems
+default is to kill and alert, naming `dnf history info last; dnf check`. The reboot never uses `--force`, which remounts filesystems
 read-only under running processes, risks the rootfs on a flash-backed host, and overrides
 other users' inhibitors.
 

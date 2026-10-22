@@ -6,7 +6,7 @@
 # Runs every 5 minutes via dnf-automatic-watchdog.timer, completely
 # independent of the main run.sh service unit.
 #
-# Handles four scenarios:
+# Handles five scenarios:
 #
 #  1. No state file     - Nothing is running; exit immediately.
 #
@@ -14,17 +14,24 @@
 #                         Clean up lock files, emit a wall warning.
 #                         Do NOT reboot: updates may be partial.
 #
-#  3. PID alive, hard   - run.sh has been running longer than
+#  3. PID alive, dnf    - In phase=updating, before dnf.log shows the rpm
+#     stalled before      transaction starting, nothing has changed on the
+#     its transaction     host: once dnf's cache and logs stay unchanged for
+#                         watchdog_stall_min, kill the service cgroup at any
+#                         age.  Never reboot.
+#
+#  4. PID alive, hard   - run.sh has been running longer than
 #     timeout exceeded    watchdog_hard_timeout_min.  In phase=updating,
 #                         wait while dnf's cache or logs still change,
-#                         until nothing has for watchdog_stall_min, then
-#                         kill the service cgroup; in phase=checking kill
-#                         at once.  Reboot only when the
-#                         recorded phase proves dnf already returned
-#                         cleanly, or when force_reboot_on_hard_timeout
-#                         says otherwise.
+#                         until nothing has for watchdog_stall_min, or for
+#                         watchdog_transaction_stall_min once the rpm
+#                         transaction has started, then kill the service
+#                         cgroup; in phase=checking kill at once.  Reboot
+#                         only when the recorded phase proves dnf already
+#                         returned cleanly, or when
+#                         force_reboot_on_hard_timeout says otherwise.
 #
-#  4. PID alive, soft   - Past watchdog_soft_timeout_min.  If dnf is no
+#  5. PID alive, soft   - Past watchdog_soft_timeout_min.  If dnf is no
 #     timeout exceeded    longer active AND phase=checking, run an
 #                         independent needs-reboot check and act on it.
 #                         If dnf is still active, leave it to the hard
@@ -66,9 +73,15 @@ readonly DNF_CACHE_DIRECTORY="${TEST_ROOT}/var/cache/dnf"
 readonly DNF_RPM_LOG_FILE="${TEST_ROOT}/var/log/dnf.rpm.log"
 readonly DNF_LIBREPO_LOG_FILE="${TEST_ROOT}/var/log/dnf.librepo.log"
 readonly DNF_LOG_FILE="${TEST_ROOT}/var/log/dnf.log"
+# dnf renames dnf.log to this at log_size (1 MB by default).
+readonly DNF_ROTATED_LOG_FILE="${DNF_LOG_FILE}.1"
 # The last dnf progress seen for the supervised run; written by the watchdog
 # only, replaced when a different run is supervised, emptied by a reboot.
 readonly PROGRESS_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.progress"
+# What an operator runs after a kill that may have cut an rpm transaction
+# short: the interrupted transaction, and the duplicate or broken packages it
+# left.
+readonly INTERRUPTED_TRANSACTION_CHECK="Check: dnf history info last; dnf check"
 
 # REBOOT_PENDING_FILE, the request lock, and request_reboot.
 # shellcheck source=/dev/null
@@ -136,6 +149,7 @@ get_config_integer() {
 SOFT_TIMEOUT_MIN=$(get_config_integer watchdog_soft_timeout_min 60)
 HARD_TIMEOUT_MIN=$(get_config_integer watchdog_hard_timeout_min 320)
 STALL_MIN=$(get_config_integer watchdog_stall_min 60)
+TRANSACTION_STALL_MIN=$(get_config_integer watchdog_transaction_stall_min 180)
 REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300 1 86400)
 FORCE_REBOOT_ON_HARD_TIMEOUT=$(get_config_value force_reboot_on_hard_timeout no)
 KILL_CONFIRM_SEC=$(get_config_integer watchdog_kill_confirm_sec 30)
@@ -216,15 +230,85 @@ update_dnf_progress_record() {
     DNF_SLOW_RUN_ANNOUNCED="${announced}"
 }
 
-# announce_slow_run RUN_IDENTITY - tells logged-in users once per run that it
-# has passed the hard timeout and is left running while dnf makes progress.
+# announce_slow_run RUN_IDENTITY STALL_WINDOW_MIN - tells logged-in users once
+# per run that it has passed the hard timeout and is left running while dnf
+# makes progress.
 announce_slow_run() {
-    local run_identity="$1" changed_uptime_seconds=""
+    local run_identity="$1" stall_window_min="$2" changed_uptime_seconds=""
     wall_msg "dnf-automatic-reboot: the update has run past ${HARD_TIMEOUT_MIN}min and dnf is still working." \
-             "It is stopped only once dnf changes nothing for ${STALL_MIN}min. Do not reboot meanwhile."
+             "It is stopped only once dnf changes nothing for ${stall_window_min}min. Do not reboot meanwhile."
     changed_uptime_seconds=$(sed -n 's/^changed_uptime=//p' "${PROGRESS_FILE}" 2>/dev/null) || changed_uptime_seconds=""
     write_dnf_progress_record "${run_identity}" "${DNF_PROGRESS_SIGNATURE}" "${changed_uptime_seconds}" yes \
         || log_warning "cannot record the announcement in ${PROGRESS_FILE} - it may be repeated"
+}
+
+# ---------------------------------------------------------------------------
+# dnf's phase within the run, read from dnf.log.  dnf 4's logging setup
+# writes "--- logging initialized ---" when dnf-automatic starts; base.py
+# writes "Running transaction check", "Transaction check succeeded.",
+# "Running transaction test" and "Transaction test succeeded." while rpm only
+# checks, and "Running transaction" right before rpm starts changing the
+# system.  Each is one line "<timestamp> INFO <message>".  Only those whole
+# messages count; every other line is ignored.
+#
+# run.sh records dnf.log's inode and size before dnf-automatic starts, so
+# lines from earlier dnf commands do not count.  Other dnf commands during the
+# run add lines too, but rpm's lock keeps their transactions out of the run's,
+# and a "Running transaction" of theirs only makes the phase more cautious.
+# ---------------------------------------------------------------------------
+
+# read_run_dnf_log INODE OFFSET -> what the dnf.log with INODE gained after
+# OFFSET, followed across one rotation.  Returns 1 when that cannot be read:
+# no recorded position, the file gone (a second rotation, or log_compress),
+# or shorter than OFFSET.
+read_run_dnf_log() {
+    local recorded_inode="$1" recorded_offset="$2" inode_and_size
+    [[ "${recorded_inode}" =~ ^[0-9]+$ && "${recorded_offset}" =~ ^[0-9]+$ ]] || return 1
+    inode_and_size=$(stat -c '%i %s' "${DNF_LOG_FILE}" 2>/dev/null) || return 1
+    if [[ "${inode_and_size%% *}" == "${recorded_inode}" ]]; then
+        (( ${inode_and_size##* } >= recorded_offset )) || return 1
+        tail -c "+$(( recorded_offset + 1 ))" "${DNF_LOG_FILE}"
+        return
+    fi
+    inode_and_size=$(stat -c '%i %s' "${DNF_ROTATED_LOG_FILE}" 2>/dev/null) || return 1
+    [[ "${inode_and_size%% *}" == "${recorded_inode}" ]] || return 1
+    (( ${inode_and_size##* } >= recorded_offset )) || return 1
+    tail -c "+$(( recorded_offset + 1 ))" "${DNF_ROTATED_LOG_FILE}"
+    cat "${DNF_LOG_FILE}"
+}
+
+# dnf_run_phase INODE OFFSET -> one of
+#   download     dnf-automatic started, no transaction check yet
+#   checked      rpm checked the transaction, has not started it
+#   transaction  rpm's transaction has started
+#   unknown      the log cannot be read, or shows no start of dnf-automatic
+#                in a format this parser knows
+# Only download and checked prove nothing has been installed; unknown is
+# handled as transaction.
+dnf_run_phase() {
+    local run_phase_found=""
+    run_phase_found=$(read_run_dnf_log "$1" "$2" | awk '
+        {
+            message = $0
+            if (sub(/^[^ ]+ INFO /, "", message) == 0) next
+            if (message == "--- logging initialized ---") started = 1
+            else if (message == "Running transaction") transaction = 1
+            else if (message == "Running transaction check" || message == "Transaction check succeeded." \
+                     || message == "Running transaction test" || message == "Transaction test succeeded.") checked = 1
+        }
+        END {
+            if (transaction) print "transaction"
+            else if (!started) print "unknown"
+            else if (checked) print "checked"
+            else print "download"
+        }') || run_phase_found="unknown"
+    printf '%s' "${run_phase_found:-unknown}"
+}
+
+# dnf_phase_is_before_transaction PHASE - 0 when PHASE proves rpm has not
+# started changing the system.
+dnf_phase_is_before_transaction() {
+    [[ "$1" == "download" || "$1" == "checked" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -533,20 +617,47 @@ main() {
         exit 0
     fi
 
-    # Every cycle of an updating run records dnf's progress, so the history is
-    # there when the hard timeout comes.
+    # Every cycle of an updating run records dnf's progress and phase, so the
+    # history is there when a stall or the hard timeout comes.
     dnf_progress_recorded=no
+    dnf_phase=""
     if [[ "${run_phase}" == "updating" ]]; then
+        dnf_phase=$(dnf_run_phase "$(run_state_field "${state_snapshot}" dnf_log_inode)" \
+                                  "$(run_state_field "${state_snapshot}" dnf_log_offset)")
         if update_dnf_progress_record "${service_pid} ${start_uptime_seconds}" "${current_uptime_seconds}"; then
             dnf_progress_recorded=yes
-            log "dnf progress: ${DNF_PROGRESS_SIGNATURE} (unchanged for ${DNF_STALLED_MINUTES}min)"
+            log "dnf progress: ${DNF_PROGRESS_SIGNATURE} (unchanged for ${DNF_STALLED_MINUTES}min), dnf phase: ${dnf_phase}"
         else
-            log_warning "cannot write ${PROGRESS_FILE} - dnf progress not recorded this cycle"
+            log_warning "cannot write ${PROGRESS_FILE} - dnf progress not recorded this cycle (dnf phase: ${dnf_phase})"
         fi
     fi
 
     # ---------------------------------------------------------------------------
-    # Scenario 3: hard timeout - PID still alive after HARD_TIMEOUT_MIN
+    # Scenario 3: dnf stalled before its rpm transaction
+    #
+    # Until dnf.log shows "Running transaction", rpm has changed nothing: the
+    # run downloads, or checks what it downloaded.  Killing it costs a retry
+    # at the next run, which finds the downloads in the cache, so a stall of
+    # STALL_MIN is stopped whatever the run's age.  Nothing is rebooted:
+    # nothing was installed.
+    # ---------------------------------------------------------------------------
+    if [[ "${run_phase}" == "updating" && "${STALL_MIN}" -gt 0 && "${dnf_progress_recorded}" == "yes" ]] \
+       && dnf_phase_is_before_transaction "${dnf_phase}" \
+       && [[ "${DNF_STALLED_MINUTES}" -ge "${STALL_MIN}" ]]; then
+        log_error "dnf changed nothing in its cache or logs for ${DNF_STALLED_MINUTES}min and has not started its rpm transaction (dnf phase: ${dnf_phase}) - stopping the run; nothing was installed"
+        begin_recovery
+        kill_result=0
+        kill_service_cgroup "${state_snapshot}" "${service_pid}" || kill_result=$?
+        [[ "${kill_result}" -eq 1 ]] && exit 0
+        [[ "${kill_result}" -eq 0 ]] || exit 1
+        remove_inspected_run_state "${state_snapshot}"
+        wall_msg "dnf-automatic-reboot: the update made no progress for ${DNF_STALLED_MINUTES}min before installing anything and was stopped." \
+                 "Nothing was installed; the next run tries again."
+        exit 0
+    fi
+
+    # ---------------------------------------------------------------------------
+    # Scenario 4: hard timeout - PID still alive after HARD_TIMEOUT_MIN
     #
     # phase=checking means dnf-automatic already returned cleanly, so the rpm
     # transaction is complete and rebooting is safe.  phase=updating means it did
@@ -554,25 +665,36 @@ main() {
     # which scenario 2 already refuses to reboot.  Rebooting there is opt-in.
     #
     # In phase=updating the run is killed only once dnf has stopped: nothing in
-    # its cache or logs changed for STALL_MIN.  A download on a slow link, or a
-    # long transaction, is left to finish.  A stall that cannot be confirmed,
-    # because the progress record cannot be written, kills nothing and fails
-    # the unit so OnFailure= reports it.  STALL_MIN 0 kills at the hard timeout.
+    # its cache or logs changed for STALL_MIN before the rpm transaction, or for
+    # TRANSACTION_STALL_MIN once it may have started - a scriptlet rebuilding
+    # SELinux policy or an initramfs writes no log line for a long time.  A
+    # download on a slow link, or a long transaction, is left to finish.  A
+    # stall that cannot be confirmed, because the progress record cannot be
+    # written, kills nothing and fails the unit so OnFailure= reports it.
+    # STALL_MIN 0 kills at the hard timeout, and so does TRANSACTION_STALL_MIN
+    # 0 once the transaction may have started.
     # ---------------------------------------------------------------------------
     if [[ "${elapsed_min}" -ge "${HARD_TIMEOUT_MIN}" ]]; then
+        stall_window_min=0
         if [[ "${run_phase}" == "updating" && "${STALL_MIN}" -gt 0 ]]; then
+            stall_window_min="${TRANSACTION_STALL_MIN}"
+            if dnf_phase_is_before_transaction "${dnf_phase}"; then
+                stall_window_min="${STALL_MIN}"
+            fi
+        fi
+        if [[ "${stall_window_min}" -gt 0 ]]; then
             if [[ "${dnf_progress_recorded}" != "yes" ]]; then
                 log_error "hard timeout ${HARD_TIMEOUT_MIN}min passed in phase=updating, but dnf progress cannot be recorded in ${PROGRESS_FILE} - not stopping a run that may still be working"
                 exit 1
             fi
-            if [[ "${DNF_STALLED_MINUTES}" -lt "${STALL_MIN}" ]]; then
-                log_warning "hard timeout ${HARD_TIMEOUT_MIN}min passed in phase=updating; dnf changed its cache or logs ${DNF_STALLED_MINUTES}min ago - left running until nothing changes for ${STALL_MIN}min"
+            if [[ "${DNF_STALLED_MINUTES}" -lt "${stall_window_min}" ]]; then
+                log_warning "hard timeout ${HARD_TIMEOUT_MIN}min passed in phase=updating (dnf phase: ${dnf_phase}); dnf changed its cache or logs ${DNF_STALLED_MINUTES}min ago - left running until nothing changes for ${stall_window_min}min"
                 if [[ "${DNF_SLOW_RUN_ANNOUNCED}" != "yes" ]]; then
-                    announce_slow_run "${service_pid} ${start_uptime_seconds}"
+                    announce_slow_run "${service_pid} ${start_uptime_seconds}" "${stall_window_min}"
                 fi
                 exit 0
             fi
-            log_error "dnf changed nothing in its cache or logs for ${DNF_STALLED_MINUTES}min, past the hard timeout ${HARD_TIMEOUT_MIN}min - stopping the run"
+            log_error "dnf changed nothing in its cache or logs for ${DNF_STALLED_MINUTES}min (dnf phase: ${dnf_phase}), past the hard timeout ${HARD_TIMEOUT_MIN}min - stopping the run"
         fi
         log_error "hard timeout ${HARD_TIMEOUT_MIN}min exceeded - PID ${service_pid} still alive in phase=${run_phase}"
         begin_recovery
@@ -593,16 +715,21 @@ main() {
                 log_error "reboot request failed - the host was not rebooted"
                 exit 1
             fi
+        elif dnf_phase_is_before_transaction "${dnf_phase}"; then
+            log_error "phase=${run_phase} at hard timeout, before the rpm transaction (dnf phase: ${dnf_phase}) - nothing was installed, NOT rebooting"
+            wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded before installing anything." \
+                     "Killed the stuck run. Nothing was installed; the next run tries again."
         else
-            log_error "phase=${run_phase} at hard timeout - an rpm transaction may be incomplete, NOT rebooting; set force_reboot_on_hard_timeout=yes to override"
+            log_error "phase=${run_phase} at hard timeout (dnf phase: ${dnf_phase}) - an rpm transaction may be incomplete, NOT rebooting; set force_reboot_on_hard_timeout=yes to override. ${INTERRUPTED_TRANSACTION_CHECK}"
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded in phase=${run_phase}." \
-                     "Killed the stuck run. Updates may be incomplete - inspect with 'dnf history' before rebooting."
+                     "Killed the stuck run. Updates may be incomplete; before rebooting:" \
+                     "${INTERRUPTED_TRANSACTION_CHECK}"
         fi
         exit 0
     fi
 
     # ---------------------------------------------------------------------------
-    # Scenario 4: soft timeout - PID alive, past SOFT_TIMEOUT_MIN
+    # Scenario 5: soft timeout - PID alive, past SOFT_TIMEOUT_MIN
     # ---------------------------------------------------------------------------
     if [[ "${elapsed_min}" -ge "${SOFT_TIMEOUT_MIN}" ]]; then
 

@@ -387,7 +387,8 @@ test_config_every_key_resolves() {
                       needs_restarting_timeout_sec reboot_delay_sec always_reboot \
                       dnf_timeout_min kill_grace_sec restart_services \
                       restart_services_exclude watchdog_soft_timeout_min \
-                      watchdog_hard_timeout_min watchdog_stall_min force_reboot_on_hard_timeout \
+                      watchdog_hard_timeout_min watchdog_stall_min watchdog_transaction_stall_min \
+                      force_reboot_on_hard_timeout \
                       enable_chrony_wait wall_messages reboot_request_lock_wait_sec \
                       watchdog_kill_confirm_sec restart_service_timeout_sec \
                       reboot_inhibited_wait_sec require_clock_sync clock_sync_wait_sec \
@@ -1743,6 +1744,206 @@ write_stalled_progress_record() {
         "$(( TEST_UPTIME_SECONDS - $3 * 60 ))" "${4:-no}" > "${PROGRESS_FILE}"
 }
 
+# append_dnf_log_messages MESSAGE... - lines as dnf 4 writes them to dnf.log.
+append_dnf_log_messages() {
+    local dnf_log_message
+    for dnf_log_message in "$@"; do
+        printf '2026-10-22T03:04:05+0000 INFO %s\n' "${dnf_log_message}" >> "${TEST_ROOT_DIR}/var/log/dnf.log"
+    done
+}
+
+# start_run_dnf_log - an earlier run's lines in dnf.log, then the position
+# run.sh records in the state file write_watchdog_state wrote.
+start_run_dnf_log() {
+    append_dnf_log_messages "--- logging initialized ---" "Running transaction check" "Running transaction"
+    printf 'dnf_log_inode=%s\ndnf_log_offset=%s\n' \
+        "$(stat -c %i "${TEST_ROOT_DIR}/var/log/dnf.log")" "$(stat -c %s "${TEST_ROOT_DIR}/var/log/dnf.log")" \
+        >> "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state"
+}
+
+# recorded_dnf_run_phase -> dnf_run_phase for the position in the state file.
+recorded_dnf_run_phase() {
+    local state_snapshot
+    state_snapshot=$(cat "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state")
+    dnf_run_phase "$(run_state_field "${state_snapshot}" dnf_log_inode)" \
+                  "$(run_state_field "${state_snapshot}" dnf_log_offset)"
+}
+
+test_watchdog_dnf_phase_follows_the_markers() {
+    load_watchdog_library
+    write_watchdog_state updating 10 4194304
+    start_run_dnf_log
+    assert_equals "unknown" "$(recorded_dnf_run_phase)" \
+        "an earlier run's lines do not count, and no start is seen yet"
+    append_dnf_log_messages "--- logging initialized ---" "Using cache for baseos"
+    assert_equals "download" "$(recorded_dnf_run_phase)" "dnf-automatic started"
+    append_dnf_log_messages "Running transaction check" "Transaction check succeeded." \
+                            "Running transaction test" "Transaction test succeeded."
+    assert_equals "checked" "$(recorded_dnf_run_phase)" "rpm checked, changed nothing"
+    append_dnf_log_messages "Running transaction"
+    assert_equals "transaction" "$(recorded_dnf_run_phase)" "rpm started changing the system"
+}
+
+test_watchdog_dnf_phase_matches_whole_messages_only() {
+    load_watchdog_library
+    write_watchdog_state updating 10 4194304
+    start_run_dnf_log
+    append_dnf_log_messages "--- logging initialized ---"
+    # Another level, a longer message, and a line without dnf's prefix.
+    printf '%s\n' "2026-10-22T03:04:05+0000 DDEBUG Running transaction" \
+                  "2026-10-22T03:04:05+0000 INFO Running transaction check failed" \
+                  "Running transaction" >> "${TEST_ROOT_DIR}/var/log/dnf.log"
+    assert_equals "download" "$(recorded_dnf_run_phase)" "none of them is a marker"
+}
+
+test_watchdog_dnf_phase_of_an_unknown_log_format_is_unknown() {
+    load_watchdog_library
+    write_watchdog_state updating 10 4194304
+    start_run_dnf_log
+    # A dnf that writes another prefix: its start is not recognised either, so
+    # the missing "Running transaction" proves nothing.
+    printf '%s\n' "Oct 22 03:04:05 dnf: --- logging initialized ---" \
+                  "Oct 22 03:04:05 dnf: Running transaction" >> "${TEST_ROOT_DIR}/var/log/dnf.log"
+    assert_equals "unknown" "$(recorded_dnf_run_phase)" "handled as a transaction"
+}
+
+test_watchdog_dnf_phase_follows_one_rotation() {
+    load_watchdog_library
+    write_watchdog_state updating 10 4194304
+    start_run_dnf_log
+    append_dnf_log_messages "--- logging initialized ---" "Running transaction check"
+    # dnf rotated the log at log_size; the run went on in a new file.
+    mv "${TEST_ROOT_DIR}/var/log/dnf.log" "${TEST_ROOT_DIR}/var/log/dnf.log.1"
+    append_dnf_log_messages "Running transaction"
+    assert_equals "transaction" "$(recorded_dnf_run_phase)" "both files are read"
+    # A second rotation leaves the recorded file nowhere.
+    mv "${TEST_ROOT_DIR}/var/log/dnf.log.1" "${TEST_ROOT_DIR}/var/log/dnf.log.2"
+    mv "${TEST_ROOT_DIR}/var/log/dnf.log" "${TEST_ROOT_DIR}/var/log/dnf.log.1"
+    append_dnf_log_messages "--- logging initialized ---"
+    assert_equals "unknown" "$(recorded_dnf_run_phase)" "the run's start is lost"
+}
+
+test_watchdog_dnf_phase_without_a_position_is_unknown() {
+    load_watchdog_library
+    append_dnf_log_messages "--- logging initialized ---"
+    assert_equals "unknown" "$(dnf_run_phase "" "")" "no position recorded"
+    assert_equals "unknown" "$(dnf_run_phase none 0)" "no dnf.log when the run started"
+    assert_equals "unknown" "$(dnf_run_phase "$(stat -c %i "${TEST_ROOT_DIR}/var/log/dnf.log")" 999999)" \
+        "a log shorter than the position was replaced"
+}
+
+test_watchdog_stall_before_the_transaction_is_stopped_early() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    # 70 minutes old, far from the hard timeout, downloading, no change for 65.
+    write_watchdog_state updating 70 "${background_pid}"
+    start_run_dnf_log
+    append_dnf_log_messages "--- logging initialized ---"
+    write_stalled_progress_record "${background_pid}" 70 65
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 0 "${exit_code}" "a confirmed stall is recovered"
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "killed before the hard timeout"
+    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "nothing was installed: no reboot"
+    assert_contains "$(cat "${LOG_FILE}")" "has not started its rpm transaction (dnf phase: download)" "the log says why"
+    assert_contains "$(cat "${STUB_LOG}")" "Nothing was installed; the next run tries again." "users are told"
+    [[ -f "${STATE_FILE}" ]] && fail "the killed run's state is removed"
+    return 0
+}
+
+test_watchdog_stall_after_the_transaction_check_is_stopped_early() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state updating 70 "${background_pid}"
+    start_run_dnf_log
+    append_dnf_log_messages "--- logging initialized ---" "Running transaction check" "Transaction check succeeded."
+    write_stalled_progress_record "${background_pid}" 70 65
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "rpm only checked: still safe to stop"
+}
+
+test_watchdog_short_stall_before_the_transaction_is_left_running() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state updating 70 "${background_pid}"
+    start_run_dnf_log
+    append_dnf_log_messages "--- logging initialized ---"
+    write_stalled_progress_record "${background_pid}" 70 30
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "30 minutes is within the window"
+}
+
+test_watchdog_stall_in_the_transaction_waits_for_the_hard_timeout() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    # rpm's transaction has started and nothing changed for 65 minutes, but
+    # the run is 70 minutes old: a silent scriptlet is left alone.
+    write_watchdog_state updating 70 "${background_pid}"
+    start_run_dnf_log
+    append_dnf_log_messages "--- logging initialized ---" "Running transaction"
+    write_stalled_progress_record "${background_pid}" 70 65
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "never stopped early mid-transaction"
+}
+
+test_watchdog_unknown_phase_is_not_stopped_early() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    # No recorded position: the transaction may have started.
+    write_watchdog_state updating 70 "${background_pid}"
+    write_stalled_progress_record "${background_pid}" 70 65
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "unknown is handled as a transaction"
+}
+
+test_watchdog_transaction_gets_the_longer_window() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state updating 400 "${background_pid}"
+    start_run_dnf_log
+    append_dnf_log_messages "--- logging initialized ---" "Running transaction"
+    write_stalled_progress_record "${background_pid}" 400 70
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 0 "${exit_code}" "a silent scriptlet is no failure"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "70 minutes is within the transaction's window"
+    assert_contains "$(cat "${LOG_FILE}")" "(dnf phase: transaction); dnf changed its cache or logs 70min ago - left running until nothing changes for 180min" \
+        "the log names the window that applies"
+    assert_contains "$(cat "${STUB_LOG}")" "It is stopped only once dnf changes nothing for 180min." "and so do users"
+}
+
+test_watchdog_transaction_window_zero_kills_at_the_hard_timeout() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    printf '\nwatchdog_transaction_stall_min = 0\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    load_watchdog_library
+    write_watchdog_state updating 400 "${background_pid}"
+    start_run_dnf_log
+    append_dnf_log_messages "--- logging initialized ---" "Running transaction"
+    write_stalled_progress_record "${background_pid}" 400 0
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "killed at the hard timeout while dnf works"
+    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "and not rebooted"
+}
+
 test_watchdog_progress_signature_sees_bytes_and_logs() {
     load_watchdog_library
     mkdir -p "${DNF_CACHE_DIRECTORY}/baseos/packages" "${TEST_ROOT_DIR}/var/log"
@@ -1774,7 +1975,7 @@ test_watchdog_progressing_update_is_left_running() {
     assert_exit_code 0 "${exit_code}" "a working dnf is no failure"
     assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "past the hard timeout, dnf changed something 10 minutes ago"
     assert_equals "1" "$(grep -c 'the update has run past 320min' "${STUB_LOG}")" "logged-in users are told once"
-    assert_contains "$(cat "${LOG_FILE}")" "left running until nothing changes for 60min" "the log says why"
+    assert_contains "$(cat "${LOG_FILE}")" "left running until nothing changes for 180min" "the log says why"
     [[ -f "${STATE_FILE}" ]] || fail "the run stays supervised"
     return 0
 }
@@ -1784,14 +1985,17 @@ test_watchdog_stalled_update_is_stopped() {
     local background_pid=$! exit_code=0
     load_watchdog_library
     write_watchdog_state updating 400 "${background_pid}"
-    write_stalled_progress_record "${background_pid}" 400 70
+    write_stalled_progress_record "${background_pid}" 400 190
     stub_watchdog_kill_path
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 0 "${exit_code}" "a confirmed stall is recovered"
-    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "nothing changed for 70 minutes: killed"
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "nothing changed for 190 minutes: killed"
     assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "and, still updating, not rebooted"
-    assert_contains "$(cat "${LOG_FILE}")" "dnf changed nothing in its cache or logs for 70min" "the log says why"
+    assert_contains "$(cat "${LOG_FILE}")" "dnf changed nothing in its cache or logs for 190min (dnf phase: unknown)" \
+        "the log says why"
+    assert_contains "$(cat "${LOG_FILE}")" "Check: dnf history info last; dnf check" "and what to inspect"
+    assert_contains "$(cat "${STUB_LOG}")" "Check: dnf history info last; dnf check" "so do users"
 }
 
 test_watchdog_dnf_activity_restarts_the_stall_window() {
@@ -1875,7 +2079,7 @@ test_watchdog_recovery_without_reboot_allows_runs_again() {
     load_watchdog_library
     # phase=updating at the hard timeout, dnf stalled: killed, not rebooted.
     write_watchdog_state updating 400 "${background_pid}"
-    write_stalled_progress_record "${background_pid}" 400 70
+    write_stalled_progress_record "${background_pid}" 400 190
     stub_watchdog_kill_path
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
@@ -3732,6 +3936,18 @@ run_test "run: failed metadata refresh still updates" test_run_failed_metadata_r
 run_test "run: metadata refresh can be turned off"   test_run_metadata_refresh_can_be_turned_off
 run_test "run: does not update before a pending reboot" test_run_does_not_update_before_a_pending_reboot
 run_test "run: unknown reboot state does not update" test_run_unknown_reboot_state_does_not_update
+run_test "watchdog: dnf phase follows the markers" test_watchdog_dnf_phase_follows_the_markers
+run_test "watchdog: dnf phase matches whole messages only" test_watchdog_dnf_phase_matches_whole_messages_only
+run_test "watchdog: dnf phase of unknown log format is unknown" test_watchdog_dnf_phase_of_an_unknown_log_format_is_unknown
+run_test "watchdog: dnf phase follows one rotation" test_watchdog_dnf_phase_follows_one_rotation
+run_test "watchdog: dnf phase without a position is unknown" test_watchdog_dnf_phase_without_a_position_is_unknown
+run_test "watchdog: stall before the transaction is stopped early" test_watchdog_stall_before_the_transaction_is_stopped_early
+run_test "watchdog: stall after the transaction check is stopped early" test_watchdog_stall_after_the_transaction_check_is_stopped_early
+run_test "watchdog: short stall before the transaction is left running" test_watchdog_short_stall_before_the_transaction_is_left_running
+run_test "watchdog: stall in the transaction waits for the hard timeout" test_watchdog_stall_in_the_transaction_waits_for_the_hard_timeout
+run_test "watchdog: unknown phase is not stopped early" test_watchdog_unknown_phase_is_not_stopped_early
+run_test "watchdog: transaction gets the longer window" test_watchdog_transaction_gets_the_longer_window
+run_test "watchdog: transaction window 0 kills at the hard timeout" test_watchdog_transaction_window_zero_kills_at_the_hard_timeout
 run_test "watchdog: progress signature sees bytes and logs" test_watchdog_progress_signature_sees_bytes_and_logs
 run_test "watchdog: progressing update is left running" test_watchdog_progressing_update_is_left_running
 run_test "watchdog: stalled update is stopped"     test_watchdog_stalled_update_is_stopped

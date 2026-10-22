@@ -17,9 +17,12 @@ Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
     into a kernel the GRUB default would not select.
   - Restarts services still mapping pre-update files, which
     needs-restarting -r never reports.
-  - An independent watchdog timer handles hung runs: soft timeout checks
-    whether dnf is still active; hard timeout kills the whole service cgroup
-    and reboots only when the recorded phase proves dnf finished cleanly.
+  - An independent watchdog timer handles hung runs.  Before rpm starts
+    installing (read from dnf.log), a run in which dnf changed nothing for
+    watchdog_stall_min is killed at any age.  Once installing has started,
+    the hard timeout kills the whole service cgroup after dnf has changed
+    nothing for watchdog_transaction_stall_min, and reboots only when the
+    recorded phase proves dnf finished cleanly.
   - Detects concurrent manual dnf invocations and warns logged-in users.
   - All timeouts and behaviour are configurable without editing scripts.
 

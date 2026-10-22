@@ -88,10 +88,13 @@ install packages without checking their signatures, are reported in the log.
 
 An update is never stopped while dnf is still working, so a download over a
 slow link, or an upgrade to the next minor release on a Raspberry Pi, can take
-as long as it needs. A separate watchdog checks every five minutes. Once an
-update run has gone on for five hours and twenty minutes, and dnf has changed
-nothing in its cache or logs for an hour, the watchdog stops it and alerts you;
-it does not restart while packages may be half-installed.
+as long as it needs. A separate watchdog checks every five minutes. If dnf
+changes nothing in its cache or logs for an hour before it starts installing,
+the watchdog stops the run and alerts you; nothing was installed, and the next
+run tries again. Once installing has started, it waits until the run has gone
+on for five hours and twenty minutes and dnf has changed nothing for three
+hours, then stops it and alerts you with the commands that show what to
+repair; it does not restart while packages may be half-installed.
 
 When something goes wrong, logged-in users get a message on their terminal and
 the details go to `/var/log/dnf-automatic-reboot.log`.
