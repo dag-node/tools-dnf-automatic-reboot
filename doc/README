@@ -17,9 +17,12 @@ Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
     into a kernel the GRUB default would not select.
   - Restarts services still mapping pre-update files, which
     needs-restarting -r never reports.
-  - An independent watchdog timer handles hung runs: soft timeout checks
-    whether dnf is still active; hard timeout kills the whole service cgroup
-    and reboots only when the recorded phase proves dnf finished cleanly.
+  - An independent watchdog timer handles hung runs.  Before rpm starts
+    installing (read from dnf.log), a run whose processes read and wrote
+    nothing for watchdog_stall_min is killed at any age.  Once installing has
+    started, the hard timeout kills the whole service cgroup after they have
+    been idle for watchdog_transaction_stall_min, and reboots only when the
+    recorded phase proves dnf finished cleanly.
   - Detects concurrent manual dnf invocations and warns logged-in users.
   - All timeouts and behaviour are configurable without editing scripts.
 
@@ -53,8 +56,17 @@ Files installed
       The command of the scheduled reboot; reboots only while one is
       pending.  Not for interactive use.
 
+  /usr/libexec/dnf-automatic-reboot/check-config.sh
+      Lists how /etc/dnf/automatic-reboot.conf differs from the shipped
+      configuration: keys not read, keys not set, values that differ.  Run by
+      the RPM after every install and upgrade, and by hand.  Never edits the
+      file.  With --unread, run.sh logs the keys not read at every start.
+
   /etc/dnf/automatic-reboot.conf
       Configuration.  Preserved across upgrades (%config(noreplace) in RPM).
+
+  /usr/share/dnf-automatic-reboot/automatic-reboot.conf
+      The configuration as shipped, which check-config.sh compares with.
 
   /usr/lib/systemd/system/dnf-automatic-reboot.service
   /usr/lib/systemd/system/dnf-automatic-reboot.timer

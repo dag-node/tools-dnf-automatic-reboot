@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 NAME    = dnf-automatic-reboot
-VERSION = 1.5.0
+VERSION = 1.6.0
 TARBALL = $(NAME)-$(VERSION).tar.gz
 
 # /usr/libexec, not /usr/local/lib: /usr/local is reserved for the local
@@ -9,6 +9,8 @@ LIBEXECDIR   = /usr/libexec/$(NAME)
 UNITDIR      = /usr/lib/systemd/system
 CONFDIR      = /etc/dnf
 DOCDIR       = /usr/share/doc/$(NAME)
+# The configuration as shipped, which check-config.sh compares CONFDIR's with.
+SHAREDIR     = /usr/share/$(NAME)
 STATEDIR     = /var/lib/$(NAME)
 TMPFILESDIR  = /usr/lib/tmpfiles.d
 LOGROTATEDIR = /etc/logrotate.d
@@ -18,7 +20,8 @@ SCRIPTS = scripts/run.sh \
           scripts/needs-reboot.sh \
           scripts/notify-failure.sh \
           scripts/cancel-reboot.sh \
-          scripts/reboot-if-pending.sh
+          scripts/reboot-if-pending.sh \
+          scripts/check-config.sh
 # Sourced, never executed.
 LIBRARIES = scripts/reboot-request.sh \
             scripts/run-state.sh
@@ -104,9 +107,11 @@ install:
 	install -d -m 0755 $(DESTDIR)$(TMPFILESDIR)
 	install -d -m 0755 $(DESTDIR)$(LOGROTATEDIR)
 	install -d -m 0750 $(DESTDIR)$(STATEDIR)
+	install -d -m 0755 $(DESTDIR)$(SHAREDIR)
 	install -m 0750 $(SCRIPTS)   $(DESTDIR)$(LIBEXECDIR)/
 	install -m 0640 $(LIBRARIES) $(DESTDIR)$(LIBEXECDIR)/
 	install -m 0644 $(UNITS)     $(DESTDIR)$(UNITDIR)/
+	install -m 0644 $(CONF)      $(DESTDIR)$(SHAREDIR)/automatic-reboot.conf
 	install -m 0640 $(CONF)      $(DESTDIR)$(CONFDIR)/automatic-reboot.conf
 	install -m 0644 $(TMPFILES)  $(DESTDIR)$(TMPFILESDIR)/$(NAME).conf
 	install -m 0644 $(LOGROTATE) $(DESTDIR)$(LOGROTATEDIR)/$(NAME)
@@ -123,6 +128,7 @@ uninstall:
 	rm -f  $(DESTDIR)$(LOGROTATEDIR)/$(NAME)
 	rm -rf $(DESTDIR)$(LIBEXECDIR)
 	rm -rf $(DESTDIR)$(DOCDIR)
+	rm -rf $(DESTDIR)$(SHAREDIR)
 	rm -rf $(DESTDIR)$(STATEDIR)
 
 dist: check

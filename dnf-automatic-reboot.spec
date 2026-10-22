@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 Name:           dnf-automatic-reboot
-Version:        1.5.0
+Version:        1.6.0
 # Plain "1" for a release; CI passes --define "rpm_release 0.<run>.git<sha>"
 # for a snapshot build.  The leading "0." makes rpm rank the release above
 # every snapshot that preceded it, so a trial build upgrades to it in place.
@@ -40,6 +40,11 @@ Requires:       logrotate
 # (require_clock_sync = yes by default).  Installed is not running: the
 # runtime check stays.
 Requires:       chrony
+# rpm's systemd_inhibit plugin holds a block-mode shutdown inhibitor for every
+# rpm transaction, a `dnf upgrade` started by hand included; the scheduled
+# reboot waits while one is held.  Without it, that reboot can stop such a
+# transaction halfway.
+Requires:       rpm-plugin-systemd-inhibit
 
 # We install systemd unit files
 BuildRequires:  systemd-rpm-macros
@@ -94,6 +99,7 @@ install -m 0750 scripts/needs-reboot.sh   %{buildroot}%{pkglibexecdir}/needs-reb
 install -m 0750 scripts/notify-failure.sh %{buildroot}%{pkglibexecdir}/notify-failure.sh
 install -m 0750 scripts/cancel-reboot.sh  %{buildroot}%{pkglibexecdir}/cancel-reboot.sh
 install -m 0750 scripts/reboot-if-pending.sh %{buildroot}%{pkglibexecdir}/reboot-if-pending.sh
+install -m 0750 scripts/check-config.sh   %{buildroot}%{pkglibexecdir}/check-config.sh
 install -m 0640 scripts/reboot-request.sh %{buildroot}%{pkglibexecdir}/reboot-request.sh
 install -m 0640 scripts/run-state.sh      %{buildroot}%{pkglibexecdir}/run-state.sh
 
@@ -109,6 +115,10 @@ install -m 0644 units/dnf-automatic-reboot-notify@.service %{buildroot}%{_unitdi
 install -d -m 0755 %{buildroot}%{_sysconfdir}/dnf
 install -m 0640 conf/automatic-reboot.conf \
     %{buildroot}%{_sysconfdir}/dnf/automatic-reboot.conf
+# The same file as shipped, never edited: check-config.sh compares the one in
+# /etc with it.  Not %%doc, which --excludedocs leaves out.
+install -d -m 0755 %{buildroot}%{_datadir}/%{name}
+install -m 0644 conf/automatic-reboot.conf %{buildroot}%{_datadir}/%{name}/automatic-reboot.conf
 
 # tmpfiles.d - owns the mode and label of the log and state paths
 install -d -m 0755 %{buildroot}%{_tmpfilesdir}
@@ -184,7 +194,7 @@ fi
 # The packages every decision depends on.  Requires: covers a normal install;
 # this catches `rpm -i --nodeps`, which would otherwise leave the build-id or
 # GRUB check silently disabled at runtime.
-for required_package in dnf-automatic yum-utils elfutils grubby chrony; do
+for required_package in dnf-automatic yum-utils elfutils grubby chrony rpm-plugin-systemd-inhibit; do
     if ! rpm -q "${required_package}" >/dev/null 2>&1; then
         echo "ERROR: ${required_package} is not installed." >&2
         echo "       Install it first:  dnf install ${required_package}" >&2
@@ -409,6 +419,13 @@ echo "  1. Review /etc/dnf/automatic-reboot.conf"
 echo "  2. Enable this package:"
 echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer"
 
+%posttrans
+# The configuration is %%config(noreplace): an edited copy keeps its keys and
+# values, old defaults included, across upgrades.  Name every difference from
+# the shipped one; the file itself is the operator's and is not edited.
+# %%posttrans, so the copy in /etc is final whichever way rpm resolved it.
+%{pkglibexecdir}/check-config.sh || :
+
 %preun
 %systemd_preun dnf-automatic-reboot.service
 %systemd_preun dnf-automatic-reboot.timer
@@ -435,6 +452,7 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %attr(0750, root, root) %{pkglibexecdir}/notify-failure.sh
 %attr(0750, root, root) %{pkglibexecdir}/cancel-reboot.sh
 %attr(0750, root, root) %{pkglibexecdir}/reboot-if-pending.sh
+%attr(0750, root, root) %{pkglibexecdir}/check-config.sh
 # Sourced by run.sh, watchdog.sh, cancel-reboot.sh and reboot-if-pending.sh;
 # never executed.
 %attr(0640, root, root) %{pkglibexecdir}/reboot-request.sh
@@ -451,6 +469,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 
 # Config - preserved across upgrades; root:root 640 (no world read for safety)
 %config(noreplace) %attr(0640, root, root) %{_sysconfdir}/dnf/automatic-reboot.conf
+# The config as shipped, for check-config.sh
+%dir %{_datadir}/%{name}
+%{_datadir}/%{name}/automatic-reboot.conf
 
 # tmpfiles.d - creates the log and state paths with the modes declared below
 %{_tmpfilesdir}/%{name}.conf
@@ -470,6 +491,56 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %ghost %attr(0640, root, root) %{_localstatedir}/lib/%{name}/kernel-reboot-attempts
 
 %changelog
+* Thu Oct 22 2026 DagNode <packages@dagnode.com> - 1.6.0-1
+- CHANGE: dnf-automatic-reboot.timer runs at 03:00 UTC instead of 03:00 local time, so the run
+  no longer moves with the host's time zone or daylight saving time. An OnCalendar= override
+  keeps its own time. The timer does not start on a host booted from rpm-ostree.
+- CHANGE: An update is not stopped while dnf is still working, so a download over a slow link
+  or an upgrade to the next minor EL release on a slow host is not cut off halfway.
+  dnf_timeout_min is removed: its deadline stopped dnf whatever it was doing, an rpm
+  transaction included. The watchdog reads from dnf.log whether rpm's transaction has started.
+  Progress is what the run's own processes read and write, so dnf-makecache.timer and other
+  dnf commands do not keep a hung run alive. Before the transaction has started, a run whose
+  processes read and wrote nothing for watchdog_stall_min (new, default 60) is stopped at any
+  age; nothing was installed, and the next run retries. Once it has, the watchdog waits past
+  watchdog_hard_timeout_min (now 320, was 180) until they have been idle for
+  watchdog_transaction_stall_min (new, default 180), so a long quiet scriptlet is not killed,
+  and tells logged-in users once that the run is still going. Neither stall window can be turned off: a value below 1 is reported and the default
+  used.
+- CHANGE: force_reboot_on_hard_timeout is removed. The watchdog does not reboot a host after
+  stopping a run that may be mid-transaction; it names dnf history info last; dnf check
+  instead. A run stopped after dnf returned cleanly is rebooted as before.
+- CHANGE: The package requires rpm-plugin-systemd-inhibit. With it, an rpm transaction started
+  by hand holds the scheduled reboot until it ends, instead of being stopped halfway.
+- NEW: Installing or upgrading the package lists every difference between
+  /etc/dnf/automatic-reboot.conf and the configuration it ships: keys no longer read, keys not
+  set, and values that differ, such as an old default kept by an edited copy. The file is not
+  edited. /usr/libexec/dnf-automatic-reboot/check-config.sh prints the same list on demand,
+  and each run warns about a key it does not read.
+- NEW: When the watchdog stops a run whose rpm transaction may be incomplete, its message names
+  the commands that show what to repair: dnf history info last; dnf check.
+- FIX: A scheduled reboot goes ahead while users are logged in. systemctl reboot
+  --check-inhibitors=yes also refused while any other user had a session, so one open SSH login
+  failed the reboot after reboot_inhibited_wait_sec and held update runs until a manual reboot
+  or cancel-reboot.sh. The package now reads logind's block inhibitors itself; a package
+  transaction's inhibitor still holds the reboot, and the messages say why a reboot did not
+  start.
+- FIX: A failed clock check carries chronyc's last answer, so a chronyd that is not running no
+  longer reads like one that is still synchronising.
+- FIX: Failure notices name the failed unit as it is: every '-' in the name was printed as '/',
+  dnf/automatic/reboot.service, in the message and in the journalctl command it suggests. The
+  scheduled reboot's notice now says whether update runs are held.
+- FIX: A failure notice quotes only the journal lines of the run that failed; the unit's last
+  lines could reach into the run before.
+- FIX: Every run fetches current repository metadata (dnf makecache --refresh) before
+  dnf-automatic starts, within metadata_refresh_timeout_sec (new, default 900).
+  dnf-automatic installed from the cache dnf-makecache.timer or metadata_expire had left, so
+  an advisory published since waited for the next run. A refresh that fails or runs out of
+  time is logged, the run continues from the cache, and the completion line says so.
+  refresh_metadata = no (new) turns the step off.
+- DOCS: dnf-automatic-reboot.timer explains how to override the schedule and how far apart runs
+  must stay, with three-a-day schedules weighted on the US, Asia, the EU or global traffic.
+
 * Thu Oct 01 2026 DagNode <packages@dagnode.com> - 1.5.0-1
 - CHANGE: A pending reboot holds update runs through its own marker,
   /run/dnf-automatic-reboot.reboot-pending, created before the reboot is requested and removed
@@ -485,9 +556,6 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   holds when upgrading from 1.4.0 while its watchdog has a reboot scheduled.
 - CHANGE: reboot_delay_sec defaults to 300, giving five minutes between the warning and the
   reboot to cancel it. An edited automatic-reboot.conf keeps its own value.
-- CHANGE: dnf-automatic-reboot.timer runs at 03:00 UTC instead of 03:00 local time, so the run
-  no longer moves with the host's time zone or daylight saving time. An OnCalendar= override
-  keeps its own time. The timer does not start on a host booted from rpm-ostree.
 - NEW: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels a pending reboot and allows
   update runs again; a timer that fires afterwards does not reboot. It exits 1 without
   changing anything while a reboot is being requested or carried out, once systemctl reboot
@@ -513,13 +581,12 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   most clock_sync_wait_sec (new, default 600, enforced with timeout); otherwise it fails. The
   package now requires chrony. The unit's ordering after
   time-sync.target did not require synchronisation to succeed, so a failed chrony-wait.service
-  let updates run with a wrong clock. require_clock_sync = no (new) turns the check off. The
-  failure carries chronyc's last answer, which says whether chronyd answered at all.
+  let updates run with a wrong clock. require_clock_sync = no (new) turns the check off.
 - FIX: The reboot respects shutdown inhibitors. From a service, systemctl reboot skipped the
   inhibitor check, so a package transaction started by hand during reboot_delay_sec could be cut
-  off. While a block inhibitor holds shutdown, the reboot is retried every 30 seconds for
-  reboot_inhibited_wait_sec (new, default 1800) and can be cancelled meanwhile. Logged-in users
-  do not hold it. The watchdog no longer falls back to systemctl reboot --force.
+  off. A refused reboot is retried every 30 seconds for reboot_inhibited_wait_sec (new, default
+  1800) and can be cancelled meanwhile. The watchdog no longer falls back to
+  systemctl reboot --force.
 - FIX: The watchdog no longer removes the state file of a run it did not inspect. run.sh wrote the
   file in place, and a watchdog reading it at that moment found it empty and deleted it as
   malformed; cleanup after a dead run could delete the state of the run that started next. Either
@@ -541,16 +608,6 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   warning no longer claims updates were installed.
 - FIX: A failed scheduled reboot's notice says whether update runs are still held and how to
   release them.
-- FIX: Failure notices name the failed unit as it is: every '-' in the name was printed as '/',
-  dnf/automatic/reboot.service, in the message and in the journalctl command it suggests.
-- FIX: A failure notice quotes only the journal lines of the run that failed; the unit's last
-  lines could reach into the run before.
-- FIX: Every run fetches current repository metadata (dnf makecache --refresh) before
-  dnf-automatic starts, within metadata_refresh_timeout_sec (new, default 900).
-  dnf-automatic installed from the cache dnf-makecache.timer or metadata_expire had left, so
-  an advisory published since waited for the next run. A refresh that fails or runs out of
-  time is logged, the run continues from the cache, and the completion line says so.
-  refresh_metadata = no (new) turns the step off.
 
 * Wed Sep 30 2026 DagNode <packages@dagnode.com> - 1.4.0-1
 - LICENSE: The project license is now GPL-2.0-or-later. Releases through 1.3 were licensed MIT,

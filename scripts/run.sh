@@ -9,8 +9,8 @@
 #   2. Fetch current repository metadata, so dnf-automatic sees the
 #      advisories published since dnf last refreshed its cache.
 #   3. Write a state file consumed by watchdog.sh.
-#   4. Run dnf-automatic under a hard wall-clock timeout, as the child of a
-#      systemd inhibitor lock that blocks shutdown and reboot until it exits.
+#   4. Run dnf-automatic as the child of a systemd inhibitor lock that
+#      blocks shutdown and reboot until it exits.
 #   5. Call needs-reboot.sh to decide whether a reboot is required,
 #      filtering known false positives.
 #   6. Schedule a reboot if needed; otherwise restart the services whose
@@ -22,6 +22,9 @@
 #   start_uptime=  seconds since boot; the watchdog times the run from this
 #                  because a host with no RTC steps its wall clock mid-run
 #   pid=           PID of this script
+#   dnf_log_inode= dnf.log's inode and size before dnf-automatic started,
+#   dnf_log_offset= or "none" and 0; the watchdog reads the run's dnf phase
+#                  from the lines after them
 #
 # Sourcing this file defines its functions without running the update, so
 # tests/run-tests.sh can exercise them directly.
@@ -49,6 +52,10 @@ readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
 readonly DNF_BIN="${TEST_ROOT}/usr/bin/dnf"
 readonly DNF_AUTOMATIC_BIN="${TEST_ROOT}/usr/bin/dnf-automatic"
+# Its position before dnf-automatic starts goes into the state file: the
+# watchdog reads the run's transaction phase from the lines after it.
+readonly DNF_LOG_FILE="${TEST_ROOT}/var/log/dnf.log"
+readonly CHECK_CONFIG_COMMAND=/usr/libexec/dnf-automatic-reboot/check-config.sh
 # shellcheck disable=SC2034  # read by reboot-request.sh
 readonly SYSTEMD_RUN_BIN="${TEST_ROOT}/usr/bin/systemd-run"
 readonly SYSTEMCTL_BIN="${TEST_ROOT}/usr/bin/systemctl"
@@ -236,7 +243,6 @@ REFRESH_METADATA=$(get_config_value refresh_metadata yes)
 REFRESH_METADATA="${REFRESH_METADATA//[[:space:]]/}"
 METADATA_REFRESH_TIMEOUT_SEC=$(get_config_integer metadata_refresh_timeout_sec 900 10 3600)
 ALWAYS_REBOOT=$(get_config_value always_reboot no)
-DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 60 1)
 KILL_GRACE_SEC=$(get_config_integer kill_grace_sec 30)
 WARN_UNSIGNED_REPOSITORIES=$(get_config_value warn_unsigned_repositories yes)
 WARN_UNAPPLIED_ADVISORIES=$(get_config_value warn_unapplied_advisories yes)
@@ -255,6 +261,10 @@ SERVICE_RESTART_SUMMARY="stale services not checked"
 SCHEDULED_REBOOT_SUMMARY=""
 # The state file content this run last published; empty before the first.
 PUBLISHED_RUN_STATE=""
+# dnf.log's inode and size before dnf-automatic started; "none" and 0 when it
+# did not exist.  Set by record_dnf_log_position.
+DNF_LOG_INODE="none"
+DNF_LOG_OFFSET=0
 # What dnf-automatic installed, for the completion line; set once it returns.
 UPDATE_SUMMARY="update result unknown"
 # Empty after a successful or disabled metadata refresh; otherwise the
@@ -285,10 +295,27 @@ cleanup() {
 # Returns 1 when it could not, and the previous file stays.
 write_state() {
     local run_phase="$1" state_content
-    state_content=$(printf 'phase=%s\nstart=%s\nstart_uptime=%s\npid=%s\n' \
-        "${run_phase}" "${START_TIMESTAMP}" "${START_UPTIME_SECONDS}" "${SERVICE_PID}")
+    state_content=$(printf 'phase=%s\nstart=%s\nstart_uptime=%s\npid=%s\ndnf_log_inode=%s\ndnf_log_offset=%s\n' \
+        "${run_phase}" "${START_TIMESTAMP}" "${START_UPTIME_SECONDS}" "${SERVICE_PID}" \
+        "${DNF_LOG_INODE}" "${DNF_LOG_OFFSET}")
     write_run_state "${state_content}" || return 1
     PUBLISHED_RUN_STATE="${state_content}"
+}
+
+# record_dnf_log_position - sets DNF_LOG_INODE and DNF_LOG_OFFSET from
+# dnf.log as it is now, so the watchdog reads only what this run's
+# dnf-automatic writes.  A log that does not exist yet is "none" at 0, which
+# the watchdog reads as an unknown phase.
+record_dnf_log_position() {
+    local inode_and_size=""
+    inode_and_size=$(stat -c '%i %s' "${DNF_LOG_FILE}" 2>/dev/null) || inode_and_size=""
+    if [[ "${inode_and_size}" =~ ^([0-9]+)\ ([0-9]+)$ ]]; then
+        DNF_LOG_INODE="${BASH_REMATCH[1]}"
+        DNF_LOG_OFFSET="${BASH_REMATCH[2]}"
+    else
+        DNF_LOG_INODE="none"
+        DNF_LOG_OFFSET=0
+    fi
 }
 
 # uptime_seconds -> whole seconds since boot, empty when unreadable.
@@ -474,7 +501,7 @@ warn_on_unapplied_security_advisories() {
 }
 
 # ---------------------------------------------------------------------------
-# Run dnf-automatic under the inhibitor lock and a hard timeout.
+# Run dnf-automatic under the inhibitor lock.
 #
 # systemd-inhibit takes a block-mode shutdown:sleep lock from logind before it
 # starts its command, holds it for exactly as long as that command runs, and
@@ -482,9 +509,10 @@ warn_on_unapplied_security_advisories() {
 # update runs unprotected, and the lock is gone before any reboot is
 # scheduled.  An admin can still force-reboot with: systemctl reboot --force
 #
-# timeout sends SIGTERM at DNF_TIMEOUT_MIN minutes, then SIGKILL after
-# KILL_GRACE_SEC seconds; 124 = timed out.  Returns dnf-automatic's exit code,
-# or systemd-inhibit's when the lock was refused.
+# There is no deadline: a deadline stops dnf whatever it is doing, an rpm
+# transaction included.  The watchdog stops the run once dnf stalls.
+# Returns dnf-automatic's exit code, or systemd-inhibit's when the lock was
+# refused.
 # ---------------------------------------------------------------------------
 run_dnf_automatic_under_inhibitor() {
     systemd-inhibit \
@@ -492,7 +520,7 @@ run_dnf_automatic_under_inhibitor() {
         --who="dnf-automatic-reboot" \
         --why="dnf-automatic update in progress - do not reboot" \
         --mode="block" \
-        timeout --kill-after="${KILL_GRACE_SEC}s" "${DNF_TIMEOUT_MIN}m" "${DNF_AUTOMATIC_BIN}"
+        "${DNF_AUTOMATIC_BIN}"
 }
 
 # run_reboot_check -> needs-reboot.sh's exit code.
@@ -541,6 +569,19 @@ schedule_reboot() {
 # chronyc_available - 0 when chronyc can be run.
 chronyc_available() {
     command -v chronyc >/dev/null 2>&1
+}
+
+# warn_on_unread_config_keys - warns once per key that the configuration sets
+# and this version does not read, so a line that does nothing does not pass
+# for a setting.  Every other difference from the shipped file may be the
+# operator's choice and is reported at install only (check-config.sh).
+warn_on_unread_config_keys() {
+    local unread_config_keys=() unread_config_key
+    mapfile -t unread_config_keys < <("${LIBRARY_DIRECTORY}/check-config.sh" --unread 2>/dev/null \
+                                      | grep -E '^[A-Za-z_][A-Za-z0-9_]*$')
+    for unread_config_key in "${unread_config_keys[@]}"; do
+        log_warning "${CONFIG_FILE#"${TEST_ROOT}"} sets ${unread_config_key}, which this version does not read - remove the line; all differences: ${CHECK_CONFIG_COMMAND}"
+    done
 }
 
 # Bound on the one chronyc query a failed clock check makes for its message.
@@ -676,6 +717,7 @@ main() {
     START_UPTIME_SECONDS=$(uptime_seconds)
     log "Starting (pid=${SERVICE_PID})"
     check_conflicts
+    warn_on_unread_config_keys
     exit_if_reboot_pending
     if ! wait_for_clock_sync; then
         wall_msg "dnf-automatic-reboot: Updates NOT started - the clock is not confirmed synchronised."
@@ -695,13 +737,14 @@ main() {
     refresh_repository_metadata \
         || METADATA_REFRESH_FAILURE_SUMMARY=" (metadata refresh failed, cached metadata used)"
 
+    record_dnf_log_position
     if ! write_state "updating"; then
         log_error "cannot publish ${STATE_FILE} - the watchdog could not supervise this run, not updating"
         exit 1
     fi
 
     wall_msg "dnf-automatic-reboot: Starting automatic updates. Reboot is inhibited until they complete."
-    log "Running dnf-automatic under the inhibitor lock (timeout=${DNF_TIMEOUT_MIN}m kill_grace=${KILL_GRACE_SEC}s)"
+    log "Running dnf-automatic under the inhibitor lock (no deadline; the watchdog stops it only once dnf stalls)"
     update_started_epoch=$(date +%s)
     run_dnf_automatic_under_inhibitor || dnf_automatic_exit_code=$?
 

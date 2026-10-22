@@ -34,7 +34,7 @@ Linux, Rocky Linux, AlmaLinux) with the standard GRUB boot menu.
 ```bash
 sudo dnf install dnf-automatic
 sudoedit /etc/dnf/automatic.conf
-sudo dnf install ./dnf-automatic-reboot-1.5.0-*.el9.noarch.rpm
+sudo dnf install ./dnf-automatic-reboot-1.6.0-*.el9.noarch.rpm
 sudo systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
 ```
 
@@ -86,9 +86,15 @@ Between 03:00 and 03:10 UTC the package:
 Updates that `dnf` knows about but refuses to install, and repositories that
 install packages without checking their signatures, are reported in the log.
 
-A separate watchdog checks every five minutes. If an update run is still going
-after three hours, the watchdog stops it and alerts you; it does not restart
-while packages may be half-installed.
+An update is never stopped while dnf is still working, so a download over a
+slow link, or an upgrade to the next minor release on a Raspberry Pi, can take
+as long as it needs. A separate watchdog checks every five minutes. If the
+update reads and writes nothing for an hour before it starts installing, the
+watchdog stops the run and alerts you; nothing was installed, and the next run
+tries again. Once installing has started, it waits until the run has gone on
+for five hours and twenty minutes and has been idle for three hours, then stops
+it and alerts you with the commands that show what to repair; it does not
+restart while packages may be half-installed.
 
 When something goes wrong, logged-in users get a message on their terminal and
 the details go to `/var/log/dnf-automatic-reboot.log`.
@@ -153,7 +159,15 @@ after that, restarts for new kernels are held back, and the log says so, until
 ## Changing the settings
 
 Settings are in `/etc/dnf/automatic-reboot.conf`; each one is explained in the
-file. The ones people change most:
+file. An upgrade keeps your copy as it is. After installing or upgrading, the
+installer lists every line that differs from the settings the new version
+ships: settings it no longer reads, new settings your copy does not have, and
+values that differ, such as a default from an older version. It changes
+nothing; edit the file by hand where you want the new value. Run
+`sudo /usr/libexec/dnf-automatic-reboot/check-config.sh` to see the list again.
+A setting that is no longer read is also named in the log at every run.
+
+The settings people change most:
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -247,7 +261,7 @@ Enterprise Linux 8 into the `el8` folder beside it; each build replaces only
 its own folder. Building in the container gives the file the
 right `.el8` or `.el9` tag whatever the build host runs, and keeps the
 test suite off that host. The file carries a local snapshot version,
-`1.5.0-0.local.git<commit>`, which a released `1.5.0-1` replaces as an
+`1.6.0-0.local.git<commit>`, which a released `1.6.0-1` replaces as an
 ordinary upgrade. Copy it to the system it is for and install it as in
 [Quick start](#quick-start).
 

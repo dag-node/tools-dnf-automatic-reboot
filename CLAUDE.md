@@ -51,6 +51,7 @@ scripts/needs-reboot.sh         Reboot decision + false-positive filtering
 scripts/notify-failure.sh       OnFailure= notifier (wall + log)
 scripts/cancel-reboot.sh        Cancels a pending reboot and allows update runs again
 scripts/reboot-if-pending.sh    The scheduled reboot's command: reboots only while one is pending
+scripts/check-config.sh         Names how /etc/dnf/automatic-reboot.conf differs from the shipped one; never edits it
 scripts/reboot-request.sh       Reboot request/cancel protocol, sourced by the scripts that request, run or cancel reboots
 scripts/run-state.sh            State file protocol (atomic publish, snapshot, checked removal), sourced by run and watchdog
 units/dnf-automatic-reboot.service    Oneshot service wrapping run.sh
@@ -81,6 +82,7 @@ Files installed verbatim onto hosts (config, units, drop-ins) take no header; th
 ```
 /usr/libexec/dnf-automatic-reboot/     scripts/
 /etc/dnf/automatic-reboot.conf         config (%config noreplace)
+/usr/share/dnf-automatic-reboot/automatic-reboot.conf   the config as shipped, for check-config.sh
 /usr/lib/systemd/system/               unit files
 /usr/lib/tmpfiles.d/dnf-automatic-reboot.conf   log + state path creation
 /etc/logrotate.d/dnf-automatic-reboot  log rotation (%config noreplace)
@@ -273,6 +275,8 @@ phase=updating|checking
 start=<unix timestamp>
 start_uptime=<whole seconds of /proc/uptime>
 pid=<PID of run.sh>
+dnf_log_inode=<inode of /var/log/dnf.log before dnf-automatic, or none>
+dnf_log_offset=<its size then, or 0>
 ```
 
 The watchdog measures elapsed time from `start_uptime` (`CLOCK_BOOTTIME`);
@@ -441,10 +445,11 @@ number may belong to another process.
 
 Watchdog decisions by phase:
 
-| Phase | Soft timeout + dnf idle | Hard timeout |
-|-------|------------------------|--------------|
-| `updating` | Leave for hard timeout (unknown completion) | Kill cgroup + alert; reboot only if `force_reboot_on_hard_timeout=yes` |
-| `checking` | Run independent needs-reboot check, kill cgroup | Kill cgroup + reboot (dnf already returned cleanly) |
+| Phase | dnf phase | Stall, any age | Soft timeout + dnf idle | Hard timeout |
+|-------|-----------|----------------|------------------------|--------------|
+| `updating` | `download`, `checked` | No change for `watchdog_stall_min`: kill cgroup + alert, never reboot | Leave | Same stall rule |
+| `updating` | `transaction`, `unknown` | Leave | Leave for hard timeout (unknown completion) | Once the run's processes have read and written nothing for `watchdog_transaction_stall_min`: kill cgroup + alert naming `dnf history info last; dnf check`; never reboot |
+| `checking` | not read | Leave | Run independent needs-reboot check, kill cgroup | Kill cgroup + reboot (dnf already returned cleanly) |
 
 The independent check can hang like the one it replaces, so it runs under `timeout`
 at three times `needs_restarting_timeout_sec` and counts as undecidable (code 2) when
@@ -458,13 +463,64 @@ accepts only the old spelling, 252 accepts either; `systemctl_kill_target_option
 it from
 `systemctl --version`). On RHEL 8.10 (systemd 239), `--kill-who=all --signal=SIGKILL`
 on a transient unit killed an orphaned grandchild left in its cgroup, which is the case
-this kill exists for. `dnf-automatic` runs behind `systemd-inhibit` and
-`timeout(1)`, so signalling the recorded PID and its direct children leaves the rpm
-transaction running while the caller proceeds to reboot.
+this kill exists for. `dnf-automatic` runs behind `systemd-inhibit`, so signalling the
+recorded PID and its direct children leaves the rpm transaction running while the caller
+proceeds to reboot.
+
+A run that is still updating is never stopped while dnf works: a download over a slow link can
+take days, and an upgrade to the next minor EL release on a Raspberry Pi takes hours.
+dnf-automatic runs with no deadline; there is no setting for one, since a deadline stops dnf
+mid-transaction as readily as mid-download. Every watchdog cycle of an
+updating run records its progress signature in `/run/dnf-automatic-reboot.progress`: the
+processes in the unit's cgroup (`ControlGroup`, read from `cgroup.procs` under
+`/sys/fs/cgroup`, the systemd v1 hierarchy, or `unified`) and the sum of their `rchar` and
+`wchar` from `/proc/PID/io`. librepo writes each downloaded chunk to its file as it arrives,
+and rpm and its scriptlets read and write files, so both show; any change counts, a process
+starting or exiting included. dnf's cache and logs are not read for progress: every dnf command,
+`dnf-makecache.timer`'s included (every one to two hours on the surveyed hosts), writes its
+start line to `dnf.log` and `dnf.rpm.log`, so counting them would keep a hung run's window open
+indefinitely. The
+record carries the run's `pid` and `start_uptime`; a cycle that finds another run's record, or
+none, counts as progress now. Counters that cannot be read, or a record that cannot be written,
+kill nothing and fail the watchdog. dnf's own `minrate`, `timeout` and `retries` are left
+alone.
+
+How long a stall is tolerated depends on whether rpm has started changing the system, which
+`dnf_run_phase` reads from the run's part of `dnf.log`. dnf 4 writes each line as
+`<timestamp> <LEVEL> <message>`; its logging setup writes `--- logging initialized ---` at
+start, and `base.py` writes, at `INFO`, `Running transaction check`, `Transaction check
+succeeded.`, `Running transaction test`, `Transaction test succeeded.` and, right before rpm's
+transaction, `Running transaction`. Only those whole messages count (allowlist). `run.sh` records
+the log's inode and size in the state file before dnf-automatic starts; the watchdog reads from
+there, through one rotation to `dnf.log.1`. A run whose start line the parser has not
+recognised is `unknown`, as is a log it cannot follow (no position, a second rotation,
+`log_compress`): a log format other than the expected one never reads as "before the
+transaction". Another dnf command during the run can only add a `Running transaction`, which
+is the cautious direction.
+
+- `download` or `checked`: nothing installed. A stall of `watchdog_stall_min` (default 60) is
+  killed at any age; the next run finds the downloads in the cache.
+- `transaction` or `unknown`: a scriptlet rebuilding SELinux policy or an initramfs can run
+  long without a log line. Past `watchdog_hard_timeout_min` (default 320) the run is killed once
+  the signature has not changed for `watchdog_transaction_stall_min` (default 180); the slow run
+  is announced once.
+
+Neither window can be turned off. Both have a minimum of 1, and `get_config_integer` reports a
+lower value and uses the default: a window of 0 would kill an updating run at the hard timeout
+whatever dnf does, mid-transaction included. `tools/verify-el-prerequisites.sh` checks the messages, the line
+format and the log settings. On the surveyed OL 9.8 (dnf 4.14) and RHEL 8.10 (dnf 4.7) hosts it
+found all six messages in the source and in `dnf.log` as `<timestamp> INFO <message>`, in this
+order for every transaction, with `log_size` 1 MB, `log_rotate` 4 and `log_compress` off.
+
+320 stays below the six hours between runs of a four-a-day timer. A timer elapse during a run
+requests a start of an activating oneshot, which joins the running start job: that elapse is
+skipped, never overlapped. This is systemd's job model; the probe checks it.
 
 At hard timeout in `phase=updating` an rpm transaction may be half-applied. That is
-the same uncertainty for which the dead-PID path already refuses to reboot, so the
-default is to kill and alert. The reboot never uses `--force`, which remounts filesystems
+the same uncertainty for which the dead-PID path already refuses to reboot, so the watchdog
+kills and alerts, naming `dnf history info last; dnf check`, and reboots only from
+`phase=checking`; there is no setting that reboots after a kill in `phase=updating`. The reboot
+never uses `--force`, which remounts filesystems
 read-only under running processes, risks the rootfs on a flash-backed host, and overrides
 other users' inhibitors.
 
@@ -804,7 +860,12 @@ compares ELF notes and does not read the clock, so skew does not affect it.
 ## RPM packaging rules
 
 - `%config(noreplace)` on the config file and the logrotate drop-in — local edits
-  survive upgrades.
+  survive upgrades. So do the keys and values of an edited config, old defaults and keys no
+  version reads included, since every shipped key is set explicitly. `%posttrans` runs
+  `check-config.sh`, which compares it with the shipped copy in `/usr/share/dnf-automatic-reboot/`
+  (not `%doc`, which `--excludedocs` drops) and names keys not read, keys not set and values
+  that differ; `run.sh` logs the keys not read at every start, since an unattended upgrade
+  shows `%posttrans` output to nobody. Neither edits the file.
 - `%ghost` on the log file and both state files — RPM owns the path and SELinux label
   without owning content. `systemd-tmpfiles --create` in `%post` materialises them.
 - `%dir` on `/var/lib/dnf-automatic-reboot/` and on `%{_libexecdir}/%{name}` — both are
@@ -839,6 +900,11 @@ compares ELF notes and does not read the clock, so skew does not affect it.
 - `Requires: chrony` — `run.sh` runs `chronyc waitsync` before every update; `%pre` checks
   it too, for `--nodeps`. Installed does not mean running or synchronised, so the runtime
   check stays.
+- `Requires: rpm-plugin-systemd-inhibit` — rpm's plugin holds a block-mode shutdown inhibitor
+  for every transaction, one started by hand included, and `reboot-if-pending.sh` waits while
+  one is held. dnf 4 takes none of its own. `%pre` checks it for `--nodeps`. On both surveyed
+  hosts it is installed and loaded (`%{__transaction_systemd_inhibit}`), from AppStream on
+  OL 9.8 and BaseOS on RHEL 8.10.
 - `Requires: systemd >= 239` — EL8's systemd. Every unit directive and systemctl
   option the package uses exists there; the one renamed option is chosen at runtime
   (see the state file section).
@@ -964,7 +1030,7 @@ tail -f /var/log/dnf-automatic-reboot.log
 - Do not extend restart-state learning to `kernel*` packages — the version-string
   check is their sole, more authoritative, source of truth.
 - Do not kill the run by PID — `systemctl kill` the whole unit, or
-  `dnf-automatic` survives behind `timeout(1)`.
+  `dnf-automatic` survives behind `systemd-inhibit`.
 - Do not use `systemctl reboot --force`, nor `--check-inhibitors=yes`, which also refuses
   while another user is logged in. Reboot only through `reboot-if-pending.sh`, after
   `read_shutdown_block_state` reports `free`.

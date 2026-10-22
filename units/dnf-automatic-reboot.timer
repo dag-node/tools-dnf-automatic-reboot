@@ -1,3 +1,45 @@
+# dnf-automatic-reboot.timer
+#
+# Runs dnf-automatic-reboot.service once a day at 03:00 UTC, up to
+# 10 minutes later at random.  To change the schedule:
+#
+#   systemctl edit dnf-automatic-reboot.timer
+#
+#   [Timer]
+#   OnCalendar=
+#   OnCalendar=*-*-* 03:00:00 UTC
+#   OnCalendar=*-*-* 14:00:00 UTC
+#   OnCalendar=*-*-* 21:00:00 UTC
+#
+# The empty OnCalendar= clears this default.  A time without a zone is
+# the host's local time.  Keep runs more than watchdog_hard_timeout_min
+# (default 320 minutes) apart.  A run that dnf keeps busy longer is not
+# stopped; a slot that comes meanwhile joins that run and is skipped.
+#
+# Three runs a day, by where the users are.  PRG = Prague, NYC = New
+# York, SIN = Singapore.  PRG and NYC hours are winter/summer time; SIN
+# has no daylight saving time.
+#
+# Weight  UTC    PRG    NYC    SIN  Rationale
+# ------  -----  -----  -----  ---  ------------------------------------
+# US      03:00  04/05  22/23  11   EU night, US evening, Asia midday
+#         14:00  15/16  09/10  22   US workday starts, EU afternoon
+#         21:00  22/23  16/17  05   US afternoon, EU evening, Asia dawn
+# Asia    00:00  01/02  19/20  08   EU night, Asia morning, US evening
+#         09:00  10/11  04/05  17   Asia day ends, EU morning, US night
+#         17:00  18/19  12/13  01   Asia night, EU evening, US midday
+# EU      01:00  02/03  20/21  09   EU night, US evening, Asia morning
+#         10:00  11/12  05/06  18   EU workday, Asia evening, US night
+#         19:00  20/21  14/15  03   EU evening, US afternoon, Asia night
+# Global  01:00  02/03  20/21  09   EU night, US evening, Asia morning
+#         09:00  10/11  04/05  17   US night, EU workday, Asia day ends
+#         17:00  18/19  12/13  01   Asia night, EU evening, US midday
+#
+# Asia and the EU each get one slot in their night, 17:00 and 01:00 UTC.
+# No US slot falls in the US night; 09:00 UTC would.  Global puts one
+# slot in each region's night.  Four runs a day fit only six hours
+# apart, such as 03:00, 09:00, 15:00 and 21:00 UTC.
+
 [Unit]
 Description=dnf-automatic with inhibitor and conditional reboot
 Documentation=file:///usr/share/doc/dnf-automatic-reboot/README
@@ -6,7 +48,6 @@ Wants=network-online.target
 
 [Timer]
 OnCalendar=
-# Late night EU, low US usage
 OnCalendar=*-*-* 03:00:00 UTC
 RandomizedDelaySec=600
 

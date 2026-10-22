@@ -269,6 +269,95 @@ timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C check-update --security >/dev/null 2>
 report_info run.sh "dnf -q -C check-update --security exited ${check_update_exit_code} (0 none, 100 available)"
 
 # ---------------------------------------------------------------------------
+printf '== run progress\n'
+# ---------------------------------------------------------------------------
+# watchdog.sh dnf_progress_signature counts the processes in the run's cgroup
+# and their rchar and wchar.  Read here for systemd-journald.service, which
+# always runs, through the same hierarchies in the same order.
+report_info watchdog.sh "/sys/fs/cgroup is $(stat -f -c %T /sys/fs/cgroup 2>&1)"
+probe_control_group=$(systemctl show --property=ControlGroup --value systemd-journald.service 2>/dev/null) || true
+probe_cgroup_directory=""
+for probe_candidate in "/sys/fs/cgroup${probe_control_group}" "/sys/fs/cgroup/systemd${probe_control_group}" \
+                       "/sys/fs/cgroup/unified${probe_control_group}"; do
+    if [[ "${probe_control_group}" == /?* && -r "${probe_candidate}/cgroup.procs" ]]; then
+        probe_cgroup_directory="${probe_candidate}"
+        break
+    fi
+done
+if [[ -z "${probe_cgroup_directory}" ]]; then
+    report_fail watchdog.sh "no readable cgroup.procs for ControlGroup '${probe_control_group}'; the stall check cannot measure a run"
+else
+    report_pass watchdog.sh "cgroup.procs read from ${probe_cgroup_directory}"
+    probe_process_id=$(head -n 1 "${probe_cgroup_directory}/cgroup.procs" 2>/dev/null) || true
+    probe_io=$(grep -E '^(rchar|wchar): [0-9]+$' "/proc/${probe_process_id}/io" 2>/dev/null | paste -sd ' ' -) || true
+    if [[ "${probe_io}" =~ ^rchar:\ [0-9]+\ wchar:\ [0-9]+$ ]]; then
+        report_pass watchdog.sh "/proc/${probe_process_id}/io reads ${probe_io}"
+    else
+        report_fail watchdog.sh "/proc/${probe_process_id:-?}/io gave '${probe_io}'; the stall check cannot measure a run"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+printf '== dnf.log phase lines\n'
+# ---------------------------------------------------------------------------
+# watchdog.sh dnf_run_phase reads these whole messages from dnf.log, each as
+# "<timestamp> INFO <message>".  It stops a stalled run early only once it has
+# recognised dnf-automatic's start line and no "Running transaction".
+dnf_base_file=$(first_file /usr/lib/python3*/site-packages/dnf/base.py)
+dnf_logging_file=$(first_file /usr/lib/python3*/site-packages/dnf/logging.py)
+dnf_const_file=$(first_file /usr/lib/python3*/site-packages/dnf/const.py)
+for dnf_phase_message in 'Running transaction check' 'Transaction check succeeded.' \
+                         'Running transaction test' 'Transaction test succeeded.' 'Running transaction'; do
+    if grep -qF "logger.info(_('${dnf_phase_message}'))" "${dnf_base_file:-/dev/null}" 2>/dev/null; then
+        report_pass watchdog.sh "base.py logs '${dnf_phase_message}' at INFO"
+    else
+        report_fail watchdog.sh "base.py does not log '${dnf_phase_message}' at INFO; dnf_run_phase never sees it"
+    fi
+done
+if grep -qF "LOG_MARKER='--- logging initialized ---'" "${dnf_const_file:-/dev/null}" 2>/dev/null; then
+    report_pass watchdog.sh "const.py LOG_MARKER is '--- logging initialized ---'"
+else
+    report_fail watchdog.sh "no LOG_MARKER '--- logging initialized ---' in const.py; every run reads as phase unknown"
+fi
+if grep -qF '"%(asctime)s %(levelname)s %(message)s"' "${dnf_logging_file:-/dev/null}" 2>/dev/null; then
+    report_pass watchdog.sh "dnf.log lines are '<asctime> <levelname> <message>'"
+else
+    report_fail watchdog.sh "dnf.log format differs from '<asctime> <levelname> <message>'; every run reads as phase unknown"
+fi
+dnf_main_config=$(timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C config-manager --dump 2>/dev/null) || true
+grep -E '^(logdir|log_size|log_rotate|log_compress|logfilelevel) = ' <<< "${dnf_main_config}" \
+    | report_lines watchdog.sh "dnf.conf" || true
+# The lines the parser recognises in the log as it is now: how many of each,
+# and the last ones with their timestamps.
+if [[ -r /var/log/dnf.log ]]; then
+    for dnf_phase_message in '--- logging initialized ---' 'Running transaction check' 'Transaction check succeeded.' \
+                             'Running transaction test' 'Transaction test succeeded.' 'Running transaction'; do
+        report_info watchdog.sh "dnf.log lines '<time> INFO ${dnf_phase_message}': $(awk -v message="${dnf_phase_message}" \
+            '{ line = $0 } sub(/^[^ ]+ INFO /, "", line) && line == message { count++ } END { print count + 0 }' /var/log/dnf.log)"
+    done
+    grep -nE '^[^ ]+ INFO (Running transaction( check| test)?|Transaction (check|test) succeeded\.)$' /var/log/dnf.log \
+        | tail -n 10 | report_lines watchdog.sh "dnf.log" || true
+else
+    report_fail watchdog.sh "/var/log/dnf.log is not readable"
+fi
+
+# ---------------------------------------------------------------------------
+printf '== rpm systemd_inhibit plugin\n'
+# ---------------------------------------------------------------------------
+# Requires: rpm-plugin-systemd-inhibit.  The scheduled reboot waits while a
+# block inhibitor is held; with the plugin, every rpm transaction holds one.
+report_info spec "$(rpm -q rpm-plugin-systemd-inhibit 2>&1)"
+timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C repoquery --qf '%{name}-%{evr}.%{arch} %{repoid}' rpm-plugin-systemd-inhibit 2>&1 \
+    | report_lines spec "available" || true
+if rpm -q rpm-plugin-systemd-inhibit >/dev/null 2>&1 \
+   || [[ -n "$(timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C repoquery rpm-plugin-systemd-inhibit 2>/dev/null)" ]]; then
+    report_pass spec "rpm-plugin-systemd-inhibit is installed or available; Requires: can be met"
+else
+    report_fail spec "rpm-plugin-systemd-inhibit is neither installed nor available from an enabled repository"
+fi
+report_info reboot-if-pending.sh "rpm --eval %{__transaction_systemd_inhibit}: $(rpm --eval '%{?__transaction_systemd_inhibit}' 2>&1)"
+
+# ---------------------------------------------------------------------------
 printf '== boot loader\n'
 # ---------------------------------------------------------------------------
 if [[ -d /sys/firmware/efi ]]; then
