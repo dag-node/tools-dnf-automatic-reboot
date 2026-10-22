@@ -767,7 +767,10 @@ checks the clock itself before installing anything: `wait_for_clock_sync` runs
 `chronyc waitsync` (every 10 s, remaining correction below 0.1 s) for at most
 `clock_sync_wait_sec` (default 600) under `timeout`, since each request adds its own time to
 the polling interval and the run is not yet supervised by the watchdog; a run whose clock
-chronyd has not confirmed by then installs nothing and fails. A missing `chronyc` fails it too. `require_clock_sync = no`
+chronyd has not confirmed by then installs nothing and fails. The waiting query's output is
+discarded, since a client stopped by `timeout` can lose what it buffered; the error carries the
+last line of one more `chronyc waitsync`, bounded at 10 s, which says whether chronyd answered
+at all and with which reference. A missing `chronyc` fails it too. `require_clock_sync = no`
 turns the check off for a host without chrony. The check asks chronyd, not the kernel's
 synchronised flag (`timedatectl`'s `NTPSynchronized`). On Linux chrony clears `STA_UNSYNC`
 only with `rtcsync` (`sys_timex.c`, chrony 4.3), and the surveyed OL 9.8 aarch64 host, which

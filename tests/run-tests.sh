@@ -995,7 +995,11 @@ stub_run_main() {
     describe_installed_updates() { printf '%s' "Updates installed (packages: 2)"; }
     read_scheduled_reboot_status() { printf '%s' "${STUB_SCHEDULED_REBOOT_STATUS:-none}"; }
     chronyc_available() { [[ "${STUB_CHRONYC_MISSING:-}" != "yes" ]]; }
-    chronyc() { printf 'chronyc %s\n' "$*" >> "${STUB_LOG}"; return "${STUB_CHRONYC_RC:-0}"; }
+    chronyc() {
+        printf 'chronyc %s\n' "$*" >> "${STUB_LOG}"
+        printf '%s\n' "${STUB_CHRONYC_REPLY:-}"
+        return "${STUB_CHRONYC_RC:-0}"
+    }
     schedule_reboot() {
         printf 'schedule_reboot reboot_pending_file=%s\n' "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
         [[ "${STUB_SCHEDULE_FAILS:-}" == "yes" ]] && return 1
@@ -2488,6 +2492,25 @@ test_run_clock_wait_has_a_hard_deadline() {
         "SIGTERM at clock_sync_wait_sec, SIGKILL kill_grace_sec later"
     assert_not_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "nothing is installed"
     assert_contains "${output}" "still running at 600s" "and says why"
+    assert_contains "${output}" "(chronyc: no reply within 10s)" "and that chronyc did not answer either"
+}
+
+test_run_unsynchronised_clock_names_chronyc_reply() {
+    load_run_library
+    stub_run_main
+    # chronyd was never started: every query fails the same way.  The last
+    # line is what the log keeps, without its control character.
+    export STUB_CHRONYC_RC=1 STUB_CHRONYC_REPLY=$'try: 1, refid: 7F7F0101, correction: 0.0, skew: 0.0\n506 Cannot talk to daemon\x07'
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "an unconfirmed clock fails the run"
+    assert_contains "$(cat "${STUB_LOG}")" "chronyc waitsync 1 0.1 0 1" "one bounded query for the message"
+    assert_contains "${output}" "(chronyc: 506 Cannot talk to daemon) - check: systemctl status chronyd" \
+        "the failure says what chronyc answered"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/var/log/dnf-automatic-reboot.log")" "(chronyc: 506 Cannot talk to daemon)" \
+        "in the log file too"
+    [[ "${output}" == *$'\x07'* ]] && fail "the reply reaches the log as printable ASCII only"
+    return 0
 }
 
 test_run_without_chronyc_does_not_update() {
@@ -3438,6 +3461,7 @@ run_test "request: waiting timer is not scheduled twice" test_request_waiting_ti
 run_test "request: coherent snapshot sees a running service" test_request_coherent_snapshot_sees_a_running_service
 run_test "run: unsynchronised clock does not update" test_run_unsynchronised_clock_does_not_update
 run_test "run: clock wait has a hard deadline"      test_run_clock_wait_has_a_hard_deadline
+run_test "run: unsynchronised clock names chronyc reply" test_run_unsynchronised_clock_names_chronyc_reply
 run_test "run: without chronyc does not update"      test_run_without_chronyc_does_not_update
 run_test "run: clock requirement can be turned off"  test_run_clock_requirement_can_be_turned_off
 run_test "run: refreshes metadata before updating"   test_run_refreshes_metadata_before_updating
