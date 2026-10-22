@@ -513,7 +513,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   most clock_sync_wait_sec (new, default 600, enforced with timeout); otherwise it fails. The
   package now requires chrony. The unit's ordering after
   time-sync.target did not require synchronisation to succeed, so a failed chrony-wait.service
-  let updates run with a wrong clock. require_clock_sync = no (new) turns the check off.
+  let updates run with a wrong clock. require_clock_sync = no (new) turns the check off. The
+  failure carries chronyc's last answer, which says whether chronyd answered at all.
 - FIX: The reboot respects shutdown inhibitors. From a service, systemctl reboot skipped the
   inhibitor check, so a package transaction started by hand during reboot_delay_sec could be cut
   off. While a block inhibitor holds shutdown, the reboot is retried every 30 seconds for
