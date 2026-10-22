@@ -379,7 +379,11 @@ reason and the block inhibitors logind lists. Between attempts the reboot can be
 Nothing in the package uses `--force`: the watchdog's kill ends the stuck run's own inhibitor,
 and any other inhibitor belongs to somebody else. Its `OnFailure=` notice says whether update
 runs are still held, and names `cancel-reboot.sh` unless the dispatched file makes
-cancellation refuse.
+cancellation refuse. The notifier is passed the failed unit as `%i`; `%I` would turn every
+`-` in the name into `/`. It quotes the failed run by the unit's `InvocationID`, which a failed
+unit keeps until its next start (`_SYSTEMD_INVOCATION_ID` for the run's output,
+`INVOCATION_ID` for systemd's messages about it), and falls back to the unit's last lines when
+that selects nothing.
 
 **Reading systemd.** `read_unit_snapshot` reads `LoadState`, `ActiveState`, `SubState` and
 `Job` of one unit from one `systemctl show`, so the values describe one moment; a missing
