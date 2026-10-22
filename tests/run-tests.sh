@@ -385,7 +385,7 @@ test_config_every_key_resolves() {
     for config_key in filter_packages verify_kernel_version learn_false_positives \
                       verify_grub_default kernel_reboot_attempt_limit \
                       needs_restarting_timeout_sec reboot_delay_sec always_reboot \
-                      dnf_timeout_min kill_grace_sec restart_services \
+                      kill_grace_sec restart_services \
                       restart_services_exclude watchdog_soft_timeout_min \
                       watchdog_hard_timeout_min watchdog_stall_min watchdog_transaction_stall_min \
                       force_reboot_on_hard_timeout \
@@ -399,6 +399,72 @@ test_config_every_key_resolves() {
         fi
     done
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# check-config.sh: an edited configuration keeps old keys and old defaults
+# across upgrades; each one must be named, and the file never edited.
+# ---------------------------------------------------------------------------
+# install_shipped_config: the configuration as the package ships it.
+install_shipped_config() {
+    mkdir -p "${TEST_ROOT_DIR}/usr/share/dnf-automatic-reboot"
+    cp "${REPO_ROOT}/conf/automatic-reboot.conf" "${TEST_ROOT_DIR}/usr/share/dnf-automatic-reboot/automatic-reboot.conf"
+}
+
+test_check_config_unedited_is_silent() {
+    install_shipped_config
+    local output exit_code=0
+    output=$(bash "${REPO_ROOT}/scripts/check-config.sh" 2>&1) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the shipped file in place"
+    assert_equals "" "${output}" "nothing to report"
+}
+
+test_check_config_names_every_difference() {
+    install_shipped_config
+    local installed_config="${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf" checksum_before output exit_code=0
+    # An edited copy from an earlier version: an old default, a key added
+    # since, and a key no longer read.
+    sed -i -e 's/^watchdog_hard_timeout_min = 320$/watchdog_hard_timeout_min = 180/' \
+           -e '/^watchdog_transaction_stall_min = /d' "${installed_config}"
+    printf 'dnf_timeout_min = 60\n' >> "${installed_config}"
+    checksum_before=$(cksum < "${installed_config}")
+    output=$(bash "${REPO_ROOT}/scripts/check-config.sh" 2>&1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "differences found"
+    assert_contains "${output}" "not read by this version, remove the line:  dnf_timeout_min = 60" "the dead key"
+    assert_contains "${output}" "not set, the built-in default applies:  watchdog_transaction_stall_min = 180 (shipped)" \
+        "the new key"
+    assert_contains "${output}" "differs from the shipped value:  watchdog_hard_timeout_min = 180 (shipped: 320)" \
+        "the old default"
+    assert_contains "${output}" "Compare: diff -u /usr/share/dnf-automatic-reboot/automatic-reboot.conf /etc/dnf/automatic-reboot.conf" \
+        "and how to see the whole difference"
+    assert_equals "3" "$(grep -c '^  ' <<< "${output}")" "nothing else is reported"
+    assert_equals "${checksum_before}" "$(cksum < "${installed_config}")" "the operator's file is not edited"
+}
+
+test_check_config_reads_values_as_the_scripts_do() {
+    install_shipped_config
+    local installed_config="${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf" exit_code=0
+    # Spacing, a trailing comment, and an earlier line overridden by the last
+    # one: get_config_value reads the shipped values from all of them.
+    sed -i 's/^watchdog_stall_min = 60$/watchdog_stall_min = 5\n  watchdog_stall_min=60   # an hour/' "${installed_config}"
+    bash "${REPO_ROOT}/scripts/check-config.sh" >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the same values, written differently"
+}
+
+test_check_config_unread_lists_only_names() {
+    install_shipped_config
+    printf 'dnf_timeout_min = 60\nwatchdog_stall_min = 5\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    local output exit_code=0
+    output=$(bash "${REPO_ROOT}/scripts/check-config.sh" --unread 2>&1) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "an unread key found"
+    assert_equals "dnf_timeout_min" "${output}" "one name per line, nothing else"
+}
+
+test_check_config_without_shipped_copy_fails() {
+    local output exit_code=0
+    output=$(bash "${REPO_ROOT}/scripts/check-config.sh" 2>&1) || exit_code=$?
+    assert_exit_code 2 "${exit_code}" "nothing to compare with"
+    assert_contains "${output}" "cannot read /usr/share/dnf-automatic-reboot/automatic-reboot.conf" "says which file"
 }
 
 test_config_prefix_keys_do_not_collide() {
@@ -963,11 +1029,13 @@ test_decision_temporary_file_failure_removes_nothing() {
 # run: no update without the inhibitor lock
 # ---------------------------------------------------------------------------
 # stub_run_main: stubs every step of run.sh's main that would reach the host.
-# systemd-inhibit runs its command unless STUB_INHIBITOR_REFUSED=yes; timeout,
-# through which dnf-automatic runs, exits STUB_DNF_AUTOMATIC_RC.
+# systemd-inhibit runs its command unless STUB_INHIBITOR_REFUSED=yes;
+# dnf-automatic, a function named by its path, exits STUB_DNF_AUTOMATIC_RC.
+# The configuration check reports no unread key.
 stub_run_main() {
     check_conflicts() { :; }
     warn_on_unapplied_security_advisories() { :; }
+    warn_on_unread_config_keys() { :; }
     pgrep() { return 1; }
     systemd-inhibit() {
         printf 'systemd-inhibit %s\n' "$*" >> "${STUB_LOG}"
@@ -975,6 +1043,12 @@ stub_run_main() {
         while [[ "$1" == --* ]]; do shift; done
         "$@"
     }
+    # A function named by the path stands in for the program: systemd-inhibit's
+    # stub calls it directly, so no exec permission is needed.
+    eval "${DNF_AUTOMATIC_BIN}() {
+        printf 'dnf-automatic\n' >> \"\${STUB_LOG}\"
+        return \"\${STUB_DNF_AUTOMATIC_RC:-0}\"
+    }"
     # chronyc runs under timeout too: the stub passes it through, or reports
     # it stopped at the deadline with STUB_CHRONYC_TIMED_OUT=yes.  The
     # metadata refresh exits STUB_MAKECACHE_RC and prints STUB_MAKECACHE_OUTPUT.
@@ -990,7 +1064,7 @@ stub_run_main() {
             printf '%s' "${STUB_MAKECACHE_OUTPUT:-}"
             return "${STUB_MAKECACHE_RC:-0}"
         fi
-        return "${STUB_DNF_AUTOMATIC_RC:-0}"
+        return 0
     }
     run_reboot_check() { return "${STUB_NEEDS_REBOOT_RC:-0}"; }
     describe_installed_updates() { printf '%s' "Updates installed (packages: 2)"; }
@@ -1010,8 +1084,8 @@ stub_run_main() {
     }
 }
 
-# stub_service_restarts: timeout(1) runs dnf-automatic successfully, lists
-# STUB_STALE_SERVICES for needs-restarting -s, and exits with the
+# stub_service_restarts: timeout(1) lists STUB_STALE_SERVICES for
+# needs-restarting -s, and exits with the
 # STUB_RESTART_RC_<unit stem> of each try-restart, 0 when unset.
 stub_service_restarts() {
     timeout() {
@@ -1200,8 +1274,8 @@ test_run_update_runs_inside_the_inhibitor() {
     local inhibitor_call
     inhibitor_call=$(grep '^systemd-inhibit' "${STUB_LOG}")
     assert_contains "${inhibitor_call}" "--mode=block" "a blocking lock"
-    assert_contains "${inhibitor_call}" "timeout --kill-after=" "the update is the lock's own command"
-    assert_contains "${inhibitor_call}" "/usr/bin/dnf-automatic" "dnf-automatic runs under it"
+    assert_contains "${inhibitor_call}" "--mode=block ${DNF_AUTOMATIC_BIN}" \
+        "dnf-automatic is the lock's own command, with no deadline between them"
 }
 
 # ---------------------------------------------------------------------------
@@ -1466,10 +1540,10 @@ test_watchdog_warning_reaches_the_stub_not_the_host() {
 }
 
 test_watchdog_hard_timeout_while_updating_does_not_reboot() {
-    disable_watchdog_stall_check
     sleep 60 &
     local background_pid=$!
     write_watchdog_state updating 400 "${background_pid}"
+    stall_recorded_run "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
     local recorded_calls
@@ -1480,12 +1554,12 @@ test_watchdog_hard_timeout_while_updating_does_not_reboot() {
 }
 
 test_watchdog_hard_timeout_while_updating_can_be_forced() {
-    disable_watchdog_stall_check
     sed -i 's/^force_reboot_on_hard_timeout = no/force_reboot_on_hard_timeout = yes/' \
         "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
     sleep 60 &
     local background_pid=$!
     write_watchdog_state updating 400 "${background_pid}"
+    stall_recorded_run "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
     assert_contains "$(cat "${STUB_LOG}")" "reboot-if-pending.sh 60 1800" "opt-in override still works"
@@ -1514,11 +1588,11 @@ test_watchdog_kill_option_follows_systemd_version() {
 }
 
 test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who() {
-    disable_watchdog_stall_check
     export STUB_SYSTEMD_VERSION=239
     sleep 60 &
     local background_pid=$!
     write_watchdog_state updating 400 "${background_pid}"
+    stall_recorded_run "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
     assert_contains "$(cat "${STUB_LOG}")" "kill --kill-who=all" "EL8 spelling used on systemd 239"
@@ -1729,10 +1803,11 @@ test_watchdog_scheduled_reboot_keeps_runs_blocked() {
     return 0
 }
 
-# disable_watchdog_stall_check: the watchdog kills at the hard timeout
-# whatever dnf is doing, as before watchdog_stall_min existed.
-disable_watchdog_stall_check() {
-    printf '\nwatchdog_stall_min = 0\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+# stall_recorded_run PID: dnf has changed nothing for 190 minutes in the
+# 400-minute-old run write_watchdog_state wrote, past both stall windows, so
+# the watchdog run as a child process kills it at the hard timeout.
+stall_recorded_run() {
+    ( load_watchdog_library; write_stalled_progress_record "$1" 400 190 ) >/dev/null 2>&1
 }
 
 # write_stalled_progress_record PID AGE_MINUTES STALLED_MINUTES: the progress
@@ -1928,21 +2003,6 @@ test_watchdog_transaction_gets_the_longer_window() {
     assert_contains "$(cat "${STUB_LOG}")" "It is stopped only once dnf changes nothing for 180min." "and so do users"
 }
 
-test_watchdog_transaction_window_zero_kills_at_the_hard_timeout() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    printf '\nwatchdog_transaction_stall_min = 0\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    load_watchdog_library
-    write_watchdog_state updating 400 "${background_pid}"
-    start_run_dnf_log
-    append_dnf_log_messages "--- logging initialized ---" "Running transaction"
-    write_stalled_progress_record "${background_pid}" 400 0
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "killed at the hard timeout while dnf works"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "and not rebooted"
-}
 
 test_watchdog_progress_signature_sees_bytes_and_logs() {
     load_watchdog_library
@@ -2060,17 +2120,28 @@ test_watchdog_unrecordable_progress_stops_nothing() {
     assert_contains "$(cat "${LOG_FILE}")" "dnf progress cannot be recorded" "and says why"
 }
 
-test_watchdog_stall_check_off_kills_at_the_hard_timeout() {
+test_watchdog_stall_windows_cannot_be_turned_off() {
     sleep 60 &
     local background_pid=$! exit_code=0
-    disable_watchdog_stall_check
-    load_watchdog_library
+    # A window of 0 would kill at the hard timeout whatever dnf is doing.
+    printf '\nwatchdog_stall_min = 0\nwatchdog_transaction_stall_min = 0\n' \
+        >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    local load_output
+    load_output=$(load_watchdog_library 2>&1)
+    load_watchdog_library 2>/dev/null
+    assert_equals "60" "${STALL_MIN}" "watchdog_stall_min keeps its default"
+    assert_equals "180" "${TRANSACTION_STALL_MIN}" "watchdog_transaction_stall_min keeps its default"
+    assert_contains "${load_output}" "watchdog_stall_min=0 is outside 1..999999999 - using default 60" "and says so"
+    assert_contains "${load_output}" "watchdog_transaction_stall_min=0 is outside 1..999999999 - using default 180" "for both"
+    # A transaction past the hard timeout that changed something 10 minutes ago.
     write_watchdog_state updating 400 "${background_pid}"
-    write_stalled_progress_record "${background_pid}" 400 0
+    start_run_dnf_log
+    append_dnf_log_messages "--- logging initialized ---" "Running transaction"
+    write_stalled_progress_record "${background_pid}" 400 10
     stub_watchdog_kill_path
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
-    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "watchdog_stall_min = 0: killed even while dnf works"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "a working transaction is never killed"
 }
 
 test_watchdog_recovery_without_reboot_allows_runs_again() {
@@ -2862,41 +2933,45 @@ test_run_unsynchronised_clock_names_chronyc_reply() {
     return 0
 }
 
-test_run_warns_when_the_watchdog_would_end_the_update() {
-    # The stall check turned off and dnf_timeout_min raised past the hard
-    # timeout: the watchdog would kill the transaction first.
-    printf '\ndnf_timeout_min = 320\nwatchdog_stall_min = 0\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+test_run_has_no_dnf_deadline() {
+    # An edited configuration may still carry the deadline; nothing reads it.
+    printf '\ndnf_timeout_min = 60\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
     load_run_library
     stub_run_main
     local exit_code=0 output
     output=$( ( main ) 2>&1 ) || exit_code=$?
-    assert_exit_code 0 "${exit_code}" "a warning, not a failure"
-    assert_contains "${output}" "watchdog_hard_timeout_min = 320 does not exceed dnf_timeout_min = 320" \
-        "both settings are named"
-    assert_contains "${output}" "set watchdog_stall_min above 0, or raise watchdog_hard_timeout_min, in /etc/dnf/automatic-reboot.conf" \
-        "and the fixes"
-}
-
-test_run_stall_check_makes_a_long_deadline_safe() {
-    # With the stall check on, the watchdog leaves a working dnf alone past
-    # the hard timeout, so a long deadline is no conflict.
-    printf '\ndnf_timeout_min = 320\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    load_run_library
-    stub_run_main
-    local output
-    output=$( ( main ) 2>&1 ) || true
-    assert_not_contains "${output}" "does not exceed dnf_timeout_min" "no warning"
-}
-
-test_run_default_has_no_dnf_deadline() {
-    load_run_library
-    stub_run_main
-    local output
-    output=$( ( main ) 2>&1 ) || true
-    assert_contains "$(cat "${STUB_LOG}")" "timeout --kill-after=30s 0m ${DNF_AUTOMATIC_BIN}" \
-        "timeout(1) with 0 disables the deadline"
+    assert_exit_code 0 "${exit_code}" "the update ran"
+    assert_contains "$(cat "${STUB_LOG}")" "--mode=block ${DNF_AUTOMATIC_BIN}" \
+        "dnf-automatic runs under the lock alone"
+    assert_not_contains "$(grep '^timeout' "${STUB_LOG}")" "${DNF_AUTOMATIC_BIN}" "no timeout(1) around the update"
     assert_contains "${output}" "no deadline; the watchdog stops it only once dnf stalls" "and the log says so"
-    assert_not_contains "${output}" "does not exceed dnf_timeout_min" "no warning"
+}
+
+# stub_check_config_program: check-config.sh, called by run.sh through its
+# installed path, runs the repository's copy against the test tree.
+stub_check_config_program() {
+    eval "${LIBRARY_DIRECTORY}/check-config.sh() { bash \"\${REPO_ROOT}/scripts/check-config.sh\" \"\$@\"; }"
+}
+
+test_run_warns_about_unread_config_keys() {
+    install_shipped_config
+    printf '\ndnf_timeout_min = 60\nwatchdog_hard_timeout_min = 180\n' \
+        >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    load_run_library
+    stub_check_config_program
+    local output
+    output=$(warn_on_unread_config_keys 2>&1)
+    assert_contains "${output}" "/etc/dnf/automatic-reboot.conf sets dnf_timeout_min, which this version does not read - remove the line; all differences: /usr/libexec/dnf-automatic-reboot/check-config.sh" \
+        "the dead line is named, with the command for the full list"
+    assert_not_contains "${output}" "watchdog_hard_timeout_min" \
+        "a value the operator may have chosen is not repeated at every run"
+}
+
+test_run_unread_config_check_is_silent_without_differences() {
+    install_shipped_config
+    load_run_library
+    stub_check_config_program
+    assert_equals "" "$(warn_on_unread_config_keys 2>&1)" "nothing to report"
 }
 
 test_run_without_chronyc_does_not_update() {
@@ -3100,21 +3175,29 @@ test_invariant_every_script_is_shipped() {
     return 0
 }
 
-test_invariant_timeout_defaults_agree() {
-    # A script default only applies when the key is missing from the config;
-    # all three must say the same, or an older config silently changes them.
-    local conf_file="${REPO_ROOT}/conf/automatic-reboot.conf"
-    assert_equals "0" "$(sed -n 's/^dnf_timeout_min = //p' "${conf_file}")" "shipped dnf_timeout_min"
-    assert_equals "60" "$(sed -n 's/^watchdog_stall_min = //p' "${conf_file}")" "shipped watchdog_stall_min"
-    assert_equals "320" "$(sed -n 's/^watchdog_hard_timeout_min = //p' "${conf_file}")" "shipped watchdog_hard_timeout_min"
-    grep -q 'get_config_integer dnf_timeout_min 0)' "${REPO_ROOT}/scripts/run.sh" \
-        || fail "run.sh defaults dnf_timeout_min to 0"
-    assert_equals "2" "$(grep -c 'get_config_integer watchdog_stall_min 60)' \
-        "${REPO_ROOT}/scripts/run.sh" "${REPO_ROOT}/scripts/watchdog.sh" | grep -c ':1$')" \
-        "run.sh and watchdog.sh default watchdog_stall_min to 60"
-    assert_equals "2" "$(grep -c 'get_config_integer watchdog_hard_timeout_min 320)' \
-        "${REPO_ROOT}/scripts/run.sh" "${REPO_ROOT}/scripts/watchdog.sh" | grep -c ':1$')" \
-        "run.sh and watchdog.sh default watchdog_hard_timeout_min to 320"
+test_invariant_script_defaults_match_the_shipped_config() {
+    # A script default applies when the key is missing from the config, and
+    # check-config.sh names the shipped value as that default: every one-word
+    # default in the scripts must equal the shipped value.
+    local conf_file="${REPO_ROOT}/conf/automatic-reboot.conf" config_key default_value shipped_value
+    local checked_count=0
+    while read -r config_key default_value; do
+        shipped_value=$(sed -n "s/^${config_key} = //p" "${conf_file}")
+        assert_equals "${shipped_value}" "${default_value}" "default of ${config_key}"
+        checked_count=$(( checked_count + 1 ))
+    done < <(grep -ohE '\$\(get_config_(value|integer) [a-z_]+ [A-Za-z0-9_.-]+[ )]' "${REPO_ROOT}"/scripts/*.sh \
+             | tr -d ')' | awk '{ print $2, $3 }' | sort -u)
+    [[ "${checked_count}" -gt 20 ]] || fail "only ${checked_count} defaults found - the pattern no longer matches"
+    assert_equals "" "$(grep -n 'dnf_timeout_min' "${conf_file}" "${REPO_ROOT}"/scripts/*.sh)" \
+        "no deadline is configured or read"
+}
+
+test_invariant_posttrans_reports_config_differences() {
+    awk '/^%posttrans/ { in_posttrans = 1; next } /^%[a-z]/ { in_posttrans = 0 } in_posttrans' "${SPEC_FILE}" \
+        | grep -q '^%{pkglibexecdir}/check-config.sh || :$' \
+        || fail "%posttrans runs check-config.sh, and its findings never fail the transaction"
+    grep -q '^install -m 0644 conf/automatic-reboot.conf %{buildroot}%{_datadir}/%{name}/automatic-reboot.conf$' "${SPEC_FILE}" \
+        || fail "the shipped configuration is installed where check-config.sh reads it"
 }
 
 test_invariant_versions_agree() {
@@ -3763,6 +3846,11 @@ run_test "parser: yields nothing without bullets"    test_parser_yields_nothing_
 printf 'config\n'
 run_test "config: every documented key resolves"     test_config_every_key_resolves
 run_test "config: prefix keys do not collide"        test_config_prefix_keys_do_not_collide
+run_test "config check: unedited is silent"          test_check_config_unedited_is_silent
+run_test "config check: names every difference"      test_check_config_names_every_difference
+run_test "config check: reads values as scripts do"   test_check_config_reads_values_as_the_scripts_do
+run_test "config check: --unread lists only names"   test_check_config_unread_lists_only_names
+run_test "config check: no shipped copy fails"       test_check_config_without_shipped_copy_fails
 run_test "config: int rejects non-numeric"           test_config_int_rejects_non_numeric
 run_test "config: int rejects negative"              test_config_int_rejects_negative
 run_test "config: int reads leading zeros as decimal" test_config_int_reads_leading_zeros_as_decimal
@@ -3928,9 +4016,9 @@ run_test "request: coherent snapshot sees a running service" test_request_cohere
 run_test "run: unsynchronised clock does not update" test_run_unsynchronised_clock_does_not_update
 run_test "run: clock wait has a hard deadline"      test_run_clock_wait_has_a_hard_deadline
 run_test "run: unsynchronised clock names chronyc reply" test_run_unsynchronised_clock_names_chronyc_reply
-run_test "run: warns when the watchdog would end the update" test_run_warns_when_the_watchdog_would_end_the_update
-run_test "run: stall check makes a long deadline safe" test_run_stall_check_makes_a_long_deadline_safe
-run_test "run: default has no dnf deadline"          test_run_default_has_no_dnf_deadline
+run_test "run: has no dnf deadline"                  test_run_has_no_dnf_deadline
+run_test "run: warns about unread config keys"       test_run_warns_about_unread_config_keys
+run_test "run: unread config check silent when same" test_run_unread_config_check_is_silent_without_differences
 run_test "run: without chronyc does not update"      test_run_without_chronyc_does_not_update
 run_test "run: clock requirement can be turned off"  test_run_clock_requirement_can_be_turned_off
 run_test "run: refreshes metadata before updating"   test_run_refreshes_metadata_before_updating
@@ -3949,7 +4037,6 @@ run_test "watchdog: short stall before the transaction is left running" test_wat
 run_test "watchdog: stall in the transaction waits for the hard timeout" test_watchdog_stall_in_the_transaction_waits_for_the_hard_timeout
 run_test "watchdog: unknown phase is not stopped early" test_watchdog_unknown_phase_is_not_stopped_early
 run_test "watchdog: transaction gets the longer window" test_watchdog_transaction_gets_the_longer_window
-run_test "watchdog: transaction window 0 kills at the hard timeout" test_watchdog_transaction_window_zero_kills_at_the_hard_timeout
 run_test "watchdog: progress signature sees bytes and logs" test_watchdog_progress_signature_sees_bytes_and_logs
 run_test "watchdog: progressing update is left running" test_watchdog_progressing_update_is_left_running
 run_test "watchdog: stalled update is stopped"     test_watchdog_stalled_update_is_stopped
@@ -3957,7 +4044,7 @@ run_test "watchdog: dnf activity restarts the stall window" test_watchdog_dnf_ac
 run_test "watchdog: records each run from its first cycle" test_watchdog_records_progress_of_each_run_from_its_first_cycle
 run_test "watchdog: records progress before the hard timeout" test_watchdog_records_progress_before_the_hard_timeout
 run_test "watchdog: unrecordable progress stops nothing" test_watchdog_unrecordable_progress_stops_nothing
-run_test "watchdog: stall check off kills at the hard timeout" test_watchdog_stall_check_off_kills_at_the_hard_timeout
+run_test "watchdog: stall windows cannot be turned off" test_watchdog_stall_windows_cannot_be_turned_off
 run_test "invariant: only reboot-if-pending reboots" test_invariant_only_reboot_if_pending_reboots
 run_test "invariant: marker removers are known"     test_invariant_marker_removers_are_known
 run_test "invariant: dispatched file removed only on refusal" test_invariant_dispatched_file_is_removed_only_on_refusal
@@ -3968,7 +4055,8 @@ run_test "invariant: flock uses documented short options" test_invariant_flock_u
 run_test "invariant: state file written only by rename" test_invariant_state_file_written_only_by_rename
 run_test "invariant: probe assigns its library before use" test_invariant_probe_assigns_its_library_before_use
 run_test "invariant: every script is shipped"       test_invariant_every_script_is_shipped
-run_test "invariant: timeout defaults agree"        test_invariant_timeout_defaults_agree
+run_test "invariant: script defaults match the shipped config" test_invariant_script_defaults_match_the_shipped_config
+run_test "invariant: posttrans reports config differences" test_invariant_posttrans_reports_config_differences
 run_test "invariant: versions agree"                test_invariant_versions_agree
 run_test "reader: unit snapshot job forms"          test_reader_unit_snapshot_job_forms
 run_test "reader: scheduled reboot status table"    test_reader_scheduled_reboot_status_table

@@ -99,6 +99,7 @@ install -m 0750 scripts/needs-reboot.sh   %{buildroot}%{pkglibexecdir}/needs-reb
 install -m 0750 scripts/notify-failure.sh %{buildroot}%{pkglibexecdir}/notify-failure.sh
 install -m 0750 scripts/cancel-reboot.sh  %{buildroot}%{pkglibexecdir}/cancel-reboot.sh
 install -m 0750 scripts/reboot-if-pending.sh %{buildroot}%{pkglibexecdir}/reboot-if-pending.sh
+install -m 0750 scripts/check-config.sh   %{buildroot}%{pkglibexecdir}/check-config.sh
 install -m 0640 scripts/reboot-request.sh %{buildroot}%{pkglibexecdir}/reboot-request.sh
 install -m 0640 scripts/run-state.sh      %{buildroot}%{pkglibexecdir}/run-state.sh
 
@@ -114,6 +115,10 @@ install -m 0644 units/dnf-automatic-reboot-notify@.service %{buildroot}%{_unitdi
 install -d -m 0755 %{buildroot}%{_sysconfdir}/dnf
 install -m 0640 conf/automatic-reboot.conf \
     %{buildroot}%{_sysconfdir}/dnf/automatic-reboot.conf
+# The same file as shipped, never edited: check-config.sh compares the one in
+# /etc with it.  Not %%doc, which --excludedocs leaves out.
+install -d -m 0755 %{buildroot}%{_datadir}/%{name}
+install -m 0644 conf/automatic-reboot.conf %{buildroot}%{_datadir}/%{name}/automatic-reboot.conf
 
 # tmpfiles.d - owns the mode and label of the log and state paths
 install -d -m 0755 %{buildroot}%{_tmpfilesdir}
@@ -414,6 +419,13 @@ echo "  1. Review /etc/dnf/automatic-reboot.conf"
 echo "  2. Enable this package:"
 echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer"
 
+%posttrans
+# The configuration is %%config(noreplace): an edited copy keeps its keys and
+# values, old defaults included, across upgrades.  Name every difference from
+# the shipped one; the file itself is the operator's and is not edited.
+# %%posttrans, so the copy in /etc is final whichever way rpm resolved it.
+%{pkglibexecdir}/check-config.sh || :
+
 %preun
 %systemd_preun dnf-automatic-reboot.service
 %systemd_preun dnf-automatic-reboot.timer
@@ -440,6 +452,7 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %attr(0750, root, root) %{pkglibexecdir}/notify-failure.sh
 %attr(0750, root, root) %{pkglibexecdir}/cancel-reboot.sh
 %attr(0750, root, root) %{pkglibexecdir}/reboot-if-pending.sh
+%attr(0750, root, root) %{pkglibexecdir}/check-config.sh
 # Sourced by run.sh, watchdog.sh, cancel-reboot.sh and reboot-if-pending.sh;
 # never executed.
 %attr(0640, root, root) %{pkglibexecdir}/reboot-request.sh
@@ -456,6 +469,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 
 # Config - preserved across upgrades; root:root 640 (no world read for safety)
 %config(noreplace) %attr(0640, root, root) %{_sysconfdir}/dnf/automatic-reboot.conf
+# The config as shipped, for check-config.sh
+%dir %{_datadir}/%{name}
+%{_datadir}/%{name}/automatic-reboot.conf
 
 # tmpfiles.d - creates the log and state paths with the modes declared below
 %{_tmpfilesdir}/%{name}.conf
@@ -481,18 +497,22 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   keeps its own time. The timer does not start on a host booted from rpm-ostree.
 - CHANGE: An update is not stopped while dnf is still working, so a download over a slow link
   or an upgrade to the next minor EL release on a slow host is not cut off halfway.
-  dnf_timeout_min defaults to 0, no deadline (was 60). The watchdog reads from dnf.log whether
-  rpm's transaction has started. Before it has, a run in which nothing in /var/cache/dnf or dnf's
-  logs changed for watchdog_stall_min (new, default 60) is stopped at any age; nothing was
-  installed, and the next run retries. Once it has, the watchdog waits past
-  watchdog_hard_timeout_min (now 320, was 180) until nothing has changed for
-  watchdog_transaction_stall_min (new, default 180), so a long silent scriptlet is not killed,
-  and tells logged-in users once that the run is still going. An edited automatic-reboot.conf
-  keeps its own values; set dnf_timeout_min = 0 there.
+  dnf_timeout_min is removed: its deadline stopped dnf whatever it was doing, an rpm
+  transaction included. The watchdog reads from dnf.log whether rpm's transaction has started.
+  Before it has, a run in which nothing in /var/cache/dnf or dnf's logs changed for
+  watchdog_stall_min (new, default 60) is stopped at any age; nothing was installed, and the
+  next run retries. Once it has, the watchdog waits past watchdog_hard_timeout_min (now 320,
+  was 180) until nothing has changed for watchdog_transaction_stall_min (new, default 180), so
+  a long silent scriptlet is not killed, and tells logged-in users once that the run is still
+  going. Neither stall window can be turned off: a value below 1 is reported and the default
+  used.
 - CHANGE: The package requires rpm-plugin-systemd-inhibit. With it, an rpm transaction started
   by hand holds the scheduled reboot until it ends, instead of being stopped halfway.
-- NEW: run.sh warns at every start when watchdog_stall_min = 0 and a non-zero dnf_timeout_min
-  reaches past watchdog_hard_timeout_min, since the watchdog would then kill a long update first.
+- NEW: Installing or upgrading the package lists every difference between
+  /etc/dnf/automatic-reboot.conf and the configuration it ships: keys no longer read, keys not
+  set, and values that differ, such as an old default kept by an edited copy. The file is not
+  edited. /usr/libexec/dnf-automatic-reboot/check-config.sh prints the same list on demand,
+  and each run warns about a key it does not read.
 - NEW: When the watchdog stops a run whose rpm transaction may be incomplete, its message names
   the commands that show what to repair: dnf history info last; dnf check.
 - FIX: A scheduled reboot goes ahead while users are logged in. systemctl reboot

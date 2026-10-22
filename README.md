@@ -159,7 +159,15 @@ after that, restarts for new kernels are held back, and the log says so, until
 ## Changing the settings
 
 Settings are in `/etc/dnf/automatic-reboot.conf`; each one is explained in the
-file. The ones people change most:
+file. An upgrade keeps your copy as it is. After installing or upgrading, the
+installer lists every line that differs from the settings the new version
+ships: settings it no longer reads, new settings your copy does not have, and
+values that differ, such as a default from an older version. It changes
+nothing; edit the file by hand where you want the new value. Run
+`sudo /usr/libexec/dnf-automatic-reboot/check-config.sh` to see the list again.
+A setting that is no longer read is also named in the log at every run.
+
+The settings people change most:
 
 | Setting | Default | Meaning |
 |---|---|---|

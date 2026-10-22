@@ -56,8 +56,17 @@ Files installed
       The command of the scheduled reboot; reboots only while one is
       pending.  Not for interactive use.
 
+  /usr/libexec/dnf-automatic-reboot/check-config.sh
+      Lists how /etc/dnf/automatic-reboot.conf differs from the shipped
+      configuration: keys not read, keys not set, values that differ.  Run by
+      the RPM after every install and upgrade, and by hand.  Never edits the
+      file.  With --unread, run.sh logs the keys not read at every start.
+
   /etc/dnf/automatic-reboot.conf
       Configuration.  Preserved across upgrades (%config(noreplace) in RPM).
+
+  /usr/share/dnf-automatic-reboot/automatic-reboot.conf
+      The configuration as shipped, which check-config.sh compares with.
 
   /usr/lib/systemd/system/dnf-automatic-reboot.service
   /usr/lib/systemd/system/dnf-automatic-reboot.timer

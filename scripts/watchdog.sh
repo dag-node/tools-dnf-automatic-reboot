@@ -148,8 +148,10 @@ get_config_integer() {
 
 SOFT_TIMEOUT_MIN=$(get_config_integer watchdog_soft_timeout_min 60)
 HARD_TIMEOUT_MIN=$(get_config_integer watchdog_hard_timeout_min 320)
-STALL_MIN=$(get_config_integer watchdog_stall_min 60)
-TRANSACTION_STALL_MIN=$(get_config_integer watchdog_transaction_stall_min 180)
+# Neither stall window can be turned off: without one, an updating run would be
+# killed at the hard timeout whatever dnf is doing, mid-transaction included.
+STALL_MIN=$(get_config_integer watchdog_stall_min 60 1)
+TRANSACTION_STALL_MIN=$(get_config_integer watchdog_transaction_stall_min 180 1)
 REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300 1 86400)
 FORCE_REBOOT_ON_HARD_TIMEOUT=$(get_config_value force_reboot_on_hard_timeout no)
 KILL_CONFIRM_SEC=$(get_config_integer watchdog_kill_confirm_sec 30)
@@ -641,7 +643,7 @@ main() {
     # STALL_MIN is stopped whatever the run's age.  Nothing is rebooted:
     # nothing was installed.
     # ---------------------------------------------------------------------------
-    if [[ "${run_phase}" == "updating" && "${STALL_MIN}" -gt 0 && "${dnf_progress_recorded}" == "yes" ]] \
+    if [[ "${run_phase}" == "updating" && "${dnf_progress_recorded}" == "yes" ]] \
        && dnf_phase_is_before_transaction "${dnf_phase}" \
        && [[ "${DNF_STALLED_MINUTES}" -ge "${STALL_MIN}" ]]; then
         log_error "dnf changed nothing in its cache or logs for ${DNF_STALLED_MINUTES}min and has not started its rpm transaction (dnf phase: ${dnf_phase}) - stopping the run; nothing was installed"
@@ -671,18 +673,13 @@ main() {
     # download on a slow link, or a long transaction, is left to finish.  A
     # stall that cannot be confirmed, because the progress record cannot be
     # written, kills nothing and fails the unit so OnFailure= reports it.
-    # STALL_MIN 0 kills at the hard timeout, and so does TRANSACTION_STALL_MIN
-    # 0 once the transaction may have started.
     # ---------------------------------------------------------------------------
     if [[ "${elapsed_min}" -ge "${HARD_TIMEOUT_MIN}" ]]; then
-        stall_window_min=0
-        if [[ "${run_phase}" == "updating" && "${STALL_MIN}" -gt 0 ]]; then
+        if [[ "${run_phase}" == "updating" ]]; then
             stall_window_min="${TRANSACTION_STALL_MIN}"
             if dnf_phase_is_before_transaction "${dnf_phase}"; then
                 stall_window_min="${STALL_MIN}"
             fi
-        fi
-        if [[ "${stall_window_min}" -gt 0 ]]; then
             if [[ "${dnf_progress_recorded}" != "yes" ]]; then
                 log_error "hard timeout ${HARD_TIMEOUT_MIN}min passed in phase=updating, but dnf progress cannot be recorded in ${PROGRESS_FILE} - not stopping a run that may still be working"
                 exit 1
@@ -715,10 +712,6 @@ main() {
                 log_error "reboot request failed - the host was not rebooted"
                 exit 1
             fi
-        elif dnf_phase_is_before_transaction "${dnf_phase}"; then
-            log_error "phase=${run_phase} at hard timeout, before the rpm transaction (dnf phase: ${dnf_phase}) - nothing was installed, NOT rebooting"
-            wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded before installing anything." \
-                     "Killed the stuck run. Nothing was installed; the next run tries again."
         else
             log_error "phase=${run_phase} at hard timeout (dnf phase: ${dnf_phase}) - an rpm transaction may be incomplete, NOT rebooting; set force_reboot_on_hard_timeout=yes to override. ${INTERRUPTED_TRANSACTION_CHECK}"
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded in phase=${run_phase}." \

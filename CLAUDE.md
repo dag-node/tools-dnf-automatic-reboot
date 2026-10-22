@@ -51,6 +51,7 @@ scripts/needs-reboot.sh         Reboot decision + false-positive filtering
 scripts/notify-failure.sh       OnFailure= notifier (wall + log)
 scripts/cancel-reboot.sh        Cancels a pending reboot and allows update runs again
 scripts/reboot-if-pending.sh    The scheduled reboot's command: reboots only while one is pending
+scripts/check-config.sh         Names how /etc/dnf/automatic-reboot.conf differs from the shipped one; never edits it
 scripts/reboot-request.sh       Reboot request/cancel protocol, sourced by the scripts that request, run or cancel reboots
 scripts/run-state.sh            State file protocol (atomic publish, snapshot, checked removal), sourced by run and watchdog
 units/dnf-automatic-reboot.service    Oneshot service wrapping run.sh
@@ -81,6 +82,7 @@ Files installed verbatim onto hosts (config, units, drop-ins) take no header; th
 ```
 /usr/libexec/dnf-automatic-reboot/     scripts/
 /etc/dnf/automatic-reboot.conf         config (%config noreplace)
+/usr/share/dnf-automatic-reboot/automatic-reboot.conf   the config as shipped, for check-config.sh
 /usr/lib/systemd/system/               unit files
 /usr/lib/tmpfiles.d/dnf-automatic-reboot.conf   log + state path creation
 /etc/logrotate.d/dnf-automatic-reboot  log rotation (%config noreplace)
@@ -461,13 +463,14 @@ accepts only the old spelling, 252 accepts either; `systemctl_kill_target_option
 it from
 `systemctl --version`). On RHEL 8.10 (systemd 239), `--kill-who=all --signal=SIGKILL`
 on a transient unit killed an orphaned grandchild left in its cgroup, which is the case
-this kill exists for. `dnf-automatic` runs behind `systemd-inhibit` and
-`timeout(1)`, so signalling the recorded PID and its direct children leaves the rpm
-transaction running while the caller proceeds to reboot.
+this kill exists for. `dnf-automatic` runs behind `systemd-inhibit`, so signalling the
+recorded PID and its direct children leaves the rpm transaction running while the caller
+proceeds to reboot.
 
 A run that is still updating is never stopped while dnf works: a download over a slow link can
 take days, and an upgrade to the next minor EL release on a Raspberry Pi takes hours.
-`dnf_timeout_min` defaults to 0, no deadline (`timeout 0m`). Every watchdog cycle of an
+dnf-automatic runs with no deadline; there is no setting for one, since a deadline stops dnf
+mid-transaction as readily as mid-download. Every watchdog cycle of an
 updating run records dnf's progress signature in `/run/dnf-automatic-reboot.progress`: the
 number and total size of the files under `/var/cache/dnf` and the sizes of `dnf.rpm.log`,
 `dnf.librepo.log` and `dnf.log`. One package can take hours with no log line, so the cache bytes
@@ -498,10 +501,9 @@ is the cautious direction.
   the signature has not changed for `watchdog_transaction_stall_min` (default 180); the slow run
   is announced once.
 
-`watchdog_stall_min = 0` turns the stall check off: an updating run is killed at the hard
-timeout whatever dnf does, and `run.sh` then warns when a non-zero `dnf_timeout_min` reaches past
-it. `watchdog_transaction_stall_min = 0` does the same once the
-transaction may have started. `tools/verify-el-prerequisites.sh` checks the messages, the line
+Neither window can be turned off. Both have a minimum of 1, and `get_config_integer` reports a
+lower value and uses the default: a window of 0 would kill an updating run at the hard timeout
+whatever dnf does, mid-transaction included. `tools/verify-el-prerequisites.sh` checks the messages, the line
 format and the log settings. On the surveyed OL 9.8 (dnf 4.14) and RHEL 8.10 (dnf 4.7) hosts it
 found all six messages in the source and in `dnf.log` as `<timestamp> INFO <message>`, in this
 order for every transaction, with `log_size` 1 MB, `log_rotate` 4 and `log_compress` off.
@@ -852,7 +854,12 @@ compares ELF notes and does not read the clock, so skew does not affect it.
 ## RPM packaging rules
 
 - `%config(noreplace)` on the config file and the logrotate drop-in — local edits
-  survive upgrades.
+  survive upgrades. So do the keys and values of an edited config, old defaults and keys no
+  version reads included, since every shipped key is set explicitly. `%posttrans` runs
+  `check-config.sh`, which compares it with the shipped copy in `/usr/share/dnf-automatic-reboot/`
+  (not `%doc`, which `--excludedocs` drops) and names keys not read, keys not set and values
+  that differ; `run.sh` logs the keys not read at every start, since an unattended upgrade
+  shows `%posttrans` output to nobody. Neither edits the file.
 - `%ghost` on the log file and both state files — RPM owns the path and SELinux label
   without owning content. `systemd-tmpfiles --create` in `%post` materialises them.
 - `%dir` on `/var/lib/dnf-automatic-reboot/` and on `%{_libexecdir}/%{name}` — both are
@@ -1017,7 +1024,7 @@ tail -f /var/log/dnf-automatic-reboot.log
 - Do not extend restart-state learning to `kernel*` packages — the version-string
   check is their sole, more authoritative, source of truth.
 - Do not kill the run by PID — `systemctl kill` the whole unit, or
-  `dnf-automatic` survives behind `timeout(1)`.
+  `dnf-automatic` survives behind `systemd-inhibit`.
 - Do not use `systemctl reboot --force`, nor `--check-inhibitors=yes`, which also refuses
   while another user is logged in. Reboot only through `reboot-if-pending.sh`, after
   `read_shutdown_block_state` reports `free`.
