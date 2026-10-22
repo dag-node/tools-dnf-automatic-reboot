@@ -448,7 +448,7 @@ Watchdog decisions by phase:
 | Phase | dnf phase | Stall, any age | Soft timeout + dnf idle | Hard timeout |
 |-------|-----------|----------------|------------------------|--------------|
 | `updating` | `download`, `checked` | No change for `watchdog_stall_min`: kill cgroup + alert, never reboot | Leave | Same stall rule |
-| `updating` | `transaction`, `unknown` | Leave | Leave for hard timeout (unknown completion) | Once dnf has changed nothing for `watchdog_transaction_stall_min`: kill cgroup + alert naming `dnf history info last; dnf check`; reboot only if `force_reboot_on_hard_timeout=yes` |
+| `updating` | `transaction`, `unknown` | Leave | Leave for hard timeout (unknown completion) | Once the run's processes have read and written nothing for `watchdog_transaction_stall_min`: kill cgroup + alert naming `dnf history info last; dnf check`; reboot only if `force_reboot_on_hard_timeout=yes` |
 | `checking` | not read | Leave | Run independent needs-reboot check, kill cgroup | Kill cgroup + reboot (dnf already returned cleanly) |
 
 The independent check can hang like the one it replaces, so it runs under `timeout`
@@ -471,15 +471,19 @@ A run that is still updating is never stopped while dnf works: a download over a
 take days, and an upgrade to the next minor EL release on a Raspberry Pi takes hours.
 dnf-automatic runs with no deadline; there is no setting for one, since a deadline stops dnf
 mid-transaction as readily as mid-download. Every watchdog cycle of an
-updating run records dnf's progress signature in `/run/dnf-automatic-reboot.progress`: the
-number and total size of the files under `/var/cache/dnf` and the sizes of `dnf.rpm.log`,
-`dnf.librepo.log` and `dnf.log`. One package can take hours with no log line, so the cache bytes
-are the download signal; rpm's log is the transaction's. Any change counts, a shrinking cache
-included. The record carries the run's `pid` and `start_uptime`; a cycle that finds another
-run's record, or none, counts as progress now. A record that cannot be written kills nothing and
-fails the watchdog. dnf's own `minrate`, `timeout` and `retries` are left alone. Whether a
-download grows its cache file while bytes arrive, rather than appearing whole at the end, needs
-a host reading.
+updating run records its progress signature in `/run/dnf-automatic-reboot.progress`: the
+processes in the unit's cgroup (`ControlGroup`, read from `cgroup.procs` under
+`/sys/fs/cgroup`, the systemd v1 hierarchy, or `unified`) and the sum of their `rchar` and
+`wchar` from `/proc/PID/io`. librepo writes each downloaded chunk to its file as it arrives,
+and rpm and its scriptlets read and write files, so both show; any change counts, a process
+starting or exiting included. dnf's cache and logs are not read for progress: every dnf command,
+`dnf-makecache.timer`'s included (every one to two hours on the surveyed hosts), writes its
+start line to `dnf.log` and `dnf.rpm.log`, so counting them would keep a hung run's window open
+indefinitely. The
+record carries the run's `pid` and `start_uptime`; a cycle that finds another run's record, or
+none, counts as progress now. Counters that cannot be read, or a record that cannot be written,
+kill nothing and fail the watchdog. dnf's own `minrate`, `timeout` and `retries` are left
+alone.
 
 How long a stall is tolerated depends on whether rpm has started changing the system, which
 `dnf_run_phase` reads from the run's part of `dnf.log`. dnf 4 writes each line as

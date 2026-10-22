@@ -269,6 +269,35 @@ timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C check-update --security >/dev/null 2>
 report_info run.sh "dnf -q -C check-update --security exited ${check_update_exit_code} (0 none, 100 available)"
 
 # ---------------------------------------------------------------------------
+printf '== run progress\n'
+# ---------------------------------------------------------------------------
+# watchdog.sh dnf_progress_signature counts the processes in the run's cgroup
+# and their rchar and wchar.  Read here for systemd-journald.service, which
+# always runs, through the same hierarchies in the same order.
+report_info watchdog.sh "/sys/fs/cgroup is $(stat -f -c %T /sys/fs/cgroup 2>&1)"
+probe_control_group=$(systemctl show --property=ControlGroup --value systemd-journald.service 2>/dev/null) || true
+probe_cgroup_directory=""
+for probe_candidate in "/sys/fs/cgroup${probe_control_group}" "/sys/fs/cgroup/systemd${probe_control_group}" \
+                       "/sys/fs/cgroup/unified${probe_control_group}"; do
+    if [[ "${probe_control_group}" == /?* && -r "${probe_candidate}/cgroup.procs" ]]; then
+        probe_cgroup_directory="${probe_candidate}"
+        break
+    fi
+done
+if [[ -z "${probe_cgroup_directory}" ]]; then
+    report_fail watchdog.sh "no readable cgroup.procs for ControlGroup '${probe_control_group}'; the stall check cannot measure a run"
+else
+    report_pass watchdog.sh "cgroup.procs read from ${probe_cgroup_directory}"
+    probe_process_id=$(head -n 1 "${probe_cgroup_directory}/cgroup.procs" 2>/dev/null) || true
+    probe_io=$(grep -E '^(rchar|wchar): [0-9]+$' "/proc/${probe_process_id}/io" 2>/dev/null | paste -sd ' ' -) || true
+    if [[ "${probe_io}" =~ ^rchar:\ [0-9]+\ wchar:\ [0-9]+$ ]]; then
+        report_pass watchdog.sh "/proc/${probe_process_id}/io reads ${probe_io}"
+    else
+        report_fail watchdog.sh "/proc/${probe_process_id:-?}/io gave '${probe_io}'; the stall check cannot measure a run"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 printf '== dnf.log phase lines\n'
 # ---------------------------------------------------------------------------
 # watchdog.sh dnf_run_phase reads these whole messages from dnf.log, each as

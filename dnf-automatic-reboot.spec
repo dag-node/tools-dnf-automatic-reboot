@@ -499,12 +499,13 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   or an upgrade to the next minor EL release on a slow host is not cut off halfway.
   dnf_timeout_min is removed: its deadline stopped dnf whatever it was doing, an rpm
   transaction included. The watchdog reads from dnf.log whether rpm's transaction has started.
-  Before it has, a run in which nothing in /var/cache/dnf or dnf's logs changed for
-  watchdog_stall_min (new, default 60) is stopped at any age; nothing was installed, and the
-  next run retries. Once it has, the watchdog waits past watchdog_hard_timeout_min (now 320,
-  was 180) until nothing has changed for watchdog_transaction_stall_min (new, default 180), so
-  a long silent scriptlet is not killed, and tells logged-in users once that the run is still
-  going. Neither stall window can be turned off: a value below 1 is reported and the default
+  Progress is what the run's own processes read and write, so dnf-makecache.timer and other
+  dnf commands do not keep a hung run alive. Before the transaction has started, a run whose
+  processes read and wrote nothing for watchdog_stall_min (new, default 60) is stopped at any
+  age; nothing was installed, and the next run retries. Once it has, the watchdog waits past
+  watchdog_hard_timeout_min (now 320, was 180) until they have been idle for
+  watchdog_transaction_stall_min (new, default 180), so a long quiet scriptlet is not killed,
+  and tells logged-in users once that the run is still going. Neither stall window can be turned off: a value below 1 is reported and the default
   used.
 - CHANGE: The package requires rpm-plugin-systemd-inhibit. With it, an rpm transaction started
   by hand holds the scheduled reboot until it ends, instead of being stopped halfway.

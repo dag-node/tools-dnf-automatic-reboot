@@ -170,6 +170,7 @@ if [[ "$1" == "show" ]]; then
         *scheduled-reboot.service:LoadState,*)
             printf 'LoadState=not-found\nActiveState=inactive\nSubState=dead\n' ;;
         *:ActiveState) printf '%s\n' "${STUB_ACTIVE_STATE:-failed}" ;;
+        *:ControlGroup) printf '%s\n' "${STUB_CONTROL_GROUP-/system.slice/dnf-automatic-reboot.service}" ;;
         *)             printf '%s\n' "${STUB_MAIN_PID:-}" ;;
     esac
     exit 0
@@ -307,6 +308,8 @@ load_watchdog_library() {
     source "${REPO_ROOT}/scripts/watchdog.sh"
     set +e
     IFS=$' \t\n'
+    # The stub systemctl's answer, without executing it.
+    unit_control_group() { printf '%s' "${STUB_CONTROL_GROUP-/system.slice/dnf-automatic-reboot.service}"; }
 }
 
 load_run_library() {
@@ -1480,6 +1483,25 @@ write_watchdog_state() {
         "${run_phase}" "$(( $(date +%s) - wall_clock_age_minutes * 60 ))" \
         "$(( TEST_UPTIME_SECONDS - age_minutes * 60 ))" "${recorded_pid}" \
         > "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state"
+    write_run_cgroup "${recorded_pid}"
+    write_process_io "${recorded_pid}" 1000 2000
+}
+
+# Where the stub systemctl's ControlGroup lies in the test tree's cgroup v2
+# hierarchy.
+readonly TEST_RUN_CGROUP=/sys/fs/cgroup/system.slice/dnf-automatic-reboot.service
+
+# write_run_cgroup PID... - the processes in the run's cgroup.
+write_run_cgroup() {
+    mkdir -p "${TEST_ROOT_DIR}${TEST_RUN_CGROUP}"
+    printf '%s\n' "$@" > "${TEST_ROOT_DIR}${TEST_RUN_CGROUP}/cgroup.procs"
+}
+
+# write_process_io PID RCHAR WCHAR - /proc/PID/io as the kernel prints it.
+write_process_io() {
+    mkdir -p "${TEST_ROOT_DIR}/proc/$1"
+    printf 'rchar: %s\nwchar: %s\nsyscr: 7\nsyscw: 3\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n' \
+        "$2" "$3" > "${TEST_ROOT_DIR}/proc/$1/io"
 }
 
 test_watchdog_ignores_wall_clock_step() {
@@ -1998,28 +2020,77 @@ test_watchdog_transaction_gets_the_longer_window() {
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 0 "${exit_code}" "a silent scriptlet is no failure"
     assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "70 minutes is within the transaction's window"
-    assert_contains "$(cat "${LOG_FILE}")" "(dnf phase: transaction); dnf changed its cache or logs 70min ago - left running until nothing changes for 180min" \
+    assert_contains "$(cat "${LOG_FILE}")" "(dnf phase: transaction); its processes last read or wrote 70min ago - left running until they stop for 180min" \
         "the log names the window that applies"
-    assert_contains "$(cat "${STUB_LOG}")" "It is stopped only once dnf changes nothing for 180min." "and so do users"
+    assert_contains "$(cat "${STUB_LOG}")" "It is stopped only once its processes read and write nothing for 180min." "and so do users"
 }
 
 
-test_watchdog_progress_signature_sees_bytes_and_logs() {
+test_watchdog_progress_counts_only_the_runs_processes() {
     load_watchdog_library
-    mkdir -p "${DNF_CACHE_DIRECTORY}/baseos/packages" "${TEST_ROOT_DIR}/var/log"
-    printf 'part' > "${DNF_CACHE_DIRECTORY}/baseos/packages/glibc.rpm"
-    local before_download after_download after_transaction
+    write_run_cgroup 101 102
+    write_process_io 101 500 0
+    write_process_io 102 1000 2000
+    local before_download after_other_dnf after_download
     before_download=$(dnf_progress_signature)
-    # A slow link: the same file grows, no new file, no log line.
-    printf 'more bytes' >> "${DNF_CACHE_DIRECTORY}/baseos/packages/glibc.rpm"
+    assert_equals "processes=2 read=1500 written=2000" "${before_download}" "summed over the cgroup"
+    # dnf-makecache.timer, or a dnf run by hand, writes to dnf's cache and logs.
+    mkdir -p "${TEST_ROOT_DIR}/var/cache/dnf/baseos"
+    printf 'metadata' > "${TEST_ROOT_DIR}/var/cache/dnf/baseos/repomd.xml"
+    append_dnf_log_messages "--- logging initialized ---" "Metadata cache created."
+    after_other_dnf=$(dnf_progress_signature)
+    assert_equals "${before_download}" "${after_other_dnf}" "another dnf command is not this run's progress"
+    # librepo writes the next chunk of a package to its file.
+    write_process_io 102 1000 6096
     after_download=$(dnf_progress_signature)
-    [[ "${after_download}" != "${before_download}" ]] || fail "bytes arriving in one file are progress"
-    printf 'Upgrade: glibc\n' >> "${DNF_RPM_LOG_FILE}"
-    after_transaction=$(dnf_progress_signature)
-    [[ "${after_transaction}" != "${after_download}" ]] || fail "a transaction step is progress"
-    rm -f "${DNF_CACHE_DIRECTORY}/baseos/packages/glibc.rpm"
-    [[ "$(dnf_progress_signature)" != "${after_transaction}" ]] || fail "a cache emptied after a transaction is progress"
-    return 0
+    [[ "${after_download}" != "${after_other_dnf}" ]] || fail "bytes the run writes are progress"
+    # A scriptlet that exited, its counters gone with it.
+    write_run_cgroup 101
+    [[ "$(dnf_progress_signature)" != "${after_download}" ]] || fail "a process exiting is progress"
+    # A process listed but already gone from /proc is left out.
+    write_run_cgroup 101 103
+    assert_equals "processes=1 read=500 written=0" "$(dnf_progress_signature)" "only readable counters count"
+}
+
+test_watchdog_progress_finds_the_cgroup_v1_hierarchy() {
+    load_watchdog_library
+    # EL8 (cgroup v1): systemd's named hierarchy lists the unit's processes.
+    mkdir -p "${TEST_ROOT_DIR}/sys/fs/cgroup/systemd/system.slice/dnf-automatic-reboot.service"
+    printf '201\n' > "${TEST_ROOT_DIR}/sys/fs/cgroup/systemd/system.slice/dnf-automatic-reboot.service/cgroup.procs"
+    write_process_io 201 10 20
+    assert_equals "processes=1 read=10 written=20" "$(dnf_progress_signature)" "the v1 cgroup is read"
+}
+
+test_watchdog_unreadable_progress_is_no_signature() {
+    load_watchdog_library
+    local exit_code=0
+    dnf_progress_signature >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "no cgroup in the tree"
+    write_run_cgroup 101
+    exit_code=0
+    dnf_progress_signature >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "a process whose counters cannot be read"
+    export STUB_CONTROL_GROUP=""
+    write_process_io 101 1 1
+    exit_code=0
+    dnf_progress_signature >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "systemctl does not name the cgroup"
+}
+
+test_watchdog_other_dnf_commands_do_not_hold_a_stalled_run() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state updating 400 "${background_pid}"
+    write_stalled_progress_record "${background_pid}" 400 190
+    # dnf-makecache.timer ran since the last cycle.
+    mkdir -p "${TEST_ROOT_DIR}/var/cache/dnf/baseos"
+    printf 'metadata' > "${TEST_ROOT_DIR}/var/cache/dnf/baseos/repomd.xml"
+    append_dnf_log_messages "--- logging initialized ---" "Metadata cache created."
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "the hung run is stopped"
 }
 
 test_watchdog_progressing_update_is_left_running() {
@@ -2035,7 +2106,7 @@ test_watchdog_progressing_update_is_left_running() {
     assert_exit_code 0 "${exit_code}" "a working dnf is no failure"
     assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "past the hard timeout, dnf changed something 10 minutes ago"
     assert_equals "1" "$(grep -c 'the update has run past 320min' "${STUB_LOG}")" "logged-in users are told once"
-    assert_contains "$(cat "${LOG_FILE}")" "left running until nothing changes for 180min" "the log says why"
+    assert_contains "$(cat "${LOG_FILE}")" "left running until they stop for 180min" "the log says why"
     [[ -f "${STATE_FILE}" ]] || fail "the run stays supervised"
     return 0
 }
@@ -2052,7 +2123,7 @@ test_watchdog_stalled_update_is_stopped() {
     assert_exit_code 0 "${exit_code}" "a confirmed stall is recovered"
     assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "nothing changed for 190 minutes: killed"
     assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "and, still updating, not rebooted"
-    assert_contains "$(cat "${LOG_FILE}")" "dnf changed nothing in its cache or logs for 190min (dnf phase: unknown)" \
+    assert_contains "$(cat "${LOG_FILE}")" "the run's processes read and wrote nothing for 190min (dnf phase: unknown)" \
         "the log says why"
     assert_contains "$(cat "${LOG_FILE}")" "Check: dnf history info last; dnf check" "and what to inspect"
     assert_contains "$(cat "${STUB_LOG}")" "Check: dnf history info last; dnf check" "so do users"
@@ -2063,11 +2134,9 @@ test_watchdog_dnf_activity_restarts_the_stall_window() {
     local background_pid=$! exit_code=0
     load_watchdog_library
     write_watchdog_state updating 400 "${background_pid}"
-    mkdir -p "${DNF_CACHE_DIRECTORY}/appstream/packages"
-    printf 'part' > "${DNF_CACHE_DIRECTORY}/appstream/packages/firefox.rpm"
-    write_stalled_progress_record "${background_pid}" 400 70
-    # One more chunk arrived since the last cycle.
-    printf 'chunk' >> "${DNF_CACHE_DIRECTORY}/appstream/packages/firefox.rpm"
+    write_stalled_progress_record "${background_pid}" 400 190
+    # One more chunk was written since the last cycle.
+    write_process_io "${background_pid}" 1000 2500
     stub_watchdog_kill_path
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
@@ -2117,7 +2186,22 @@ test_watchdog_unrecordable_progress_stops_nothing() {
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 1 "${exit_code}" "the watchdog fails, so OnFailure= reports it"
     assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "a stall that cannot be confirmed kills nothing"
-    assert_contains "$(cat "${LOG_FILE}")" "dnf progress cannot be recorded" "and says why"
+    assert_contains "$(cat "${LOG_FILE}")" "its progress cannot be recorded (${PROGRESS_FILE} cannot be written)" "and says why"
+}
+
+test_watchdog_unreadable_counters_stop_nothing() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state updating 400 "${background_pid}"
+    write_stalled_progress_record "${background_pid}" 400 190
+    rm -f "${TEST_ROOT_DIR}/proc/${background_pid}/io"
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "the watchdog fails, so OnFailure= reports it"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "a stall that cannot be measured kills nothing"
+    assert_contains "$(cat "${LOG_FILE}")" "the I/O counters of dnf-automatic-reboot.service's processes cannot be read" "and says why"
 }
 
 test_watchdog_stall_windows_cannot_be_turned_off() {
@@ -4037,13 +4121,17 @@ run_test "watchdog: short stall before the transaction is left running" test_wat
 run_test "watchdog: stall in the transaction waits for the hard timeout" test_watchdog_stall_in_the_transaction_waits_for_the_hard_timeout
 run_test "watchdog: unknown phase is not stopped early" test_watchdog_unknown_phase_is_not_stopped_early
 run_test "watchdog: transaction gets the longer window" test_watchdog_transaction_gets_the_longer_window
-run_test "watchdog: progress signature sees bytes and logs" test_watchdog_progress_signature_sees_bytes_and_logs
+run_test "watchdog: progress counts only the run's processes" test_watchdog_progress_counts_only_the_runs_processes
+run_test "watchdog: progress finds the cgroup v1 hierarchy" test_watchdog_progress_finds_the_cgroup_v1_hierarchy
+run_test "watchdog: unreadable progress is no signature" test_watchdog_unreadable_progress_is_no_signature
+run_test "watchdog: other dnf commands do not hold a stalled run" test_watchdog_other_dnf_commands_do_not_hold_a_stalled_run
 run_test "watchdog: progressing update is left running" test_watchdog_progressing_update_is_left_running
 run_test "watchdog: stalled update is stopped"     test_watchdog_stalled_update_is_stopped
 run_test "watchdog: dnf activity restarts the stall window" test_watchdog_dnf_activity_restarts_the_stall_window
 run_test "watchdog: records each run from its first cycle" test_watchdog_records_progress_of_each_run_from_its_first_cycle
 run_test "watchdog: records progress before the hard timeout" test_watchdog_records_progress_before_the_hard_timeout
 run_test "watchdog: unrecordable progress stops nothing" test_watchdog_unrecordable_progress_stops_nothing
+run_test "watchdog: unreadable counters stop nothing" test_watchdog_unreadable_counters_stop_nothing
 run_test "watchdog: stall windows cannot be turned off" test_watchdog_stall_windows_cannot_be_turned_off
 run_test "invariant: only reboot-if-pending reboots" test_invariant_only_reboot_if_pending_reboots
 run_test "invariant: marker removers are known"     test_invariant_marker_removers_are_known

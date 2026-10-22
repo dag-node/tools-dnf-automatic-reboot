@@ -15,14 +15,14 @@
 #                         Do NOT reboot: updates may be partial.
 #
 #  3. PID alive, dnf    - In phase=updating, before dnf.log shows the rpm
-#     stalled before      transaction starting, nothing has changed on the
-#     its transaction     host: once dnf's cache and logs stay unchanged for
-#                         watchdog_stall_min, kill the service cgroup at any
-#                         age.  Never reboot.
+#     stalled before      transaction starting, rpm has changed nothing on
+#     its transaction     the host: once the run's processes read and write
+#                         nothing for watchdog_stall_min, kill the service
+#                         cgroup at any age.  Never reboot.
 #
 #  4. PID alive, hard   - run.sh has been running longer than
 #     timeout exceeded    watchdog_hard_timeout_min.  In phase=updating,
-#                         wait while dnf's cache or logs still change,
+#                         wait while the run's processes still read or write,
 #                         until nothing has for watchdog_stall_min, or for
 #                         watchdog_transaction_stall_min once the rpm
 #                         transaction has started, then kill the service
@@ -67,11 +67,9 @@ readonly SYSTEMD_RUN_BIN="${TEST_ROOT}/usr/bin/systemd-run"
 readonly SYSTEMCTL_BIN="${TEST_ROOT}/usr/bin/systemctl"
 readonly MAIN_SERVICE_UNIT=dnf-automatic-reboot.service
 readonly SCRIPT_NAME=watchdog
-# What dnf changes while it works: package and metadata downloads land in
-# its cache, a transaction appends to dnf.rpm.log.
-readonly DNF_CACHE_DIRECTORY="${TEST_ROOT}/var/cache/dnf"
-readonly DNF_RPM_LOG_FILE="${TEST_ROOT}/var/log/dnf.rpm.log"
-readonly DNF_LIBREPO_LOG_FILE="${TEST_ROOT}/var/log/dnf.librepo.log"
+# Where the run's processes and their I/O counters are read.
+readonly CGROUP_ROOT="${TEST_ROOT}/sys/fs/cgroup"
+readonly PROC_DIRECTORY="${TEST_ROOT}/proc"
 readonly DNF_LOG_FILE="${TEST_ROOT}/var/log/dnf.log"
 # dnf renames dnf.log to this at log_size (1 MB by default).
 readonly DNF_ROTATED_LOG_FILE="${DNF_LOG_FILE}.1"
@@ -160,25 +158,60 @@ REBOOT_REQUEST_LOCK_WAIT_SEC=$(get_config_integer reboot_request_lock_wait_sec 6
 REBOOT_INHIBITED_WAIT_SEC=$(get_config_integer reboot_inhibited_wait_sec 1800 0 86400)
 
 # ---------------------------------------------------------------------------
-# dnf progress.  A run past the hard timeout in phase=updating is stopped only
-# once dnf has stopped changing anything.  On a slow link one package can take
-# hours with no log line; the bytes in the cache are the finer signal.
+# dnf progress.  An updating run is stopped only once its own processes have
+# stopped reading and writing.  Every other dnf command, dnf-makecache.timer's
+# included, writes to dnf's cache and logs too, so neither is a signal of
+# this run's progress: the processes in the unit's cgroup are.  librepo writes
+# each downloaded chunk to its file as it arrives, and rpm and its scriptlets
+# read and write files, so both show in the counters.
 # ---------------------------------------------------------------------------
 
-# dnf_progress_signature -> "FILES BYTES RPM_LOG LIBREPO_LOG DNF_LOG": the
-# number and total size of the files under dnf's cache, and the size of each
-# dnf log ("none" when missing).  Any difference between two cycles is
-# progress, a shrinking cache included: dnf removes packages after a
-# transaction.
-dnf_progress_signature() {
-    local cache_totals log_file log_sizes=""
-    cache_totals=$(find "${DNF_CACHE_DIRECTORY}" -type f -printf '%s\n' 2>/dev/null \
-                   | awk '{ file_count += 1; byte_count += $1 } END { printf "%d %d", file_count, byte_count }') \
-        || cache_totals="unreadable"
-    for log_file in "${DNF_RPM_LOG_FILE}" "${DNF_LIBREPO_LOG_FILE}" "${DNF_LOG_FILE}"; do
-        log_sizes+=" $(stat -c %s "${log_file}" 2>/dev/null || printf 'none')"
+# unit_control_group -> the service unit's ControlGroup, empty when systemctl
+# does not answer.
+unit_control_group() {
+    "${SYSTEMCTL_BIN}" show --property=ControlGroup --value "${MAIN_SERVICE_UNIT}" 2>/dev/null || true
+}
+
+# unit_cgroup_directory -> the unit's cgroup directory in the hierarchy that
+# lists its processes: the unified one (cgroup v2), else systemd's named
+# hierarchy (cgroup v1), else the unified one of a hybrid mount.  Returns 1
+# when none of them has a readable cgroup.procs.
+unit_cgroup_directory() {
+    local control_group cgroup_directory
+    control_group=$(unit_control_group)
+    [[ "${control_group}" == /?* ]] || return 1
+    for cgroup_directory in "${CGROUP_ROOT}${control_group}" "${CGROUP_ROOT}/systemd${control_group}" \
+                            "${CGROUP_ROOT}/unified${control_group}"; do
+        if [[ -r "${cgroup_directory}/cgroup.procs" ]]; then
+            printf '%s' "${cgroup_directory}"
+            return 0
+        fi
     done
-    printf '%s%s' "${cache_totals}" "${log_sizes}"
+    return 1
+}
+
+# dnf_progress_signature -> "processes=N read=BYTES written=BYTES": the
+# processes in the unit's cgroup and its child cgroups, and the sum of their
+# rchar and wchar from /proc/PID/io.  Any difference between two cycles is
+# progress, a process starting or exiting included.  A process that exits
+# between the listing and the read is left out.  Returns 1 when the cgroup
+# cannot be read or lists no process whose counters can be read.
+dnf_progress_signature() {
+    local cgroup_directory process_ids process_id io_counters
+    local process_count=0 read_total=0 written_total=0
+    cgroup_directory=$(unit_cgroup_directory) || return 1
+    process_ids=$(find "${cgroup_directory}" -name cgroup.procs -exec cat {} + 2>/dev/null) || return 1
+    while IFS= read -r process_id; do
+        [[ "${process_id}" =~ ^[0-9]+$ ]] || continue
+        io_counters=$(cat "${PROC_DIRECTORY}/${process_id}/io" 2>/dev/null) || continue
+        [[ "${io_counters}" =~ (^|$'\n')rchar:\ ([0-9]+) ]] || continue
+        read_total=$(( read_total + BASH_REMATCH[2] ))
+        [[ "${io_counters}" =~ (^|$'\n')wchar:\ ([0-9]+) ]] || continue
+        written_total=$(( written_total + BASH_REMATCH[2] ))
+        process_count=$(( process_count + 1 ))
+    done <<< "${process_ids}"
+    (( process_count > 0 )) || return 1
+    printf 'processes=%d read=%d written=%d' "${process_count}" "${read_total}" "${written_total}"
 }
 
 # write_dnf_progress_record RUN_IDENTITY SIGNATURE CHANGED_UPTIME_SECONDS ANNOUNCED
@@ -195,18 +228,22 @@ write_dnf_progress_record() {
 }
 
 # update_dnf_progress_record RUN_IDENTITY CURRENT_UPTIME_SECONDS
-# Compares dnf's progress signature with PROGRESS_FILE and sets
+# Compares the run's progress signature with PROGRESS_FILE and sets
 #   DNF_PROGRESS_SIGNATURE  the signature now
 #   DNF_STALLED_MINUTES     whole minutes since it last changed
 #   DNF_SLOW_RUN_ANNOUNCED  yes once the slow run has been announced
+#   DNF_PROGRESS_FAILURE    why the record was not updated, on return 1
 # RUN_IDENTITY, "PID START_UPTIME", ties the record to one run: the first
 # cycle that sees a run, and every change of signature, counts as progress
-# now.  Returns 1 when the record cannot be written, since a stall then
-# cannot be told from progress.
+# now.  Returns 1 when the signature cannot be read or the record cannot be
+# written, since a stall then cannot be told from progress.
 update_dnf_progress_record() {
     local run_identity="$1" current_uptime_seconds="$2" record_line
     local recorded_identity="" recorded_signature="" changed_uptime_seconds="" announced="no"
-    DNF_PROGRESS_SIGNATURE=$(dnf_progress_signature)
+    if ! DNF_PROGRESS_SIGNATURE=$(dnf_progress_signature); then
+        DNF_PROGRESS_FAILURE="the I/O counters of ${MAIN_SERVICE_UNIT}'s processes cannot be read"
+        return 1
+    fi
     if [[ -f "${PROGRESS_FILE}" ]]; then
         while IFS= read -r record_line; do
             case "${record_line}" in
@@ -225,6 +262,7 @@ update_dnf_progress_record() {
         changed_uptime_seconds="${current_uptime_seconds}"
         if ! write_dnf_progress_record "${run_identity}" "${DNF_PROGRESS_SIGNATURE}" \
                 "${changed_uptime_seconds}" "${announced}"; then
+            DNF_PROGRESS_FAILURE="${PROGRESS_FILE} cannot be written"
             return 1
         fi
     fi
@@ -233,12 +271,12 @@ update_dnf_progress_record() {
 }
 
 # announce_slow_run RUN_IDENTITY STALL_WINDOW_MIN - tells logged-in users once
-# per run that it has passed the hard timeout and is left running while dnf
-# makes progress.
+# per run that it has passed the hard timeout and is left running while its
+# processes read or write.
 announce_slow_run() {
     local run_identity="$1" stall_window_min="$2" changed_uptime_seconds=""
     wall_msg "dnf-automatic-reboot: the update has run past ${HARD_TIMEOUT_MIN}min and dnf is still working." \
-             "It is stopped only once dnf changes nothing for ${stall_window_min}min. Do not reboot meanwhile."
+             "It is stopped only once its processes read and write nothing for ${stall_window_min}min. Do not reboot meanwhile."
     changed_uptime_seconds=$(sed -n 's/^changed_uptime=//p' "${PROGRESS_FILE}" 2>/dev/null) || changed_uptime_seconds=""
     write_dnf_progress_record "${run_identity}" "${DNF_PROGRESS_SIGNATURE}" "${changed_uptime_seconds}" yes \
         || log_warning "cannot record the announcement in ${PROGRESS_FILE} - it may be repeated"
@@ -630,7 +668,7 @@ main() {
             dnf_progress_recorded=yes
             log "dnf progress: ${DNF_PROGRESS_SIGNATURE} (unchanged for ${DNF_STALLED_MINUTES}min), dnf phase: ${dnf_phase}"
         else
-            log_warning "cannot write ${PROGRESS_FILE} - dnf progress not recorded this cycle (dnf phase: ${dnf_phase})"
+            log_warning "${DNF_PROGRESS_FAILURE} - progress not recorded this cycle (dnf phase: ${dnf_phase})"
         fi
     fi
 
@@ -646,7 +684,7 @@ main() {
     if [[ "${run_phase}" == "updating" && "${dnf_progress_recorded}" == "yes" ]] \
        && dnf_phase_is_before_transaction "${dnf_phase}" \
        && [[ "${DNF_STALLED_MINUTES}" -ge "${STALL_MIN}" ]]; then
-        log_error "dnf changed nothing in its cache or logs for ${DNF_STALLED_MINUTES}min and has not started its rpm transaction (dnf phase: ${dnf_phase}) - stopping the run; nothing was installed"
+        log_error "the run's processes read and wrote nothing for ${DNF_STALLED_MINUTES}min and dnf has not started its rpm transaction (dnf phase: ${dnf_phase}) - stopping the run; nothing was installed"
         begin_recovery
         kill_result=0
         kill_service_cgroup "${state_snapshot}" "${service_pid}" || kill_result=$?
@@ -666,13 +704,14 @@ main() {
     # not, so an rpm transaction may be half-applied - the same uncertainty for
     # which scenario 2 already refuses to reboot.  Rebooting there is opt-in.
     #
-    # In phase=updating the run is killed only once dnf has stopped: nothing in
-    # its cache or logs changed for STALL_MIN before the rpm transaction, or for
-    # TRANSACTION_STALL_MIN once it may have started - a scriptlet rebuilding
-    # SELinux policy or an initramfs writes no log line for a long time.  A
-    # download on a slow link, or a long transaction, is left to finish.  A
-    # stall that cannot be confirmed, because the progress record cannot be
-    # written, kills nothing and fails the unit so OnFailure= reports it.
+    # In phase=updating the run is killed only once its processes have stopped
+    # reading and writing for STALL_MIN before the rpm transaction, or for
+    # TRANSACTION_STALL_MIN once it may have started - a scriptlet compiling
+    # SELinux policy can run for a long time with little I/O.  A download on a
+    # slow link, or a long transaction, is left to finish.  A stall that cannot
+    # be confirmed, because the counters cannot be read or the progress record
+    # cannot be written, kills nothing and fails the unit so OnFailure=
+    # reports it.
     # ---------------------------------------------------------------------------
     if [[ "${elapsed_min}" -ge "${HARD_TIMEOUT_MIN}" ]]; then
         if [[ "${run_phase}" == "updating" ]]; then
@@ -681,17 +720,17 @@ main() {
                 stall_window_min="${STALL_MIN}"
             fi
             if [[ "${dnf_progress_recorded}" != "yes" ]]; then
-                log_error "hard timeout ${HARD_TIMEOUT_MIN}min passed in phase=updating, but dnf progress cannot be recorded in ${PROGRESS_FILE} - not stopping a run that may still be working"
+                log_error "hard timeout ${HARD_TIMEOUT_MIN}min passed in phase=updating, but its progress cannot be recorded (${DNF_PROGRESS_FAILURE}) - not stopping a run that may still be working"
                 exit 1
             fi
             if [[ "${DNF_STALLED_MINUTES}" -lt "${stall_window_min}" ]]; then
-                log_warning "hard timeout ${HARD_TIMEOUT_MIN}min passed in phase=updating (dnf phase: ${dnf_phase}); dnf changed its cache or logs ${DNF_STALLED_MINUTES}min ago - left running until nothing changes for ${stall_window_min}min"
+                log_warning "hard timeout ${HARD_TIMEOUT_MIN}min passed in phase=updating (dnf phase: ${dnf_phase}); its processes last read or wrote ${DNF_STALLED_MINUTES}min ago - left running until they stop for ${stall_window_min}min"
                 if [[ "${DNF_SLOW_RUN_ANNOUNCED}" != "yes" ]]; then
                     announce_slow_run "${service_pid} ${start_uptime_seconds}" "${stall_window_min}"
                 fi
                 exit 0
             fi
-            log_error "dnf changed nothing in its cache or logs for ${DNF_STALLED_MINUTES}min (dnf phase: ${dnf_phase}), past the hard timeout ${HARD_TIMEOUT_MIN}min - stopping the run"
+            log_error "the run's processes read and wrote nothing for ${DNF_STALLED_MINUTES}min (dnf phase: ${dnf_phase}), past the hard timeout ${HARD_TIMEOUT_MIN}min - stopping the run"
         fi
         log_error "hard timeout ${HARD_TIMEOUT_MIN}min exceeded - PID ${service_pid} still alive in phase=${run_phase}"
         begin_recovery
