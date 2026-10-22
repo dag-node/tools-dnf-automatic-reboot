@@ -1426,7 +1426,7 @@ test_watchdog_state_without_uptime_is_malformed() {
     # Only a pre-1.4 run.sh wrote this shape, and %pre refuses to install over
     # one.  Nothing may be timed from the wall clock.
     printf 'phase=updating\nstart=%s\npid=%s\n' \
-        "$(( $(date +%s) - 200 * 60 ))" "${background_pid}" \
+        "$(( $(date +%s) - 400 * 60 ))" "${background_pid}" \
         > "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
@@ -1446,7 +1446,7 @@ test_watchdog_no_state_file_is_a_noop() {
 test_watchdog_dead_pid_does_not_reboot() {
     # PID 2 belongs to the kernel and is never our run.sh, but it is alive, so
     # use a pid that cannot exist instead.
-    write_watchdog_state updating 200 4194304
+    write_watchdog_state updating 400 4194304
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     assert_not_contains "$(cat "${STUB_LOG}")" "systemctl reboot" "a crashed run must not reboot"
     assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run" "a crashed run must not schedule a reboot"
@@ -1458,7 +1458,7 @@ test_watchdog_dead_pid_does_not_reboot() {
 test_watchdog_warning_reaches_the_stub_not_the_host() {
     # The watchdog runs as a child process; its wall warning for a dead run
     # must land in the stub log, which proves it never reached the real wall.
-    write_watchdog_state updating 200 4194304
+    write_watchdog_state updating 400 4194304
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     assert_contains "$(cat "${STUB_LOG}")" "wall dnf-automatic-reboot: WARNING" \
         "the child process used the exported wall stub"
@@ -1467,7 +1467,7 @@ test_watchdog_warning_reaches_the_stub_not_the_host() {
 test_watchdog_hard_timeout_while_updating_does_not_reboot() {
     sleep 60 &
     local background_pid=$!
-    write_watchdog_state updating 200 "${background_pid}"
+    write_watchdog_state updating 400 "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
     local recorded_calls
@@ -1482,7 +1482,7 @@ test_watchdog_hard_timeout_while_updating_can_be_forced() {
         "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
     sleep 60 &
     local background_pid=$!
-    write_watchdog_state updating 200 "${background_pid}"
+    write_watchdog_state updating 400 "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
     assert_contains "$(cat "${STUB_LOG}")" "reboot-if-pending.sh 60 1800" "opt-in override still works"
@@ -1492,7 +1492,7 @@ test_watchdog_hard_timeout_while_checking_reboots() {
     sleep 60 &
     local background_pid=$!
     # phase=checking means dnf-automatic already returned cleanly.
-    write_watchdog_state checking 200 "${background_pid}"
+    write_watchdog_state checking 400 "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
     local recorded_calls
@@ -1514,7 +1514,7 @@ test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who() {
     export STUB_SYSTEMD_VERSION=239
     sleep 60 &
     local background_pid=$!
-    write_watchdog_state updating 200 "${background_pid}"
+    write_watchdog_state updating 400 "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
     assert_contains "$(cat "${STUB_LOG}")" "kill --kill-who=all" "EL8 spelling used on systemd 239"
@@ -1527,7 +1527,7 @@ test_watchdog_reused_pid_is_not_the_run() {
     # reports the unit inactive (MainPID 0).  Past the hard timeout the
     # watchdog must not kill that process or reboot.
     export STUB_MAIN_PID=0
-    write_watchdog_state checking 200 "${background_pid}"
+    write_watchdog_state checking 400 "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     local process_survived=no
     kill -0 "${background_pid}" 2>/dev/null && process_survived=yes
@@ -1600,7 +1600,7 @@ test_watchdog_failed_kill_keeps_supervision() {
     sleep 60 &
     local background_pid=$! exit_code=0
     load_watchdog_library
-    write_watchdog_state checking 200 "${background_pid}"
+    write_watchdog_state checking 400 "${background_pid}"
     stub_watchdog_kill_path
     export STUB_KILL_FAILS=yes
     ( main ) >/dev/null 2>&1 || exit_code=$?
@@ -1616,7 +1616,7 @@ test_watchdog_unconfirmed_kill_signals_no_pid() {
     sleep 60 &
     local background_pid=$! exit_code=0
     load_watchdog_library
-    write_watchdog_state checking 200 "${background_pid}"
+    write_watchdog_state checking 400 "${background_pid}"
     stub_watchdog_kill_path
     export STUB_ACTIVE_STATE=activating
     KILL_CONFIRM_SEC=1
@@ -1637,7 +1637,7 @@ test_watchdog_no_run_starts_during_the_kill() {
     sleep 60 &
     local background_pid=$! exit_code=0
     load_watchdog_library
-    write_watchdog_state checking 200 "${background_pid}"
+    write_watchdog_state checking 400 "${background_pid}"
     stub_watchdog_kill_path
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
@@ -1685,7 +1685,7 @@ test_state_removal_keeps_a_changed_file() {
 
 test_watchdog_dead_run_cleanup_keeps_a_successor() {
     load_watchdog_library
-    write_watchdog_state updating 200 4194304
+    write_watchdog_state updating 400 4194304
     export SUCCESSOR_PID=$$
     # While the watchdog inspects the dead run, its successor starts.
     recorded_pid_identity() {
@@ -1730,7 +1730,7 @@ test_watchdog_recovery_without_reboot_allows_runs_again() {
     local background_pid=$! exit_code=0
     load_watchdog_library
     # phase=updating at the hard timeout: killed, not rebooted.
-    write_watchdog_state updating 200 "${background_pid}"
+    write_watchdog_state updating 400 "${background_pid}"
     stub_watchdog_kill_path
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
@@ -1778,7 +1778,7 @@ test_watchdog_later_failure_keeps_a_pending_reboot() {
     # A reboot requested earlier is still pending when a later watchdog cycle
     # fails for an unrelated reason.
     : > "${REBOOT_PENDING_FILE}"
-    write_watchdog_state checking 200 "${background_pid}"
+    write_watchdog_state checking 400 "${background_pid}"
     stub_watchdog_kill_path
     export STUB_KILL_FAILS=yes
     ( main ) >/dev/null 2>&1 || exit_code=$?
@@ -1877,7 +1877,7 @@ test_watchdog_unknown_identity_is_not_acted_on() {
     local background_pid=$! exit_code=0 output
     load_watchdog_library
     export STUB_MAIN_PID=""
-    write_watchdog_state checking 200 "${background_pid}"
+    write_watchdog_state checking 400 "${background_pid}"
     stub_watchdog_host
     submit_reboot() { printf 'submit_reboot\n' >> "${STUB_LOG}"; }
     # Past the hard timeout, but systemctl reports no MainPID: the live PID
@@ -1931,7 +1931,7 @@ test_watchdog_unit_has_a_start_timeout() {
 test_watchdog_reboots_through_the_pending_check() {
     sleep 60 &
     local background_pid=$!
-    write_watchdog_state checking 200 "${background_pid}"
+    write_watchdog_state checking 400 "${background_pid}"
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
     assert_not_contains "$(cat "${STUB_LOG}")" "systemctl reboot" \
@@ -2513,6 +2513,28 @@ test_run_unsynchronised_clock_names_chronyc_reply() {
     return 0
 }
 
+test_run_warns_when_the_watchdog_would_end_the_update() {
+    # dnf_timeout_min raised for a long upgrade, watchdog_hard_timeout_min
+    # left behind: the watchdog would kill the transaction first.
+    printf '\ndnf_timeout_min = 320\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    load_run_library
+    stub_run_main
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a warning, not a failure"
+    assert_contains "${output}" "watchdog_hard_timeout_min = 320 does not exceed dnf_timeout_min = 320" \
+        "both settings are named"
+    assert_contains "${output}" "raise watchdog_hard_timeout_min in /etc/dnf/automatic-reboot.conf" "and the fix"
+}
+
+test_run_default_timeouts_do_not_warn() {
+    load_run_library
+    stub_run_main
+    local output
+    output=$( ( main ) 2>&1 ) || true
+    assert_not_contains "${output}" "does not exceed dnf_timeout_min" "240 minutes fit inside 320"
+}
+
 test_run_without_chronyc_does_not_update() {
     load_run_library
     stub_run_main
@@ -2712,6 +2734,19 @@ test_invariant_every_script_is_shipped() {
             || fail "${script_name} is not listed in %files"
     done
     return 0
+}
+
+test_invariant_timeout_defaults_agree() {
+    # A script default only applies when the key is missing from the config;
+    # all three must say the same, or an older config silently changes them.
+    local conf_file="${REPO_ROOT}/conf/automatic-reboot.conf"
+    assert_equals "240" "$(sed -n 's/^dnf_timeout_min = //p' "${conf_file}")" "shipped dnf_timeout_min"
+    assert_equals "320" "$(sed -n 's/^watchdog_hard_timeout_min = //p' "${conf_file}")" "shipped watchdog_hard_timeout_min"
+    grep -q 'get_config_integer dnf_timeout_min 240 ' "${REPO_ROOT}/scripts/run.sh" \
+        || fail "run.sh defaults dnf_timeout_min to 240"
+    assert_equals "2" "$(grep -c 'get_config_integer watchdog_hard_timeout_min 320)' \
+        "${REPO_ROOT}/scripts/run.sh" "${REPO_ROOT}/scripts/watchdog.sh" | grep -c ':1$')" \
+        "run.sh and watchdog.sh default watchdog_hard_timeout_min to 320"
 }
 
 test_invariant_versions_agree() {
@@ -2914,7 +2949,7 @@ test_watchdog_unknown_immediate_reboot_keeps_the_marker() {
     sleep 60 &
     local background_pid=$! exit_code=0
     load_watchdog_library
-    write_watchdog_state checking 200 "${background_pid}"
+    write_watchdog_state checking 400 "${background_pid}"
     stub_watchdog_kill_path
     submit_reboot() { return 2; }
     ( main ) >/dev/null 2>&1 || exit_code=$?
@@ -3523,6 +3558,8 @@ run_test "request: coherent snapshot sees a running service" test_request_cohere
 run_test "run: unsynchronised clock does not update" test_run_unsynchronised_clock_does_not_update
 run_test "run: clock wait has a hard deadline"      test_run_clock_wait_has_a_hard_deadline
 run_test "run: unsynchronised clock names chronyc reply" test_run_unsynchronised_clock_names_chronyc_reply
+run_test "run: warns when the watchdog would end the update" test_run_warns_when_the_watchdog_would_end_the_update
+run_test "run: default timeouts do not warn"        test_run_default_timeouts_do_not_warn
 run_test "run: without chronyc does not update"      test_run_without_chronyc_does_not_update
 run_test "run: clock requirement can be turned off"  test_run_clock_requirement_can_be_turned_off
 run_test "run: refreshes metadata before updating"   test_run_refreshes_metadata_before_updating
@@ -3540,6 +3577,7 @@ run_test "invariant: flock uses documented short options" test_invariant_flock_u
 run_test "invariant: state file written only by rename" test_invariant_state_file_written_only_by_rename
 run_test "invariant: probe assigns its library before use" test_invariant_probe_assigns_its_library_before_use
 run_test "invariant: every script is shipped"       test_invariant_every_script_is_shipped
+run_test "invariant: timeout defaults agree"        test_invariant_timeout_defaults_agree
 run_test "invariant: versions agree"                test_invariant_versions_agree
 run_test "reader: unit snapshot job forms"          test_reader_unit_snapshot_job_forms
 run_test "reader: scheduled reboot status table"    test_reader_scheduled_reboot_status_table

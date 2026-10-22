@@ -462,6 +462,14 @@ this kill exists for. `dnf-automatic` runs behind `systemd-inhibit` and
 `timeout(1)`, so signalling the recorded PID and its direct children leaves the rpm
 transaction running while the caller proceeds to reboot.
 
+`dnf_timeout_min` (default 240) bounds dnf-automatic; an upgrade to the next minor EL release
+on a Raspberry Pi takes hours. The watchdog times the run from before dnf-automatic starts, so
+`watchdog_hard_timeout_min` (default 320) must exceed `dnf_timeout_min` plus `kill_grace_sec`,
+with room for the reboot check and service restarts; `run.sh` warns at every start when it does
+not. 320 stays below the six hours between runs of a four-a-day timer. A timer elapse during a
+run requests a start of an activating oneshot, which joins the running start job: that elapse is
+skipped, never overlapped. This is systemd's job model; the probe checks it.
+
 At hard timeout in `phase=updating` an rpm transaction may be half-applied. That is
 the same uncertainty for which the dead-PID path already refuses to reboot, so the
 default is to kill and alert. The reboot never uses `--force`, which remounts filesystems

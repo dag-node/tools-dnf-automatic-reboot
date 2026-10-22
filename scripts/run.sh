@@ -236,8 +236,10 @@ REFRESH_METADATA=$(get_config_value refresh_metadata yes)
 REFRESH_METADATA="${REFRESH_METADATA//[[:space:]]/}"
 METADATA_REFRESH_TIMEOUT_SEC=$(get_config_integer metadata_refresh_timeout_sec 900 10 3600)
 ALWAYS_REBOOT=$(get_config_value always_reboot no)
-DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 60 1)
+DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 240 1)
 KILL_GRACE_SEC=$(get_config_integer kill_grace_sec 30)
+# Read only to warn when the watchdog would end the update first.
+WATCHDOG_HARD_TIMEOUT_MIN=$(get_config_integer watchdog_hard_timeout_min 320)
 WARN_UNSIGNED_REPOSITORIES=$(get_config_value warn_unsigned_repositories yes)
 WARN_UNAPPLIED_ADVISORIES=$(get_config_value warn_unapplied_advisories yes)
 RESTART_SERVICES=$(get_config_value restart_services yes)
@@ -543,6 +545,18 @@ chronyc_available() {
     command -v chronyc >/dev/null 2>&1
 }
 
+# warn_on_watchdog_ending_the_update - warns when watchdog_hard_timeout_min
+# does not exceed dnf_timeout_min plus kill_grace_sec.  The watchdog times the
+# run from before dnf-automatic starts, so with such settings it kills a long
+# update, half-applied transaction included, before the run's own timeout
+# would.  A warning, not a failure: the setting is the operator's, and a run
+# that finishes in time is unaffected.
+warn_on_watchdog_ending_the_update() {
+    if (( WATCHDOG_HARD_TIMEOUT_MIN * 60 <= DNF_TIMEOUT_MIN * 60 + KILL_GRACE_SEC )); then
+        log_warning "watchdog_hard_timeout_min = ${WATCHDOG_HARD_TIMEOUT_MIN} does not exceed dnf_timeout_min = ${DNF_TIMEOUT_MIN} plus kill_grace_sec = ${KILL_GRACE_SEC}s: the watchdog would kill an update that long before its own timeout - raise watchdog_hard_timeout_min in ${CONFIG_FILE#"${TEST_ROOT}"}"
+    fi
+}
+
 # Bound on the one chronyc query a failed clock check makes for its message.
 readonly CHRONYC_REPLY_TIMEOUT_SEC=10
 
@@ -676,6 +690,7 @@ main() {
     START_UPTIME_SECONDS=$(uptime_seconds)
     log "Starting (pid=${SERVICE_PID})"
     check_conflicts
+    warn_on_watchdog_ending_the_update
     exit_if_reboot_pending
     if ! wait_for_clock_sync; then
         wall_msg "dnf-automatic-reboot: Updates NOT started - the clock is not confirmed synchronised."

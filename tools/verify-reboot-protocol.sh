@@ -16,8 +16,8 @@
 # It never reboots and never touches the package's markers or lock.  It
 # starts transient units named dnf-automatic-reboot-probe-*, which run
 # /bin/true or sleep, one of them under a block-mode shutdown inhibitor for
-# up to a minute, and one /bin/sh that fails on purpose, and stops and resets
-# them on exit.  The one fact it
+# up to a minute, one /bin/sh that fails on purpose and one that is started
+# twice, and stops and resets them on exit.  The one fact it
 # cannot reach without a shutdown, logind's PreparingForShutdown under a
 # delay inhibitor, is reported as INFO.
 #
@@ -37,6 +37,7 @@ readonly PROBE_NOW_UNIT="${PROBE_PREFIX}-now"
 readonly PROBE_ELAPSED_UNIT="${PROBE_PREFIX}-elapsed"
 readonly PROBE_INHIBITOR_UNIT="${PROBE_PREFIX}-inhibitor"
 readonly PROBE_FAILING_UNIT="${PROBE_PREFIX}-failing"
+readonly PROBE_BUSY_UNIT="${PROBE_PREFIX}-busy"
 readonly PROBE_MISSING_UNIT="${PROBE_PREFIX}-does-not-exist.service"
 readonly INSTALLED_LIBRARY=/usr/libexec/dnf-automatic-reboot/reboot-request.sh
 readonly LOCK_FILE=/run/dnf-automatic-reboot.reboot-request.lock
@@ -65,7 +66,8 @@ probe_units() {
         "${PROBE_TIMER_UNIT}.service" "${PROBE_LATE_UNIT}.service" "${PROBE_QUEUED_UNIT}.service" \
         "${PROBE_BLOCKER_UNIT}.service" "${PROBE_NOW_UNIT}.service" \
         "${PROBE_ELAPSED_UNIT}.timer" "${PROBE_ELAPSED_UNIT}.service" \
-        "${PROBE_INHIBITOR_UNIT}.service" "${PROBE_FAILING_UNIT}.service"
+        "${PROBE_INHIBITOR_UNIT}.service" "${PROBE_FAILING_UNIT}.service" \
+        "${PROBE_BUSY_UNIT}.service"
 }
 
 remove_probe_units() {
@@ -232,6 +234,30 @@ if systemd-run --quiet --unit="${PROBE_NOW_UNIT}" /bin/true >/dev/null 2>&1; the
         "systemd-run without --on-active ran the command at once and the unit is done"
 else
     report_fail start_reboot_unit "systemd-run without --on-active failed"
+fi
+
+# ---------------------------------------------------------------------------
+printf '== start during a run\n'
+# ---------------------------------------------------------------------------
+# A timer that elapses while dnf-automatic-reboot.service still runs asks
+# for a start of an activating oneshot.  The run must not start twice: the
+# request joins the running start job, and that elapse is skipped.
+busy_probe_since=$(date +%s)
+if systemd-run --quiet --no-block --unit="${PROBE_BUSY_UNIT}" --property=Type=oneshot \
+       /bin/sh -c 'echo probe-busy-run; sleep 5' >/dev/null 2>&1; then
+    sleep 1
+    busy_second_start_status=0
+    systemctl start "${PROBE_BUSY_UNIT}.service" >/dev/null 2>&1 || busy_second_start_status=$?
+    sleep 1
+    busy_run_count=$(journalctl --no-pager --output=cat --since "@${busy_probe_since}" \
+                         -u "${PROBE_BUSY_UNIT}.service" 2>/dev/null | grep -cx 'probe-busy-run' || true)
+    if [[ "${busy_run_count}" == "1" ]]; then
+        report_pass dnf-automatic-reboot.timer "a start during a oneshot run joins it: one run, second start exited ${busy_second_start_status}"
+    else
+        report_fail dnf-automatic-reboot.timer "a start during a oneshot run gave ${busy_run_count} runs; an overlapping timer elapse would start a second update"
+    fi
+else
+    report_fail dnf-automatic-reboot.timer "could not start ${PROBE_BUSY_UNIT}"
 fi
 
 # ---------------------------------------------------------------------------

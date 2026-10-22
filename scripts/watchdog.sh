@@ -121,7 +121,7 @@ get_config_integer() {
 }
 
 SOFT_TIMEOUT_MIN=$(get_config_integer watchdog_soft_timeout_min 60)
-HARD_TIMEOUT_MIN=$(get_config_integer watchdog_hard_timeout_min 180)
+HARD_TIMEOUT_MIN=$(get_config_integer watchdog_hard_timeout_min 320)
 REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300 1 86400)
 FORCE_REBOOT_ON_HARD_TIMEOUT=$(get_config_value force_reboot_on_hard_timeout no)
 KILL_CONFIRM_SEC=$(get_config_integer watchdog_kill_confirm_sec 30)
