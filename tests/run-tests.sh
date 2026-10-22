@@ -391,7 +391,6 @@ test_config_every_key_resolves() {
                       kill_grace_sec restart_services \
                       restart_services_exclude watchdog_soft_timeout_min \
                       watchdog_hard_timeout_min watchdog_stall_min watchdog_transaction_stall_min \
-                      force_reboot_on_hard_timeout \
                       enable_chrony_wait wall_messages reboot_request_lock_wait_sec \
                       watchdog_kill_confirm_sec restart_service_timeout_sec \
                       reboot_inhibited_wait_sec require_clock_sync clock_sync_wait_sec \
@@ -1575,16 +1574,20 @@ test_watchdog_hard_timeout_while_updating_does_not_reboot() {
         "a half-applied rpm transaction must not be rebooted into"
 }
 
-test_watchdog_hard_timeout_while_updating_can_be_forced() {
-    sed -i 's/^force_reboot_on_hard_timeout = no/force_reboot_on_hard_timeout = yes/' \
-        "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+test_watchdog_hard_timeout_while_updating_cannot_be_forced() {
     sleep 60 &
-    local background_pid=$!
+    local background_pid=$! exit_code=0
+    # An edited configuration may still carry the setting; nothing reads it.
+    printf '\nforce_reboot_on_hard_timeout = yes\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    load_watchdog_library
     write_watchdog_state updating 400 "${background_pid}"
-    stall_recorded_run "${background_pid}"
-    bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
+    write_stalled_progress_record "${background_pid}" 400 190
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
-    assert_contains "$(cat "${STUB_LOG}")" "reboot-if-pending.sh 60 1800" "opt-in override still works"
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "the stalled run is stopped"
+    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "a possibly half-applied transaction is never rebooted into"
+    assert_contains "$(cat "${LOG_FILE}")" "NOT rebooting. Check: dnf history info last; dnf check" "the log names the check instead"
 }
 
 test_watchdog_hard_timeout_while_checking_reboots() {
@@ -4043,7 +4046,7 @@ run_test "watchdog: warning reaches the stub, not the host" test_watchdog_warnin
 run_test "watchdog: ignores wall clock step"         test_watchdog_ignores_wall_clock_step
 run_test "watchdog: state without uptime is malformed" test_watchdog_state_without_uptime_is_malformed
 run_test "watchdog: hard timeout while updating does not reboot" test_watchdog_hard_timeout_while_updating_does_not_reboot needs-exec
-run_test "watchdog: hard timeout while updating can be forced"   test_watchdog_hard_timeout_while_updating_can_be_forced   needs-exec
+run_test "watchdog: hard timeout while updating cannot be forced" test_watchdog_hard_timeout_while_updating_cannot_be_forced
 run_test "watchdog: hard timeout while checking reboots"         test_watchdog_hard_timeout_while_checking_reboots         needs-exec
 run_test "watchdog: reboots through the pending check" test_watchdog_reboots_through_the_pending_check needs-exec
 run_test "watchdog: kill option follows systemd version" test_watchdog_kill_option_follows_systemd_version

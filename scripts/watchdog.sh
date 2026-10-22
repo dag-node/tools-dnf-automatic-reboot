@@ -28,8 +28,7 @@
 #                         transaction has started, then kill the service
 #                         cgroup; in phase=checking kill at once.  Reboot
 #                         only when the recorded phase proves dnf already
-#                         returned cleanly, or when
-#                         force_reboot_on_hard_timeout says otherwise.
+#                         returned cleanly.
 #
 #  5. PID alive, soft   - Past watchdog_soft_timeout_min.  If dnf is no
 #     timeout exceeded    longer active AND phase=checking, run an
@@ -151,7 +150,6 @@ HARD_TIMEOUT_MIN=$(get_config_integer watchdog_hard_timeout_min 320)
 STALL_MIN=$(get_config_integer watchdog_stall_min 60 1)
 TRANSACTION_STALL_MIN=$(get_config_integer watchdog_transaction_stall_min 180 1)
 REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300 1 86400)
-FORCE_REBOOT_ON_HARD_TIMEOUT=$(get_config_value force_reboot_on_hard_timeout no)
 KILL_CONFIRM_SEC=$(get_config_integer watchdog_kill_confirm_sec 30)
 NEEDS_RESTARTING_TIMEOUT_SEC=$(get_config_integer needs_restarting_timeout_sec 120)
 REBOOT_REQUEST_LOCK_WAIT_SEC=$(get_config_integer reboot_request_lock_wait_sec 60 1 600)
@@ -702,7 +700,7 @@ main() {
     # phase=checking means dnf-automatic already returned cleanly, so the rpm
     # transaction is complete and rebooting is safe.  phase=updating means it did
     # not, so an rpm transaction may be half-applied - the same uncertainty for
-    # which scenario 2 already refuses to reboot.  Rebooting there is opt-in.
+    # which scenario 2 already refuses to reboot.  No setting reboots there.
     #
     # In phase=updating the run is killed only once its processes have stopped
     # reading and writing for STALL_MIN before the rpm transaction, or for
@@ -740,7 +738,7 @@ main() {
         [[ "${kill_result}" -eq 0 ]] || exit 1
         remove_inspected_run_state "${state_snapshot}"
 
-        if [[ "${run_phase}" == "checking" || "${FORCE_REBOOT_ON_HARD_TIMEOUT}" == "yes" ]]; then
+        if [[ "${run_phase}" == "checking" ]]; then
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded." \
                      "Killed the stuck run and rebooting now."
             # At once (delay 0) through reboot-if-pending.sh.  The kill ended
@@ -752,7 +750,7 @@ main() {
                 exit 1
             fi
         else
-            log_error "phase=${run_phase} at hard timeout (dnf phase: ${dnf_phase}) - an rpm transaction may be incomplete, NOT rebooting; set force_reboot_on_hard_timeout=yes to override. ${INTERRUPTED_TRANSACTION_CHECK}"
+            log_error "phase=${run_phase} at hard timeout (dnf phase: ${dnf_phase}) - an rpm transaction may be incomplete, NOT rebooting. ${INTERRUPTED_TRANSACTION_CHECK}"
             wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded in phase=${run_phase}." \
                      "Killed the stuck run. Updates may be incomplete; before rebooting:" \
                      "${INTERRUPTED_TRANSACTION_CHECK}"

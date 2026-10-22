@@ -507,6 +507,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   watchdog_transaction_stall_min (new, default 180), so a long quiet scriptlet is not killed,
   and tells logged-in users once that the run is still going. Neither stall window can be turned off: a value below 1 is reported and the default
   used.
+- CHANGE: force_reboot_on_hard_timeout is removed. The watchdog does not reboot a host after
+  stopping a run that may be mid-transaction; it names dnf history info last; dnf check
+  instead. A run stopped after dnf returned cleanly is rebooted as before.
 - CHANGE: The package requires rpm-plugin-systemd-inhibit. With it, an rpm transaction started
   by hand holds the scheduled reboot until it ends, instead of being stopped halfway.
 - NEW: Installing or upgrading the package lists every difference between

@@ -448,7 +448,7 @@ Watchdog decisions by phase:
 | Phase | dnf phase | Stall, any age | Soft timeout + dnf idle | Hard timeout |
 |-------|-----------|----------------|------------------------|--------------|
 | `updating` | `download`, `checked` | No change for `watchdog_stall_min`: kill cgroup + alert, never reboot | Leave | Same stall rule |
-| `updating` | `transaction`, `unknown` | Leave | Leave for hard timeout (unknown completion) | Once the run's processes have read and written nothing for `watchdog_transaction_stall_min`: kill cgroup + alert naming `dnf history info last; dnf check`; reboot only if `force_reboot_on_hard_timeout=yes` |
+| `updating` | `transaction`, `unknown` | Leave | Leave for hard timeout (unknown completion) | Once the run's processes have read and written nothing for `watchdog_transaction_stall_min`: kill cgroup + alert naming `dnf history info last; dnf check`; never reboot |
 | `checking` | not read | Leave | Run independent needs-reboot check, kill cgroup | Kill cgroup + reboot (dnf already returned cleanly) |
 
 The independent check can hang like the one it replaces, so it runs under `timeout`
@@ -517,8 +517,10 @@ requests a start of an activating oneshot, which joins the running start job: th
 skipped, never overlapped. This is systemd's job model; the probe checks it.
 
 At hard timeout in `phase=updating` an rpm transaction may be half-applied. That is
-the same uncertainty for which the dead-PID path already refuses to reboot, so the
-default is to kill and alert, naming `dnf history info last; dnf check`. The reboot never uses `--force`, which remounts filesystems
+the same uncertainty for which the dead-PID path already refuses to reboot, so the watchdog
+kills and alerts, naming `dnf history info last; dnf check`, and reboots only from
+`phase=checking`; there is no setting that reboots after a kill in `phase=updating`. The reboot
+never uses `--force`, which remounts filesystems
 read-only under running processes, risks the rootfs on a flash-backed host, and overrides
 other users' inhibitors.
 
