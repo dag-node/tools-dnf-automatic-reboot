@@ -485,6 +485,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   holds when upgrading from 1.4.0 while its watchdog has a reboot scheduled.
 - CHANGE: reboot_delay_sec defaults to 300, giving five minutes between the warning and the
   reboot to cancel it. An edited automatic-reboot.conf keeps its own value.
+- CHANGE: dnf-automatic-reboot.timer runs at 03:00 UTC instead of 03:00 local time, so the run
+  no longer moves with the host's time zone or daylight saving time. An OnCalendar= override
+  keeps its own time. The timer does not start on a host booted from rpm-ostree.
 - NEW: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels a pending reboot and allows
   update runs again; a timer that fires afterwards does not reboot. It exits 1 without
   changing anything while a reboot is being requested or carried out, once systemctl reboot

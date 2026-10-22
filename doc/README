@@ -58,7 +58,8 @@ Files installed
 
   /usr/lib/systemd/system/dnf-automatic-reboot.service
   /usr/lib/systemd/system/dnf-automatic-reboot.timer
-      Main service + daily timer (default: 03:00 +/- 10min random).
+      Main service + timer (default: daily at 03:00 UTC, plus up to
+      10 min random delay).
 
   /usr/lib/systemd/system/dnf-automatic-watchdog.service
   /usr/lib/systemd/system/dnf-automatic-watchdog.timer
