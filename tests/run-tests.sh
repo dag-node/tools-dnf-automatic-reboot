@@ -387,7 +387,7 @@ test_config_every_key_resolves() {
                       needs_restarting_timeout_sec reboot_delay_sec always_reboot \
                       dnf_timeout_min kill_grace_sec restart_services \
                       restart_services_exclude watchdog_soft_timeout_min \
-                      watchdog_hard_timeout_min force_reboot_on_hard_timeout \
+                      watchdog_hard_timeout_min watchdog_stall_min force_reboot_on_hard_timeout \
                       enable_chrony_wait wall_messages reboot_request_lock_wait_sec \
                       watchdog_kill_confirm_sec restart_service_timeout_sec \
                       reboot_inhibited_wait_sec require_clock_sync clock_sync_wait_sec \
@@ -1465,6 +1465,7 @@ test_watchdog_warning_reaches_the_stub_not_the_host() {
 }
 
 test_watchdog_hard_timeout_while_updating_does_not_reboot() {
+    disable_watchdog_stall_check
     sleep 60 &
     local background_pid=$!
     write_watchdog_state updating 400 "${background_pid}"
@@ -1478,6 +1479,7 @@ test_watchdog_hard_timeout_while_updating_does_not_reboot() {
 }
 
 test_watchdog_hard_timeout_while_updating_can_be_forced() {
+    disable_watchdog_stall_check
     sed -i 's/^force_reboot_on_hard_timeout = no/force_reboot_on_hard_timeout = yes/' \
         "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
     sleep 60 &
@@ -1511,6 +1513,7 @@ test_watchdog_kill_option_follows_systemd_version() {
 }
 
 test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who() {
+    disable_watchdog_stall_check
     export STUB_SYSTEMD_VERSION=239
     sleep 60 &
     local background_pid=$!
@@ -1725,12 +1728,154 @@ test_watchdog_scheduled_reboot_keeps_runs_blocked() {
     return 0
 }
 
+# disable_watchdog_stall_check: the watchdog kills at the hard timeout
+# whatever dnf is doing, as before watchdog_stall_min existed.
+disable_watchdog_stall_check() {
+    printf '\nwatchdog_stall_min = 0\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+}
+
+# write_stalled_progress_record PID AGE_MINUTES STALLED_MINUTES: the progress
+# record of the run write_watchdog_state wrote, with dnf's current signature
+# last changed STALLED_MINUTES ago.  Needs the watchdog library.
+write_stalled_progress_record() {
+    printf 'run=%s %s\nsignature=%s\nchanged_uptime=%s\nannounced=%s\n' \
+        "$1" "$(( TEST_UPTIME_SECONDS - $2 * 60 ))" "$(dnf_progress_signature)" \
+        "$(( TEST_UPTIME_SECONDS - $3 * 60 ))" "${4:-no}" > "${PROGRESS_FILE}"
+}
+
+test_watchdog_progress_signature_sees_bytes_and_logs() {
+    load_watchdog_library
+    mkdir -p "${DNF_CACHE_DIRECTORY}/baseos/packages" "${TEST_ROOT_DIR}/var/log"
+    printf 'part' > "${DNF_CACHE_DIRECTORY}/baseos/packages/glibc.rpm"
+    local before_download after_download after_transaction
+    before_download=$(dnf_progress_signature)
+    # A slow link: the same file grows, no new file, no log line.
+    printf 'more bytes' >> "${DNF_CACHE_DIRECTORY}/baseos/packages/glibc.rpm"
+    after_download=$(dnf_progress_signature)
+    [[ "${after_download}" != "${before_download}" ]] || fail "bytes arriving in one file are progress"
+    printf 'Upgrade: glibc\n' >> "${DNF_RPM_LOG_FILE}"
+    after_transaction=$(dnf_progress_signature)
+    [[ "${after_transaction}" != "${after_download}" ]] || fail "a transaction step is progress"
+    rm -f "${DNF_CACHE_DIRECTORY}/baseos/packages/glibc.rpm"
+    [[ "$(dnf_progress_signature)" != "${after_transaction}" ]] || fail "a cache emptied after a transaction is progress"
+    return 0
+}
+
+test_watchdog_progressing_update_is_left_running() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state updating 400 "${background_pid}"
+    write_stalled_progress_record "${background_pid}" 400 10
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 0 "${exit_code}" "a working dnf is no failure"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "past the hard timeout, dnf changed something 10 minutes ago"
+    assert_equals "1" "$(grep -c 'the update has run past 320min' "${STUB_LOG}")" "logged-in users are told once"
+    assert_contains "$(cat "${LOG_FILE}")" "left running until nothing changes for 60min" "the log says why"
+    [[ -f "${STATE_FILE}" ]] || fail "the run stays supervised"
+    return 0
+}
+
+test_watchdog_stalled_update_is_stopped() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state updating 400 "${background_pid}"
+    write_stalled_progress_record "${background_pid}" 400 70
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 0 "${exit_code}" "a confirmed stall is recovered"
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "nothing changed for 70 minutes: killed"
+    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "and, still updating, not rebooted"
+    assert_contains "$(cat "${LOG_FILE}")" "dnf changed nothing in its cache or logs for 70min" "the log says why"
+}
+
+test_watchdog_dnf_activity_restarts_the_stall_window() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state updating 400 "${background_pid}"
+    mkdir -p "${DNF_CACHE_DIRECTORY}/appstream/packages"
+    printf 'part' > "${DNF_CACHE_DIRECTORY}/appstream/packages/firefox.rpm"
+    write_stalled_progress_record "${background_pid}" 400 70
+    # One more chunk arrived since the last cycle.
+    printf 'chunk' >> "${DNF_CACHE_DIRECTORY}/appstream/packages/firefox.rpm"
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 0 "${exit_code}" "a working dnf is no failure"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "the download moved: not killed"
+    assert_contains "$(cat "${PROGRESS_FILE}")" "changed_uptime=${TEST_UPTIME_SECONDS}" "the window starts again now"
+}
+
+test_watchdog_records_progress_of_each_run_from_its_first_cycle() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    # A record left by an earlier run that stalled long ago.
+    printf 'run=4194304 1\nsignature=old\nchanged_uptime=1\nannounced=yes\n' > "${PROGRESS_FILE}"
+    write_watchdog_state updating 400 "${background_pid}"
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "another run's stall says nothing about this one"
+    assert_contains "$(cat "${PROGRESS_FILE}")" "run=${background_pid} $(( TEST_UPTIME_SECONDS - 400 * 60 ))" \
+        "the record now belongs to this run"
+    assert_contains "$(cat "${PROGRESS_FILE}")" "changed_uptime=${TEST_UPTIME_SECONDS}" "first sight counts as progress"
+    assert_equals "1" "$(grep -c 'the update has run past' "${STUB_LOG}")" "and this run is announced"
+}
+
+test_watchdog_records_progress_before_the_hard_timeout() {
+    sleep 60 &
+    local background_pid=$!
+    load_watchdog_library
+    write_watchdog_state updating 70 "${background_pid}"
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1
+    kill "${background_pid}" 2>/dev/null
+    assert_contains "$(cat "${PROGRESS_FILE}" 2>/dev/null)" "run=${background_pid} " \
+        "the history exists when the hard timeout comes"
+}
+
+test_watchdog_unrecordable_progress_stops_nothing() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    load_watchdog_library
+    write_watchdog_state updating 400 "${background_pid}"
+    # A directory in its place: the record cannot be written.
+    mkdir -p "${PROGRESS_FILE}"
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_exit_code 1 "${exit_code}" "the watchdog fails, so OnFailure= reports it"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "a stall that cannot be confirmed kills nothing"
+    assert_contains "$(cat "${LOG_FILE}")" "dnf progress cannot be recorded" "and says why"
+}
+
+test_watchdog_stall_check_off_kills_at_the_hard_timeout() {
+    sleep 60 &
+    local background_pid=$! exit_code=0
+    disable_watchdog_stall_check
+    load_watchdog_library
+    write_watchdog_state updating 400 "${background_pid}"
+    write_stalled_progress_record "${background_pid}" 400 0
+    stub_watchdog_kill_path
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${background_pid}" 2>/dev/null
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "watchdog_stall_min = 0: killed even while dnf works"
+}
+
 test_watchdog_recovery_without_reboot_allows_runs_again() {
     sleep 60 &
     local background_pid=$! exit_code=0
     load_watchdog_library
-    # phase=updating at the hard timeout: killed, not rebooted.
+    # phase=updating at the hard timeout, dnf stalled: killed, not rebooted.
     write_watchdog_state updating 400 "${background_pid}"
+    write_stalled_progress_record "${background_pid}" 400 70
     stub_watchdog_kill_path
     ( main ) >/dev/null 2>&1 || exit_code=$?
     kill "${background_pid}" 2>/dev/null
@@ -2514,9 +2659,9 @@ test_run_unsynchronised_clock_names_chronyc_reply() {
 }
 
 test_run_warns_when_the_watchdog_would_end_the_update() {
-    # dnf_timeout_min raised for a long upgrade, watchdog_hard_timeout_min
-    # left behind: the watchdog would kill the transaction first.
-    printf '\ndnf_timeout_min = 320\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    # The stall check turned off and dnf_timeout_min raised past the hard
+    # timeout: the watchdog would kill the transaction first.
+    printf '\ndnf_timeout_min = 320\nwatchdog_stall_min = 0\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
     load_run_library
     stub_run_main
     local exit_code=0 output
@@ -2524,15 +2669,30 @@ test_run_warns_when_the_watchdog_would_end_the_update() {
     assert_exit_code 0 "${exit_code}" "a warning, not a failure"
     assert_contains "${output}" "watchdog_hard_timeout_min = 320 does not exceed dnf_timeout_min = 320" \
         "both settings are named"
-    assert_contains "${output}" "raise watchdog_hard_timeout_min in /etc/dnf/automatic-reboot.conf" "and the fix"
+    assert_contains "${output}" "set watchdog_stall_min above 0, or raise watchdog_hard_timeout_min, in /etc/dnf/automatic-reboot.conf" \
+        "and the fixes"
 }
 
-test_run_default_timeouts_do_not_warn() {
+test_run_stall_check_makes_a_long_deadline_safe() {
+    # With the stall check on, the watchdog leaves a working dnf alone past
+    # the hard timeout, so a long deadline is no conflict.
+    printf '\ndnf_timeout_min = 320\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
     load_run_library
     stub_run_main
     local output
     output=$( ( main ) 2>&1 ) || true
-    assert_not_contains "${output}" "does not exceed dnf_timeout_min" "240 minutes fit inside 320"
+    assert_not_contains "${output}" "does not exceed dnf_timeout_min" "no warning"
+}
+
+test_run_default_has_no_dnf_deadline() {
+    load_run_library
+    stub_run_main
+    local output
+    output=$( ( main ) 2>&1 ) || true
+    assert_contains "$(cat "${STUB_LOG}")" "timeout --kill-after=30s 0m ${DNF_AUTOMATIC_BIN}" \
+        "timeout(1) with 0 disables the deadline"
+    assert_contains "${output}" "no deadline; the watchdog stops it only once dnf stalls" "and the log says so"
+    assert_not_contains "${output}" "does not exceed dnf_timeout_min" "no warning"
 }
 
 test_run_without_chronyc_does_not_update() {
@@ -2740,10 +2900,14 @@ test_invariant_timeout_defaults_agree() {
     # A script default only applies when the key is missing from the config;
     # all three must say the same, or an older config silently changes them.
     local conf_file="${REPO_ROOT}/conf/automatic-reboot.conf"
-    assert_equals "240" "$(sed -n 's/^dnf_timeout_min = //p' "${conf_file}")" "shipped dnf_timeout_min"
+    assert_equals "0" "$(sed -n 's/^dnf_timeout_min = //p' "${conf_file}")" "shipped dnf_timeout_min"
+    assert_equals "60" "$(sed -n 's/^watchdog_stall_min = //p' "${conf_file}")" "shipped watchdog_stall_min"
     assert_equals "320" "$(sed -n 's/^watchdog_hard_timeout_min = //p' "${conf_file}")" "shipped watchdog_hard_timeout_min"
-    grep -q 'get_config_integer dnf_timeout_min 240 ' "${REPO_ROOT}/scripts/run.sh" \
-        || fail "run.sh defaults dnf_timeout_min to 240"
+    grep -q 'get_config_integer dnf_timeout_min 0)' "${REPO_ROOT}/scripts/run.sh" \
+        || fail "run.sh defaults dnf_timeout_min to 0"
+    assert_equals "2" "$(grep -c 'get_config_integer watchdog_stall_min 60)' \
+        "${REPO_ROOT}/scripts/run.sh" "${REPO_ROOT}/scripts/watchdog.sh" | grep -c ':1$')" \
+        "run.sh and watchdog.sh default watchdog_stall_min to 60"
     assert_equals "2" "$(grep -c 'get_config_integer watchdog_hard_timeout_min 320)' \
         "${REPO_ROOT}/scripts/run.sh" "${REPO_ROOT}/scripts/watchdog.sh" | grep -c ':1$')" \
         "run.sh and watchdog.sh default watchdog_hard_timeout_min to 320"
@@ -3559,7 +3723,8 @@ run_test "run: unsynchronised clock does not update" test_run_unsynchronised_clo
 run_test "run: clock wait has a hard deadline"      test_run_clock_wait_has_a_hard_deadline
 run_test "run: unsynchronised clock names chronyc reply" test_run_unsynchronised_clock_names_chronyc_reply
 run_test "run: warns when the watchdog would end the update" test_run_warns_when_the_watchdog_would_end_the_update
-run_test "run: default timeouts do not warn"        test_run_default_timeouts_do_not_warn
+run_test "run: stall check makes a long deadline safe" test_run_stall_check_makes_a_long_deadline_safe
+run_test "run: default has no dnf deadline"          test_run_default_has_no_dnf_deadline
 run_test "run: without chronyc does not update"      test_run_without_chronyc_does_not_update
 run_test "run: clock requirement can be turned off"  test_run_clock_requirement_can_be_turned_off
 run_test "run: refreshes metadata before updating"   test_run_refreshes_metadata_before_updating
@@ -3567,6 +3732,14 @@ run_test "run: failed metadata refresh still updates" test_run_failed_metadata_r
 run_test "run: metadata refresh can be turned off"   test_run_metadata_refresh_can_be_turned_off
 run_test "run: does not update before a pending reboot" test_run_does_not_update_before_a_pending_reboot
 run_test "run: unknown reboot state does not update" test_run_unknown_reboot_state_does_not_update
+run_test "watchdog: progress signature sees bytes and logs" test_watchdog_progress_signature_sees_bytes_and_logs
+run_test "watchdog: progressing update is left running" test_watchdog_progressing_update_is_left_running
+run_test "watchdog: stalled update is stopped"     test_watchdog_stalled_update_is_stopped
+run_test "watchdog: dnf activity restarts the stall window" test_watchdog_dnf_activity_restarts_the_stall_window
+run_test "watchdog: records each run from its first cycle" test_watchdog_records_progress_of_each_run_from_its_first_cycle
+run_test "watchdog: records progress before the hard timeout" test_watchdog_records_progress_before_the_hard_timeout
+run_test "watchdog: unrecordable progress stops nothing" test_watchdog_unrecordable_progress_stops_nothing
+run_test "watchdog: stall check off kills at the hard timeout" test_watchdog_stall_check_off_kills_at_the_hard_timeout
 run_test "invariant: only reboot-if-pending reboots" test_invariant_only_reboot_if_pending_reboots
 run_test "invariant: marker removers are known"     test_invariant_marker_removers_are_known
 run_test "invariant: dispatched file removed only on refusal" test_invariant_dispatched_file_is_removed_only_on_refusal

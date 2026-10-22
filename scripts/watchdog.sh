@@ -15,10 +15,14 @@
 #                         Do NOT reboot: updates may be partial.
 #
 #  3. PID alive, hard   - run.sh has been running longer than
-#     timeout exceeded    watchdog_hard_timeout_min.  Kill the service
-#                         cgroup.  Reboot only when the recorded phase
-#                         proves dnf already returned cleanly, or when
-#                         force_reboot_on_hard_timeout says otherwise.
+#     timeout exceeded    watchdog_hard_timeout_min.  In phase=updating,
+#                         wait while dnf's cache or logs still change,
+#                         until nothing has for watchdog_stall_min, then
+#                         kill the service cgroup; in phase=checking kill
+#                         at once.  Reboot only when the
+#                         recorded phase proves dnf already returned
+#                         cleanly, or when force_reboot_on_hard_timeout
+#                         says otherwise.
 #
 #  4. PID alive, soft   - Past watchdog_soft_timeout_min.  If dnf is no
 #     timeout exceeded    longer active AND phase=checking, run an
@@ -56,6 +60,15 @@ readonly SYSTEMD_RUN_BIN="${TEST_ROOT}/usr/bin/systemd-run"
 readonly SYSTEMCTL_BIN="${TEST_ROOT}/usr/bin/systemctl"
 readonly MAIN_SERVICE_UNIT=dnf-automatic-reboot.service
 readonly SCRIPT_NAME=watchdog
+# What dnf changes while it works: package and metadata downloads land in
+# its cache, a transaction appends to dnf.rpm.log.
+readonly DNF_CACHE_DIRECTORY="${TEST_ROOT}/var/cache/dnf"
+readonly DNF_RPM_LOG_FILE="${TEST_ROOT}/var/log/dnf.rpm.log"
+readonly DNF_LIBREPO_LOG_FILE="${TEST_ROOT}/var/log/dnf.librepo.log"
+readonly DNF_LOG_FILE="${TEST_ROOT}/var/log/dnf.log"
+# The last dnf progress seen for the supervised run; written by the watchdog
+# only, replaced when a different run is supervised, emptied by a reboot.
+readonly PROGRESS_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.progress"
 
 # REBOOT_PENDING_FILE, the request lock, and request_reboot.
 # shellcheck source=/dev/null
@@ -122,12 +135,97 @@ get_config_integer() {
 
 SOFT_TIMEOUT_MIN=$(get_config_integer watchdog_soft_timeout_min 60)
 HARD_TIMEOUT_MIN=$(get_config_integer watchdog_hard_timeout_min 320)
+STALL_MIN=$(get_config_integer watchdog_stall_min 60)
 REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300 1 86400)
 FORCE_REBOOT_ON_HARD_TIMEOUT=$(get_config_value force_reboot_on_hard_timeout no)
 KILL_CONFIRM_SEC=$(get_config_integer watchdog_kill_confirm_sec 30)
 NEEDS_RESTARTING_TIMEOUT_SEC=$(get_config_integer needs_restarting_timeout_sec 120)
 REBOOT_REQUEST_LOCK_WAIT_SEC=$(get_config_integer reboot_request_lock_wait_sec 60 1 600)
 REBOOT_INHIBITED_WAIT_SEC=$(get_config_integer reboot_inhibited_wait_sec 1800 0 86400)
+
+# ---------------------------------------------------------------------------
+# dnf progress.  A run past the hard timeout in phase=updating is stopped only
+# once dnf has stopped changing anything.  On a slow link one package can take
+# hours with no log line; the bytes in the cache are the finer signal.
+# ---------------------------------------------------------------------------
+
+# dnf_progress_signature -> "FILES BYTES RPM_LOG LIBREPO_LOG DNF_LOG": the
+# number and total size of the files under dnf's cache, and the size of each
+# dnf log ("none" when missing).  Any difference between two cycles is
+# progress, a shrinking cache included: dnf removes packages after a
+# transaction.
+dnf_progress_signature() {
+    local cache_totals log_file log_sizes=""
+    cache_totals=$(find "${DNF_CACHE_DIRECTORY}" -type f -printf '%s\n' 2>/dev/null \
+                   | awk '{ file_count += 1; byte_count += $1 } END { printf "%d %d", file_count, byte_count }') \
+        || cache_totals="unreadable"
+    for log_file in "${DNF_RPM_LOG_FILE}" "${DNF_LIBREPO_LOG_FILE}" "${DNF_LOG_FILE}"; do
+        log_sizes+=" $(stat -c %s "${log_file}" 2>/dev/null || printf 'none')"
+    done
+    printf '%s%s' "${cache_totals}" "${log_sizes}"
+}
+
+# write_dnf_progress_record RUN_IDENTITY SIGNATURE CHANGED_UPTIME_SECONDS ANNOUNCED
+# Publishes PROGRESS_FILE by rename, so a reader never sees half of it.
+write_dnf_progress_record() {
+    local temporary_record
+    temporary_record=$(mktemp "${PROGRESS_FILE}.XXXXXX" 2>/dev/null) || return 1
+    if ! printf 'run=%s\nsignature=%s\nchanged_uptime=%s\nannounced=%s\n' "$1" "$2" "$3" "$4" \
+            > "${temporary_record}" 2>/dev/null \
+       || ! mv -f -T "${temporary_record}" "${PROGRESS_FILE}" 2>/dev/null; then
+        rm -f "${temporary_record}"
+        return 1
+    fi
+}
+
+# update_dnf_progress_record RUN_IDENTITY CURRENT_UPTIME_SECONDS
+# Compares dnf's progress signature with PROGRESS_FILE and sets
+#   DNF_PROGRESS_SIGNATURE  the signature now
+#   DNF_STALLED_MINUTES     whole minutes since it last changed
+#   DNF_SLOW_RUN_ANNOUNCED  yes once the slow run has been announced
+# RUN_IDENTITY, "PID START_UPTIME", ties the record to one run: the first
+# cycle that sees a run, and every change of signature, counts as progress
+# now.  Returns 1 when the record cannot be written, since a stall then
+# cannot be told from progress.
+update_dnf_progress_record() {
+    local run_identity="$1" current_uptime_seconds="$2" record_line
+    local recorded_identity="" recorded_signature="" changed_uptime_seconds="" announced="no"
+    DNF_PROGRESS_SIGNATURE=$(dnf_progress_signature)
+    if [[ -f "${PROGRESS_FILE}" ]]; then
+        while IFS= read -r record_line; do
+            case "${record_line}" in
+                run=*)            recorded_identity="${record_line#run=}" ;;
+                signature=*)      recorded_signature="${record_line#signature=}" ;;
+                changed_uptime=*) changed_uptime_seconds="${record_line#changed_uptime=}" ;;
+                announced=*)      announced="${record_line#announced=}" ;;
+            esac
+        done < "${PROGRESS_FILE}"
+    fi
+    if [[ "${recorded_identity}" != "${run_identity}" ]]; then
+        announced="no"
+    fi
+    if [[ "${recorded_identity}" != "${run_identity}" || "${recorded_signature}" != "${DNF_PROGRESS_SIGNATURE}" \
+          || ! "${changed_uptime_seconds}" =~ ^[0-9]+$ ]]; then
+        changed_uptime_seconds="${current_uptime_seconds}"
+        if ! write_dnf_progress_record "${run_identity}" "${DNF_PROGRESS_SIGNATURE}" \
+                "${changed_uptime_seconds}" "${announced}"; then
+            return 1
+        fi
+    fi
+    DNF_STALLED_MINUTES=$(( (current_uptime_seconds - changed_uptime_seconds) / 60 ))
+    DNF_SLOW_RUN_ANNOUNCED="${announced}"
+}
+
+# announce_slow_run RUN_IDENTITY - tells logged-in users once per run that it
+# has passed the hard timeout and is left running while dnf makes progress.
+announce_slow_run() {
+    local run_identity="$1" changed_uptime_seconds=""
+    wall_msg "dnf-automatic-reboot: the update has run past ${HARD_TIMEOUT_MIN}min and dnf is still working." \
+             "It is stopped only once dnf changes nothing for ${STALL_MIN}min. Do not reboot meanwhile."
+    changed_uptime_seconds=$(sed -n 's/^changed_uptime=//p' "${PROGRESS_FILE}" 2>/dev/null) || changed_uptime_seconds=""
+    write_dnf_progress_record "${run_identity}" "${DNF_PROGRESS_SIGNATURE}" "${changed_uptime_seconds}" yes \
+        || log_warning "cannot record the announcement in ${PROGRESS_FILE} - it may be repeated"
+}
 
 # ---------------------------------------------------------------------------
 # Independent reboot check, bounded.
@@ -435,6 +533,18 @@ main() {
         exit 0
     fi
 
+    # Every cycle of an updating run records dnf's progress, so the history is
+    # there when the hard timeout comes.
+    dnf_progress_recorded=no
+    if [[ "${run_phase}" == "updating" ]]; then
+        if update_dnf_progress_record "${service_pid} ${start_uptime_seconds}" "${current_uptime_seconds}"; then
+            dnf_progress_recorded=yes
+            log "dnf progress: ${DNF_PROGRESS_SIGNATURE} (unchanged for ${DNF_STALLED_MINUTES}min)"
+        else
+            log_warning "cannot write ${PROGRESS_FILE} - dnf progress not recorded this cycle"
+        fi
+    fi
+
     # ---------------------------------------------------------------------------
     # Scenario 3: hard timeout - PID still alive after HARD_TIMEOUT_MIN
     #
@@ -442,8 +552,28 @@ main() {
     # transaction is complete and rebooting is safe.  phase=updating means it did
     # not, so an rpm transaction may be half-applied - the same uncertainty for
     # which scenario 2 already refuses to reboot.  Rebooting there is opt-in.
+    #
+    # In phase=updating the run is killed only once dnf has stopped: nothing in
+    # its cache or logs changed for STALL_MIN.  A download on a slow link, or a
+    # long transaction, is left to finish.  A stall that cannot be confirmed,
+    # because the progress record cannot be written, kills nothing and fails
+    # the unit so OnFailure= reports it.  STALL_MIN 0 kills at the hard timeout.
     # ---------------------------------------------------------------------------
     if [[ "${elapsed_min}" -ge "${HARD_TIMEOUT_MIN}" ]]; then
+        if [[ "${run_phase}" == "updating" && "${STALL_MIN}" -gt 0 ]]; then
+            if [[ "${dnf_progress_recorded}" != "yes" ]]; then
+                log_error "hard timeout ${HARD_TIMEOUT_MIN}min passed in phase=updating, but dnf progress cannot be recorded in ${PROGRESS_FILE} - not stopping a run that may still be working"
+                exit 1
+            fi
+            if [[ "${DNF_STALLED_MINUTES}" -lt "${STALL_MIN}" ]]; then
+                log_warning "hard timeout ${HARD_TIMEOUT_MIN}min passed in phase=updating; dnf changed its cache or logs ${DNF_STALLED_MINUTES}min ago - left running until nothing changes for ${STALL_MIN}min"
+                if [[ "${DNF_SLOW_RUN_ANNOUNCED}" != "yes" ]]; then
+                    announce_slow_run "${service_pid} ${start_uptime_seconds}"
+                fi
+                exit 0
+            fi
+            log_error "dnf changed nothing in its cache or logs for ${DNF_STALLED_MINUTES}min, past the hard timeout ${HARD_TIMEOUT_MIN}min - stopping the run"
+        fi
         log_error "hard timeout ${HARD_TIMEOUT_MIN}min exceeded - PID ${service_pid} still alive in phase=${run_phase}"
         begin_recovery
         kill_result=0

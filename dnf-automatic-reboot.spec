@@ -474,12 +474,15 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 - CHANGE: dnf-automatic-reboot.timer runs at 03:00 UTC instead of 03:00 local time, so the run
   no longer moves with the host's time zone or daylight saving time. An OnCalendar= override
   keeps its own time. The timer does not start on a host booted from rpm-ostree.
-- CHANGE: An update gets four hours before anything stops it: dnf_timeout_min defaults to 240
-  (was 60) and watchdog_hard_timeout_min to 320 (was 180), so an upgrade to the next minor EL
-  release on a slow host is not cut off halfway. An edited automatic-reboot.conf keeps its own
-  values; raise both there.
-- NEW: run.sh warns at every start when watchdog_hard_timeout_min does not exceed
-  dnf_timeout_min plus kill_grace_sec, since the watchdog would then kill a long update first.
+- CHANGE: An update is not stopped while dnf is still working, so a download over a slow link
+  or an upgrade to the next minor EL release on a slow host is not cut off halfway.
+  dnf_timeout_min defaults to 0, no deadline (was 60). Past watchdog_hard_timeout_min (now 320,
+  was 180) the watchdog stops an updating run only once nothing in /var/cache/dnf or dnf's logs
+  has changed for watchdog_stall_min (new, default 60), and tells logged-in users once that the
+  run is still going. An edited automatic-reboot.conf keeps its own values; set
+  dnf_timeout_min = 0 there.
+- NEW: run.sh warns at every start when watchdog_stall_min = 0 and a non-zero dnf_timeout_min
+  reaches past watchdog_hard_timeout_min, since the watchdog would then kill a long update first.
 - FIX: A scheduled reboot goes ahead while users are logged in. systemctl reboot
   --check-inhibitors=yes also refused while any other user had a session, so one open SSH login
   failed the reboot after reboot_inhibited_wait_sec and held update runs until a manual reboot

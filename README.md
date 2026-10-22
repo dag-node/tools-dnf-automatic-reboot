@@ -86,10 +86,12 @@ Between 03:00 and 03:10 UTC the package:
 Updates that `dnf` knows about but refuses to install, and repositories that
 install packages without checking their signatures, are reported in the log.
 
-An update gets four hours, enough for an upgrade to the next minor release on
-a Raspberry Pi. A separate watchdog checks every five minutes. If an update run
-is still going after five hours and twenty minutes, the watchdog stops it and
-alerts you; it does not restart while packages may be half-installed.
+An update is never stopped while dnf is still working, so a download over a
+slow link, or an upgrade to the next minor release on a Raspberry Pi, can take
+as long as it needs. A separate watchdog checks every five minutes. Once an
+update run has gone on for five hours and twenty minutes, and dnf has changed
+nothing in its cache or logs for an hour, the watchdog stops it and alerts you;
+it does not restart while packages may be half-installed.
 
 When something goes wrong, logged-in users get a message on their terminal and
 the details go to `/var/log/dnf-automatic-reboot.log`.

@@ -443,7 +443,7 @@ Watchdog decisions by phase:
 
 | Phase | Soft timeout + dnf idle | Hard timeout |
 |-------|------------------------|--------------|
-| `updating` | Leave for hard timeout (unknown completion) | Kill cgroup + alert; reboot only if `force_reboot_on_hard_timeout=yes` |
+| `updating` | Leave for hard timeout (unknown completion) | Once dnf has changed nothing for `watchdog_stall_min`: kill cgroup + alert; reboot only if `force_reboot_on_hard_timeout=yes` |
 | `checking` | Run independent needs-reboot check, kill cgroup | Kill cgroup + reboot (dnf already returned cleanly) |
 
 The independent check can hang like the one it replaces, so it runs under `timeout`
@@ -462,12 +462,24 @@ this kill exists for. `dnf-automatic` runs behind `systemd-inhibit` and
 `timeout(1)`, so signalling the recorded PID and its direct children leaves the rpm
 transaction running while the caller proceeds to reboot.
 
-`dnf_timeout_min` (default 240) bounds dnf-automatic; an upgrade to the next minor EL release
-on a Raspberry Pi takes hours. The watchdog times the run from before dnf-automatic starts, so
-`watchdog_hard_timeout_min` (default 320) must exceed `dnf_timeout_min` plus `kill_grace_sec`,
-with room for the reboot check and service restarts; `run.sh` warns at every start when it does
-not. 320 stays below the six hours between runs of a four-a-day timer. A timer elapse during a
-run requests a start of an activating oneshot, which joins the running start job: that elapse is
+A run that is still updating is never stopped while dnf works: a download over a slow link can
+take days, and an upgrade to the next minor EL release on a Raspberry Pi takes hours.
+`dnf_timeout_min` defaults to 0, no deadline (`timeout 0m`). Every watchdog cycle of an
+updating run records dnf's progress signature in `/run/dnf-automatic-reboot.progress`: the
+number and total size of the files under `/var/cache/dnf` and the sizes of `dnf.rpm.log`,
+`dnf.librepo.log` and `dnf.log`. One package can take hours with no log line, so the cache bytes
+are the download signal; rpm's log is the transaction's. Past `watchdog_hard_timeout_min`
+(default 320) the watchdog kills an updating run only once the signature has not changed for
+`watchdog_stall_min` (default 60), and announces the slow run once. Any change counts, a
+shrinking cache included. The record carries the run's `pid` and `start_uptime`; a cycle that
+finds another run's record, or none, counts as progress now. A record that cannot be written
+kills nothing and fails the watchdog. `watchdog_stall_min = 0` kills at the hard timeout as
+before, and `run.sh` then warns when a non-zero `dnf_timeout_min` reaches past it. dnf's own
+`minrate`, `timeout` and `retries` are left alone. Whether a download grows its cache file
+while bytes arrive, rather than appearing whole at the end, needs a host reading.
+
+320 stays below the six hours between runs of a four-a-day timer. A timer elapse during a run
+requests a start of an activating oneshot, which joins the running start job: that elapse is
 skipped, never overlapped. This is systemd's job model; the probe checks it.
 
 At hard timeout in `phase=updating` an rpm transaction may be half-applied. That is

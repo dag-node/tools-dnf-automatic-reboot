@@ -236,10 +236,12 @@ REFRESH_METADATA=$(get_config_value refresh_metadata yes)
 REFRESH_METADATA="${REFRESH_METADATA//[[:space:]]/}"
 METADATA_REFRESH_TIMEOUT_SEC=$(get_config_integer metadata_refresh_timeout_sec 900 10 3600)
 ALWAYS_REBOOT=$(get_config_value always_reboot no)
-DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 240 1)
+# 0: no fixed deadline; the watchdog stops dnf only once it stalls.
+DNF_TIMEOUT_MIN=$(get_config_integer dnf_timeout_min 0)
 KILL_GRACE_SEC=$(get_config_integer kill_grace_sec 30)
 # Read only to warn when the watchdog would end the update first.
 WATCHDOG_HARD_TIMEOUT_MIN=$(get_config_integer watchdog_hard_timeout_min 320)
+WATCHDOG_STALL_MIN=$(get_config_integer watchdog_stall_min 60)
 WARN_UNSIGNED_REPOSITORIES=$(get_config_value warn_unsigned_repositories yes)
 WARN_UNAPPLIED_ADVISORIES=$(get_config_value warn_unapplied_advisories yes)
 RESTART_SERVICES=$(get_config_value restart_services yes)
@@ -485,7 +487,7 @@ warn_on_unapplied_security_advisories() {
 # scheduled.  An admin can still force-reboot with: systemctl reboot --force
 #
 # timeout sends SIGTERM at DNF_TIMEOUT_MIN minutes, then SIGKILL after
-# KILL_GRACE_SEC seconds; 124 = timed out.  Returns dnf-automatic's exit code,
+# KILL_GRACE_SEC seconds; 124 = timed out.  0 minutes disables the deadline.  Returns dnf-automatic's exit code,
 # or systemd-inhibit's when the lock was refused.
 # ---------------------------------------------------------------------------
 run_dnf_automatic_under_inhibitor() {
@@ -545,15 +547,17 @@ chronyc_available() {
     command -v chronyc >/dev/null 2>&1
 }
 
-# warn_on_watchdog_ending_the_update - warns when watchdog_hard_timeout_min
-# does not exceed dnf_timeout_min plus kill_grace_sec.  The watchdog times the
+# warn_on_watchdog_ending_the_update - warns when the watchdog kills at its
+# hard timeout whatever dnf is doing (watchdog_stall_min = 0) and that comes
+# no later than dnf_timeout_min plus kill_grace_sec.  The watchdog times the
 # run from before dnf-automatic starts, so with such settings it kills a long
 # update, half-applied transaction included, before the run's own timeout
 # would.  A warning, not a failure: the setting is the operator's, and a run
 # that finishes in time is unaffected.
 warn_on_watchdog_ending_the_update() {
-    if (( WATCHDOG_HARD_TIMEOUT_MIN * 60 <= DNF_TIMEOUT_MIN * 60 + KILL_GRACE_SEC )); then
-        log_warning "watchdog_hard_timeout_min = ${WATCHDOG_HARD_TIMEOUT_MIN} does not exceed dnf_timeout_min = ${DNF_TIMEOUT_MIN} plus kill_grace_sec = ${KILL_GRACE_SEC}s: the watchdog would kill an update that long before its own timeout - raise watchdog_hard_timeout_min in ${CONFIG_FILE#"${TEST_ROOT}"}"
+    if (( WATCHDOG_STALL_MIN == 0 && DNF_TIMEOUT_MIN > 0 \
+          && WATCHDOG_HARD_TIMEOUT_MIN * 60 <= DNF_TIMEOUT_MIN * 60 + KILL_GRACE_SEC )); then
+        log_warning "watchdog_hard_timeout_min = ${WATCHDOG_HARD_TIMEOUT_MIN} does not exceed dnf_timeout_min = ${DNF_TIMEOUT_MIN} plus kill_grace_sec = ${KILL_GRACE_SEC}s: with watchdog_stall_min = 0 the watchdog kills an update that long before its own timeout - set watchdog_stall_min above 0, or raise watchdog_hard_timeout_min, in ${CONFIG_FILE#"${TEST_ROOT}"}"
     fi
 }
 
@@ -716,7 +720,11 @@ main() {
     fi
 
     wall_msg "dnf-automatic-reboot: Starting automatic updates. Reboot is inhibited until they complete."
-    log "Running dnf-automatic under the inhibitor lock (timeout=${DNF_TIMEOUT_MIN}m kill_grace=${KILL_GRACE_SEC}s)"
+    if [[ "${DNF_TIMEOUT_MIN}" -gt 0 ]]; then
+        log "Running dnf-automatic under the inhibitor lock (timeout=${DNF_TIMEOUT_MIN}m kill_grace=${KILL_GRACE_SEC}s)"
+    else
+        log "Running dnf-automatic under the inhibitor lock (no deadline; the watchdog stops it only once dnf stalls)"
+    fi
     update_started_epoch=$(date +%s)
     run_dnf_automatic_under_inhibitor || dnf_automatic_exit_code=$?
 
