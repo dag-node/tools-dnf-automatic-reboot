@@ -253,11 +253,27 @@ install_command_stubs() {
         esac
     }
 
-    # rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' PKG -> STUB_RPM_KERNEL_VERSIONS
-    # rpm -q --qf '%{EVR}' PKG                          -> STUB_RPM_EVR
-    # rpm -qf PATH --qf '%{NAME}'                       -> STUB_RPM_OWNER
+    # rpm -ql PKG                                  -> /lib/modules/<release>/vmlinuz
+    #                                                 for each STUB_RPM_KERNEL_VERSIONS line
+    # rpm -q --qf '%{EVR}' PKG                     -> STUB_RPM_EVR
+    # rpm -qf /lib/modules/RELEASE/vmlinuz --qf .. -> STUB_RPM_KERNEL_OWNER, kernel-uek-core
+    #                                                 by default; "none" owns nothing
+    # rpm -qf PATH --qf '%{NAME}'                  -> STUB_RPM_OWNER
     rpm() {
-        local argument
+        local argument kernel_version
+        if [[ "$1" == "-ql" ]]; then
+            [[ -n "${STUB_RPM_KERNEL_VERSIONS:-}" ]] || return 1
+            while IFS= read -r kernel_version; do
+                [[ -n "${kernel_version}" ]] && printf '/lib/modules/%s/vmlinuz\n/lib/modules/%s/modules.dep\n' \
+                    "${kernel_version}" "${kernel_version}"
+            done <<< "${STUB_RPM_KERNEL_VERSIONS}"
+            return 0
+        fi
+        if [[ "$1" == "-qf" && "$2" == /lib/modules/*/vmlinuz ]]; then
+            [[ "${STUB_RPM_KERNEL_OWNER:-kernel-uek-core}" != "none" ]] || return 1
+            printf '%s\n' "${STUB_RPM_KERNEL_OWNER:-kernel-uek-core}"
+            return 0
+        fi
         if [[ "$1" == "-qf" ]]; then
             printf '%s' "${STUB_RPM_OWNER:-}"
             [[ -n "${STUB_RPM_OWNER:-}" ]] || return 1
@@ -270,8 +286,7 @@ install_command_stubs() {
                 return 0
             fi
         done
-        [[ -n "${STUB_RPM_KERNEL_VERSIONS:-}" ]] || return 1
-        printf '%s\n' "${STUB_RPM_KERNEL_VERSIONS}"
+        return 1
     }
 
     grubby() {
@@ -309,7 +324,7 @@ load_watchdog_library() {
     set +e
     IFS=$' \t\n'
     # The stub systemctl's answer, without executing it.
-    unit_control_group() { printf '%s' "${STUB_CONTROL_GROUP-/system.slice/dnf-automatic-reboot.service}"; }
+    read_unit_control_group() { printf '%s' "${STUB_CONTROL_GROUP-/system.slice/dnf-automatic-reboot.service}"; }
 }
 
 load_run_library() {
@@ -380,32 +395,155 @@ test_parser_yields_nothing_without_bullets() {
 }
 
 # ---------------------------------------------------------------------------
-# config: get_config_value is section-blind, so key names must not collide
+# config: one parser, and every doubt about the file stops the run
 # ---------------------------------------------------------------------------
-test_config_every_key_resolves() {
-    load_needs_reboot_library
-    local config_key resolved_value
-    for config_key in filter_packages verify_kernel_version learn_false_positives \
-                      verify_grub_default kernel_reboot_attempt_limit \
-                      needs_restarting_timeout_sec reboot_delay_sec always_reboot \
-                      kill_grace_sec restart_services \
-                      restart_services_exclude watchdog_soft_timeout_min \
-                      watchdog_hard_timeout_min watchdog_stall_min watchdog_transaction_stall_min \
-                      enable_chrony_wait wall_messages reboot_request_lock_wait_sec \
-                      watchdog_kill_confirm_sec restart_service_timeout_sec \
-                      reboot_inhibited_wait_sec require_clock_sync clock_sync_wait_sec \
-                      refresh_metadata metadata_refresh_timeout_sec; do
-        resolved_value=$(get_config_value "${config_key}" "MISSING")
-        if [[ "${resolved_value}" == "MISSING" ]]; then
-            fail "shipped config does not define ${config_key}"
-        fi
+# load_config_library - sources config.sh, the parser every script uses.
+load_config_library() {
+    # shellcheck source=/dev/null
+    source "${REPO_ROOT}/scripts/config.sh"
+    set +e
+    IFS=$' \t\n'
+}
+
+# write_test_config LINE... - the configuration under test, one line each.
+write_test_config() {
+    printf '%s\n' "$@" > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+}
+
+# load_test_config - load_config on the configuration under test.
+load_test_config() {
+    load_config "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+}
+
+test_config_shipped_file_sets_every_default() {
+    load_config_library
+    local config_key
+    load_config "${REPO_ROOT}/conf/automatic-reboot.conf" \
+        || fail "the shipped file has errors: ${CONFIG_ERRORS[*]}"
+    for config_key in "${CONFIG_KEYS[@]}"; do
+        [[ -n "${CONFIG_KEY_LINES[${config_key}]+set}" ]] \
+            || fail "the shipped file does not set ${config_key}"
+        assert_equals "${CONFIG_KEY_DEFAULTS[${config_key}]}" "${CONFIG_VALUES[${config_key}]}" \
+            "${config_key}: the shipped value is the default the scripts use"
+    done
+}
+
+test_config_booleans_accept_every_spelling() {
+    load_config_library
+    local spelling
+    for spelling in yes Yes TRUE on 1; do
+        write_test_config "warn_unsigned_repositories = ${spelling}"
+        load_test_config || fail "${spelling}: ${CONFIG_ERRORS[*]}"
+        assert_equals "yes" "$(config_value warn_unsigned_repositories)" "${spelling} is yes"
+    done
+    for spelling in no No FALSE off 0; do
+        write_test_config "restart_services = ${spelling}"
+        load_test_config || fail "${spelling}: ${CONFIG_ERRORS[*]}"
+        assert_equals "no" "$(config_value restart_services)" "${spelling} is no"
+    done
+    for spelling in maybe y enabled 2; do
+        write_test_config "restart_services = ${spelling}"
+        load_test_config && fail "${spelling} was accepted"
+        assert_contains "${CONFIG_ERRORS[*]}" "restart_services = ${spelling} is not a yes value" "${spelling} is an error"
     done
     return 0
 }
 
+test_config_blanks_and_comments_never_change_a_value() {
+    load_config_library
+    write_test_config "restart_services = yes " "require_clock_sync = yes	" \
+                      "warn_unapplied_advisories = no   # quiet" "  warn_unsigned_repositories=no" \
+                      "# dnf_query_timeout_seconds = 5" "[services]  # grouping only"
+    load_test_config || fail "${CONFIG_ERRORS[*]}"
+    assert_equals "yes" "$(config_value restart_services)" "a trailing blank is not part of the value"
+    assert_equals "yes" "$(config_value require_clock_sync)" "nor is a trailing tab"
+    assert_equals "no" "$(config_value warn_unapplied_advisories)" "nor a comment after a blank"
+    assert_equals "no" "$(config_value warn_unsigned_repositories)" "leading blanks and no spaces around ="
+    assert_equals "120" "$(config_value dnf_query_timeout_seconds)" "a commented-out line sets nothing"
+    # A # inside a word is part of the value, which then is no boolean.
+    write_test_config "restart_services = yes#no"
+    load_test_config && fail "yes#no was accepted"
+    assert_contains "${CONFIG_ERRORS[*]}" "restart_services = yes#no is not a yes value" "and is reported whole"
+}
+
+test_config_unknown_key_names_its_line() {
+    load_config_library
+    # A key from an earlier version: read as nothing, it would quietly leave
+    # its default in place.
+    write_test_config "[reboot]" "reboot_delay_sec = 3600"
+    load_test_config && fail "an unknown key was accepted"
+    assert_contains "${CONFIG_ERRORS[*]}" "automatic-reboot.conf:2: reboot_delay_sec is not a setting of this version" \
+        "names the key and its line"
+}
+
+test_config_duplicate_key_is_an_error() {
+    load_config_library
+    # Sections do not make two keys different: the second line is ambiguous.
+    write_test_config "[services]" "restart_services = no" "[updates]" "restart_services = yes"
+    load_test_config && fail "a repeated key was accepted"
+    assert_contains "${CONFIG_ERRORS[*]}" ":4: restart_services is already set on line 2" "names both lines"
+}
+
+test_config_malformed_lines_are_errors() {
+    load_config_library
+    write_test_config "garbage" "[Bad Section]" "= 5" "clock_sync_timeout_seconds ="
+    load_test_config && fail "malformed lines were accepted"
+    assert_equals "4" "${#CONFIG_ERRORS[@]}" "one error per line"
+    assert_contains "${CONFIG_ERRORS[0]}" ":1: not a 'key = value' line: garbage" "a line of no known shape"
+    assert_contains "${CONFIG_ERRORS[1]}" ":2: not a section header" "a section name with a blank"
+    assert_contains "${CONFIG_ERRORS[2]}" ":3: no key before '='" "a value without a key"
+    assert_contains "${CONFIG_ERRORS[3]}" ":4: clock_sync_timeout_seconds has no value" "a key without a value"
+}
+
+test_config_integers_are_decimal_and_bounded() {
+    load_config_library
+    write_test_config "dnf_query_timeout_seconds = 080"
+    load_test_config || fail "${CONFIG_ERRORS[*]}"
+    assert_equals "80" "$(config_value dnf_query_timeout_seconds)" "080 is eighty seconds, not an invalid octal number"
+    local rejected_value
+    for rejected_value in 0 901 99999999999999999999 -1 abc 5s; do
+        write_test_config "dnf_query_timeout_seconds = ${rejected_value}"
+        load_test_config && fail "${rejected_value} was accepted"
+        assert_equals "120" "$(config_value dnf_query_timeout_seconds)" "${rejected_value}: values stay well-formed"
+    done
+    write_test_config "service_restart_timeout_seconds = 901"
+    load_test_config && fail "a restart wait longer than the watchdog's stall window was accepted"
+    return 0
+}
+
+test_config_missing_file_is_an_error() {
+    load_config_library
+    rm -f "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    load_test_config && fail "a missing file was accepted"
+    assert_contains "${CONFIG_ERRORS[*]}" "automatic-reboot.conf: cannot be read" "says so"
+}
+
+test_config_unit_patterns_are_validated() {
+    load_config_library
+    write_test_config "restart_services_excluded_patterns = postgresql.service , container-*.service"
+    load_test_config || fail "${CONFIG_ERRORS[*]}"
+    assert_equals "postgresql.service,container-*.service" "$(config_value restart_services_excluded_patterns)" \
+        "items trimmed and joined"
+    write_test_config "restart_services_excluded_patterns ="
+    load_test_config || fail "the empty list: ${CONFIG_ERRORS[*]}"
+    assert_equals "" "$(config_value restart_services_excluded_patterns)" "empty adds nothing"
+    local rejected_value
+    for rejected_value in "a.service,,b.service" "a.service," "sshd" "'sshd.service'" 'x$(id).service'; do
+        write_test_config "restart_services_excluded_patterns = ${rejected_value}"
+        load_test_config && fail "${rejected_value} was accepted"
+    done
+    return 0
+}
+
+test_config_diagnostics_are_printable() {
+    load_config_library
+    write_test_config "restart_services = $(printf 'y\033[2Jes')"
+    load_test_config && fail "a control character was accepted"
+    assert_not_contains "${CONFIG_ERRORS[*]}" $'\033' "no escape sequence reaches the log"
+}
+
 # ---------------------------------------------------------------------------
-# check-config.sh: an edited configuration keeps old keys and old defaults
-# across upgrades; each one must be named, and the file never edited.
+# check-config.sh: the validator, and what differs from the shipped file
 # ---------------------------------------------------------------------------
 # install_shipped_config: the configuration as the package ships it.
 install_shipped_config() {
@@ -424,42 +562,46 @@ test_check_config_unedited_is_silent() {
 test_check_config_names_every_difference() {
     install_shipped_config
     local installed_config="${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf" checksum_before output exit_code=0
-    # An edited copy from an earlier version: an old default, a key added
-    # since, and a key no longer read.
-    sed -i -e 's/^watchdog_hard_timeout_min = 320$/watchdog_hard_timeout_min = 180/' \
-           -e '/^watchdog_transaction_stall_min = /d' "${installed_config}"
-    printf 'dnf_timeout_min = 60\n' >> "${installed_config}"
+    sed -i -e 's/^metadata_refresh_timeout_seconds = 1800$/metadata_refresh_timeout_seconds = 3600/' \
+           -e 's/^restart_services = yes$/restart_services = FALSE   # by hand/' \
+           -e '/^warn_unapplied_advisories = /d' "${installed_config}"
     checksum_before=$(cksum < "${installed_config}")
     output=$(bash "${REPO_ROOT}/scripts/check-config.sh" 2>&1) || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "differences found"
-    assert_contains "${output}" "not read by this version, remove the line:  dnf_timeout_min = 60" "the dead key"
-    assert_contains "${output}" "not set, the built-in default applies:  watchdog_transaction_stall_min = 180 (shipped)" \
-        "the new key"
-    assert_contains "${output}" "differs from the shipped value:  watchdog_hard_timeout_min = 180 (shipped: 320)" \
-        "the old default"
+    assert_exit_code 1 "${exit_code}" "valid, with differences"
+    assert_contains "${output}" "  restart_services = no (shipped: yes)" "compared as the scripts read it"
+    assert_contains "${output}" "  metadata_refresh_timeout_seconds = 3600 (shipped: 1800)" "an edited value"
     assert_contains "${output}" "Compare: diff -u /usr/share/dnf-automatic-reboot/automatic-reboot.conf /etc/dnf/automatic-reboot.conf" \
         "and how to see the whole difference"
-    assert_equals "3" "$(grep -c '^  ' <<< "${output}")" "nothing else is reported"
+    assert_equals "2" "$(grep -c '^  ' <<< "${output}")" "a key left out takes its default, the shipped value"
     assert_equals "${checksum_before}" "$(cksum < "${installed_config}")" "the operator's file is not edited"
 }
 
-test_check_config_reads_values_as_the_scripts_do() {
+test_check_config_same_values_written_differently() {
     install_shipped_config
-    local installed_config="${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf" exit_code=0
-    # Spacing, a trailing comment, and an earlier line overridden by the last
-    # one: get_config_value reads the shipped values from all of them.
-    sed -i 's/^watchdog_stall_min = 60$/watchdog_stall_min = 5\n  watchdog_stall_min=60   # an hour/' "${installed_config}"
+    local exit_code=0
+    sed -i -e 's/^restart_services = yes$/  restart_services=On  # default/' \
+           -e 's/^dnf_query_timeout_seconds = 120$/dnf_query_timeout_seconds = 0120/' \
+           "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
     bash "${REPO_ROOT}/scripts/check-config.sh" >/dev/null 2>&1 || exit_code=$?
-    assert_exit_code 0 "${exit_code}" "the same values, written differently"
+    assert_exit_code 0 "${exit_code}" "the same values"
 }
 
-test_check_config_unread_lists_only_names() {
+test_check_config_old_file_names_errors_and_replacement() {
     install_shipped_config
-    printf 'dnf_timeout_min = 60\nwatchdog_stall_min = 5\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    local output exit_code=0
-    output=$(bash "${REPO_ROOT}/scripts/check-config.sh" --unread 2>&1) || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "an unread key found"
-    assert_equals "dnf_timeout_min" "${output}" "one name per line, nothing else"
+    local installed_config="${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf" output exit_code=0
+    printf '[reboot]\nreboot_delay_sec = 300\n[timeouts]\nwatchdog_stall_min = 60\n' > "${installed_config}"
+    output=$(bash "${REPO_ROOT}/scripts/check-config.sh" 2>&1) || exit_code=$?
+    assert_exit_code 2 "${exit_code}" "invalid"
+    assert_contains "${output}" "/etc/dnf/automatic-reboot.conf:2: reboot_delay_sec is not a setting of this version" "every error"
+    assert_contains "${output}" "/etc/dnf/automatic-reboot.conf:4: watchdog_stall_min is not a setting of this version" "with its line"
+    assert_contains "${output}" "Update runs stop, and no reboot is requested, until it is valid." "what it stops"
+    assert_contains "${output}" "cp -p /etc/dnf/automatic-reboot.conf /etc/dnf/automatic-reboot.conf.bak" "the operator's copy is kept"
+    assert_contains "${output}" "cp /usr/share/dnf-automatic-reboot/automatic-reboot.conf /etc/dnf/automatic-reboot.conf" \
+        "replaced from the shipped copy"
+    cp "${REPO_ROOT}/conf/automatic-reboot.conf" "${installed_config}.rpmnew"
+    output=$(bash "${REPO_ROOT}/scripts/check-config.sh" 2>&1) || true
+    assert_contains "${output}" "mv /etc/dnf/automatic-reboot.conf.rpmnew /etc/dnf/automatic-reboot.conf" \
+        "or from the .rpmnew rpm wrote"
 }
 
 test_check_config_without_shipped_copy_fails() {
@@ -467,41 +609,6 @@ test_check_config_without_shipped_copy_fails() {
     output=$(bash "${REPO_ROOT}/scripts/check-config.sh" 2>&1) || exit_code=$?
     assert_exit_code 2 "${exit_code}" "nothing to compare with"
     assert_contains "${output}" "cannot read /usr/share/dnf-automatic-reboot/automatic-reboot.conf" "says which file"
-}
-
-test_config_prefix_keys_do_not_collide() {
-    load_needs_reboot_library
-    # restart_services must not pick up restart_services_exclude's value.
-    assert_equals "yes" "$(get_config_value restart_services MISSING)" "restart_services"
-    assert_contains "$(get_config_value restart_services_exclude MISSING)" "dbus.service" \
-        "restart_services_exclude"
-}
-
-test_config_int_rejects_non_numeric() {
-    load_needs_reboot_library
-    printf '[timeouts]\nneeds_restarting_timeout_sec = abc\n' \
-        > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    # The warning must not land on stdout: the caller assigns this to a
-    # variable that then goes straight into `timeout <value>s`.
-    assert_equals "120" "$(get_config_integer needs_restarting_timeout_sec 120 2>/dev/null)" \
-        "non-numeric falls back to a clean default"
-}
-
-test_config_int_reads_leading_zeros_as_decimal() {
-    load_run_library
-    printf '[reboot]\nreboot_delay_sec = 08\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    assert_equals "8" "$(get_config_integer reboot_delay_sec 300 1 86400 2>/dev/null)" \
-        "08 is eight seconds, not an invalid octal number"
-}
-
-test_config_int_enforces_bounds() {
-    load_run_library
-    printf '[reboot]\nreboot_delay_sec = 0\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    assert_equals "300" "$(get_config_integer reboot_delay_sec 300 1 86400 2>/dev/null)" \
-        "a zero delay would reboot at once"
-    printf '[reboot]\nreboot_delay_sec = 99999999999999999999\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    assert_equals "300" "$(get_config_integer reboot_delay_sec 300 1 86400 2>/dev/null)" \
-        "a number bash arithmetic would wrap"
 }
 
 test_request_malformed_delay_submits_nothing() {
@@ -514,85 +621,60 @@ test_request_malformed_delay_submits_nothing() {
     assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run 08x" "the malformed one never reached systemd-run"
 }
 
-test_config_int_rejects_negative() {
-    load_needs_reboot_library
-    printf '[kernel]\nkernel_reboot_attempt_limit = -1\n' \
-        > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    assert_equals "3" "$(get_config_integer kernel_reboot_attempt_limit 3 2>/dev/null)" \
-        "negative falls back to a clean default"
-}
-
 # ---------------------------------------------------------------------------
-# kernel: equality against the running kernel, failing closed
+# kernel: the running family's releases, read from the files it owns
 # ---------------------------------------------------------------------------
-test_kernel_running_is_newest_is_false_positive() {
+test_kernel_running_package_owns_the_running_vmlinuz() {
     load_needs_reboot_library
-    export STUB_UNAME_R="6.12.0-204.92.4.3.1.el9uek.aarch64"
-    export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.3.1.el9uek.aarch64"
-    running_kernel_is_newest kernel-uek
-    assert_exit_code 0 "$?" "running kernel is newest"
+    export STUB_RPM_KERNEL_OWNER=kernel-core
+    assert_equals "kernel-core" "$(running_kernel_package)" "the owner of /lib/modules/\$(uname -r)/vmlinuz"
+    export STUB_RPM_KERNEL_OWNER=none
+    assert_equals "" "$(running_kernel_package)" "none when rpm names no owner"
 }
 
-test_kernel_newer_installed_is_genuine() {
-    load_needs_reboot_library
-    export STUB_UNAME_R="6.12.0-204.92.4.3.1.el9uek.aarch64"
-    export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.3.1.el9uek.aarch64
-6.12.0-204.92.4.4.el9uek.aarch64"
-    running_kernel_is_newest kernel-uek
-    assert_exit_code 1 "$?" "newer kernel installed"
-}
-
-test_kernel_not_installed_is_genuine() {
-    load_needs_reboot_library
-    export STUB_UNAME_R="6.12.0-204.92.4.3.1.el9uek.aarch64"
-    export STUB_RPM_KERNEL_VERSIONS=""
-    running_kernel_is_newest kernel-uek >/dev/null 2>&1
-    assert_exit_code 1 "$?" "uninstalled package must fail closed, not be dropped"
-}
-
-test_kernel_arch_stripped_form_matches() {
-    load_needs_reboot_library
-    export STUB_UNAME_R="5.14.0-427.el9"
-    export STUB_UNAME_M="x86_64"
-    export STUB_RPM_KERNEL_VERSIONS="5.14.0-427.el9.x86_64"
-    running_kernel_is_newest kernel
-    assert_exit_code 0 "$?" "release string without arch suffix"
-}
-
-test_kernel_version_sort_is_numeric() {
+test_kernel_release_sort_is_numeric() {
     load_needs_reboot_library
     export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.3.1.el9uek.aarch64
 6.12.0-204.92.4.4.el9uek.aarch64
 6.12.0-204.92.4.10.el9uek.aarch64"
     assert_equals "6.12.0-204.92.4.10.el9uek.aarch64" \
-        "$(newest_installed_kernel_version kernel-uek)" "4.10 outranks 4.4 and 4.3.1"
+        "$(newest_installed_kernel_release kernel-uek-core)" "4.10 outranks 4.4 and 4.3.1"
+}
+
+test_kernel_release_carries_any_suffix() {
+    load_needs_reboot_library
+    # An EL9 real-time release: uname -r and the module directory both end in
+    # +rt, which rpm's VERSION-RELEASE.ARCH does not carry.
+    export STUB_UNAME_R="5.14.0-503.11.1.el9_5.x86_64+rt" STUB_RPM_KERNEL_OWNER=kernel-rt-core \
+           STUB_RPM_KERNEL_VERSIONS="5.14.0-503.11.1.el9_5.x86_64+rt"
+    FLAGGED_PACKAGE_NAMES=(kernel-rt kernel-rt-core)
+    classify_flagged_packages >/dev/null 2>&1
+    assert_equals "0" "${#REBOOT_TRIGGER_PACKAGES[@]}" "the running +rt release is the newest: false positive"
+    assert_equals "0" "${REBOOT_WITHHELD}" "and nothing is withheld"
 }
 
 # ---------------------------------------------------------------------------
 # grub: never reboot into a kernel the bootloader would not select
 # ---------------------------------------------------------------------------
-test_grub_default_matches_newest() {
+test_grub_default_matches_release() {
     load_needs_reboot_library
-    export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.4.el9uek.aarch64"
     export STUB_GRUBBY_DEFAULT="/boot/vmlinuz-6.12.0-204.92.4.4.el9uek.aarch64"
-    grub_default_is_newest_kernel kernel-uek-core
-    assert_exit_code 0 "$?" "default points at newest"
+    grub_default_is_kernel_release 6.12.0-204.92.4.4.el9uek.aarch64
+    assert_exit_code 0 "$?" "default points at the release"
 }
 
 test_grub_default_is_stale() {
     load_needs_reboot_library
-    export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.4.el9uek.aarch64"
     export STUB_GRUBBY_DEFAULT="/boot/vmlinuz-6.12.0-204.92.4.3.1.el9uek.aarch64"
-    grub_default_is_newest_kernel kernel-uek-core
+    grub_default_is_kernel_release 6.12.0-204.92.4.4.el9uek.aarch64
     assert_exit_code 1 "$?" "stale default must be detected"
 }
 
 test_grub_unreadable_grubenv_is_undetermined() {
     load_needs_reboot_library
-    export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.4.el9uek.aarch64"
     # What grubby printed, with exit 0, when grubenv was unreadable.
     export STUB_GRUBBY_DEFAULT="/boot"
-    grub_default_is_newest_kernel kernel-uek-core
+    grub_default_is_kernel_release 6.12.0-204.92.4.4.el9uek.aarch64
     assert_exit_code 2 "$?" "no kernel path is undetermined, not a stale default"
 }
 
@@ -600,8 +682,7 @@ test_grub_unavailable_is_undetermined() {
     load_needs_reboot_library
     unset -f grubby
     PATH=/nonexistent
-    export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.4.el9uek.aarch64"
-    grub_default_is_newest_kernel kernel-uek-core
+    grub_default_is_kernel_release 6.12.0-204.92.4.4.el9uek.aarch64
     assert_exit_code 2 "$?" "missing grubby is undetermined, not a mismatch"
 }
 
@@ -765,15 +846,6 @@ test_state_attempts_cleared_when_target_runs_unflagged() {
         "a target that is not running keeps its count"
 }
 
-test_state_attempts_cleared_for_arch_stripped_release() {
-    load_needs_reboot_library
-    export STUB_UNAME_R="6.12.0-9.el9uek" STUB_UNAME_M=aarch64
-    write_kernel_reboot_attempts kernel-uek "6.12.0-9.el9uek.aarch64" 1 old-boot
-    clear_kernel_reboot_attempts_for_running_kernel >/dev/null
-    assert_equals "0" "$(read_kernel_reboot_attempts kernel-uek '6.12.0-9.el9uek.aarch64')" \
-        "uname -r without the arch suffix matches"
-}
-
 test_state_attempts_kept_while_old_kernel_runs() {
     load_needs_reboot_library
     export STUB_UNAME_R="4.18.0-553.169.1.el8_10.x86_64" STUB_UNAME_M=x86_64
@@ -884,7 +956,7 @@ test_classify_withholds_at_attempt_limit() {
     export STUB_UNAME_R="6.12.0-204.92.4.3.1.el9uek.aarch64"
     export STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.4.el9uek.aarch64"
     export STUB_GRUBBY_DEFAULT="/boot/vmlinuz-6.12.0-204.92.4.4.el9uek.aarch64"
-    write_kernel_reboot_attempts kernel-uek "6.12.0-204.92.4.4.el9uek.aarch64" 3
+    write_kernel_reboot_attempts kernel-uek-core "6.12.0-204.92.4.4.el9uek.aarch64" 3
     FLAGGED_PACKAGE_NAMES=(kernel-uek)
     classify_flagged_packages >/dev/null 2>&1
     assert_equals "0" "${#REBOOT_TRIGGER_PACKAGES[@]}" "loop guard stops further reboots"
@@ -936,7 +1008,7 @@ test_classify_schedules_genuine_kernel_reboot() {
     FLAGGED_PACKAGE_NAMES=(kernel-uek)
     classify_flagged_packages >/dev/null 2>&1
     assert_equals "1" "${#REBOOT_TRIGGER_PACKAGES[@]}" "genuine kernel update reboots"
-    assert_equals "1" "$(read_kernel_reboot_attempts kernel-uek '6.12.0-204.92.4.4.el9uek.aarch64')" \
+    assert_equals "1" "$(read_kernel_reboot_attempts kernel-uek-core '6.12.0-204.92.4.4.el9uek.aarch64')" \
         "attempt recorded"
 }
 
@@ -953,12 +1025,135 @@ test_classify_repeated_checks_in_one_boot_count_once() {
         classify_flagged_packages >/dev/null 2>&1
     done
     assert_equals "1" "${#REBOOT_TRIGGER_PACKAGES[@]}" "the fourth check in one boot still reboots"
-    assert_equals "1" "$(read_kernel_reboot_attempts kernel-uek '6.12.0-204.92.4.4.el9uek.aarch64')" \
+    assert_equals "1" "$(read_kernel_reboot_attempts kernel-uek-core '6.12.0-204.92.4.4.el9uek.aarch64')" \
         "one boot counts one attempt"
     printf 'ffffffff-0000-1111-2222-333333333333\n' > "${BOOT_ID_FILE}"
     classify_flagged_packages >/dev/null 2>&1
-    assert_equals "2" "$(read_kernel_reboot_attempts kernel-uek '6.12.0-204.92.4.4.el9uek.aarch64')" \
+    assert_equals "2" "$(read_kernel_reboot_attempts kernel-uek-core '6.12.0-204.92.4.4.el9uek.aarch64')" \
         "a boot still on the old kernel counts the next attempt"
+}
+
+# stub_genuine_uek_update - a newer UEK installed, the GRUB default on it.
+stub_genuine_uek_update() {
+    export STUB_UNAME_R="6.12.0-204.92.4.3.1.el9uek.aarch64" \
+           STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.3.1.el9uek.aarch64
+6.12.0-204.92.4.4.el9uek.aarch64" \
+           STUB_GRUBBY_DEFAULT="/boot/vmlinuz-6.12.0-204.92.4.4.el9uek.aarch64"
+}
+
+test_classify_kernel_family_is_decided_once() {
+    load_needs_reboot_library
+    stub_genuine_uek_update
+    # Oracle's plugin flags both the meta package and its -core package.
+    FLAGGED_PACKAGE_NAMES=(kernel-uek kernel-uek-core)
+    classify_flagged_packages >/dev/null 2>&1
+    assert_equals "kernel-uek kernel-uek-core" "${REBOOT_TRIGGER_PACKAGES[*]}" "both trigger the one reboot"
+    assert_equals "1" "$(read_kernel_reboot_attempts kernel-uek-core '6.12.0-204.92.4.4.el9uek.aarch64')" \
+        "which counts one attempt, not two"
+}
+
+test_classify_kernel_family_false_positive_drops_both() {
+    load_needs_reboot_library
+    export STUB_UNAME_R="6.12.0-204.92.4.4.el9uek.aarch64" \
+           STUB_RPM_KERNEL_VERSIONS="6.12.0-204.92.4.3.1.el9uek.aarch64
+6.12.0-204.92.4.4.el9uek.aarch64"
+    FLAGGED_PACKAGE_NAMES=(kernel-uek kernel-uek-core)
+    classify_flagged_packages >/dev/null 2>&1
+    assert_equals "0" "${#REBOOT_TRIGGER_PACKAGES[@]}" "the newest kernel runs: a clock-skew flag"
+    assert_equals "0" "${REBOOT_WITHHELD}" "nothing withheld"
+}
+
+test_classify_other_kernel_family_withholds() {
+    load_needs_reboot_library
+    stub_genuine_uek_update
+    # RHCK installed beside UEK, and updated: not the kernel that runs.
+    FLAGGED_PACKAGE_NAMES=(kernel)
+    classify_flagged_packages >/dev/null 2>&1
+    assert_equals "1" "${REBOOT_WITHHELD}" "another family needs an operator"
+    assert_equals "0" "${#REBOOT_TRIGGER_PACKAGES[@]}" "and triggers nothing on its own"
+}
+
+test_classify_unowned_running_kernel_withholds() {
+    load_needs_reboot_library
+    stub_genuine_uek_update
+    export STUB_RPM_KERNEL_OWNER=none
+    FLAGGED_PACKAGE_NAMES=(kernel-uek)
+    classify_flagged_packages >/dev/null 2>&1
+    assert_equals "1" "${REBOOT_WITHHELD}" "no family, no decision"
+}
+
+test_classify_unreadable_releases_withhold() {
+    load_needs_reboot_library
+    export STUB_RPM_KERNEL_VERSIONS=""
+    FLAGGED_PACKAGE_NAMES=(kernel-uek)
+    classify_flagged_packages >/dev/null 2>&1
+    assert_equals "1" "${REBOOT_WITHHELD}" "no target release, no reboot to count against the limit"
+}
+
+test_classify_unreadable_grub_default_proceeds_and_counts() {
+    load_needs_reboot_library
+    stub_genuine_uek_update
+    export STUB_GRUBBY_DEFAULT="/boot"
+    FLAGGED_PACKAGE_NAMES=(kernel-uek)
+    classify_flagged_packages >/dev/null 2>&1
+    assert_equals "kernel-uek" "${REBOOT_TRIGGER_PACKAGES[*]}" "the reboot goes ahead"
+    assert_equals "1" "$(read_kernel_reboot_attempts kernel-uek-core '6.12.0-204.92.4.4.el9uek.aarch64')" \
+        "and the attempt limit still counts it"
+}
+
+test_classify_real_time_family_reaches_the_grub_check() {
+    load_needs_reboot_library
+    export STUB_UNAME_R="5.14.0-503.11.1.el9_5.x86_64+rt" STUB_RPM_KERNEL_OWNER=kernel-rt-core \
+           STUB_RPM_KERNEL_VERSIONS="5.14.0-503.11.1.el9_5.x86_64+rt
+5.14.0-503.14.1.el9_5.x86_64+rt" \
+           STUB_GRUBBY_DEFAULT="/boot/vmlinuz-5.14.0-503.11.1.el9_5.x86_64+rt"
+    FLAGGED_PACKAGE_NAMES=(kernel-rt)
+    classify_flagged_packages >/dev/null 2>&1
+    assert_equals "1" "${REBOOT_WITHHELD}" "a stale default withholds an RT kernel's reboot too"
+}
+
+# decide_with_flags NAME... - main's exit code with needs-restarting
+# flagging NAME...
+decide_with_flags() {
+    local flagged_package_name exit_code=0
+    NEEDS_RESTARTING_STUB_OUTPUT="Core libraries or services have been updated since boot-up:"
+    for flagged_package_name in "$@"; do
+        NEEDS_RESTARTING_STUB_OUTPUT+=$'\n'"  * ${flagged_package_name}"
+    done
+    run_needs_restarting() { NEEDS_RESTARTING_OUTPUT="${NEEDS_RESTARTING_STUB_OUTPUT}"; return 1; }
+    ( main ) > "${TEST_ROOT_DIR}/decision.log" 2>&1 || exit_code=$?
+    printf '%s' "${exit_code}"
+}
+
+test_decision_stale_grub_default_vetoes_every_trigger() {
+    load_needs_reboot_library
+    stub_genuine_uek_update
+    export STUB_GRUBBY_DEFAULT="/boot/vmlinuz-6.12.0-204.92.4.3.1.el9uek.aarch64" STUB_RPM_EVR="2.34-274"
+    assert_equals "2" "$(decide_with_flags kernel-uek glibc)" \
+        "a new glibc does not carry a reboot onto the kernel that already runs"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/decision.log")" "grubby --set-default /boot/vmlinuz-6.12.0-204.92.4.4.el9uek.aarch64" \
+        "the error names the repair"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/decision.log")" "Reboot withheld for every package" "and what it stops"
+}
+
+test_decision_attempt_limit_vetoes_every_trigger() {
+    load_needs_reboot_library
+    stub_genuine_uek_update
+    write_kernel_reboot_attempts kernel-uek-core "6.12.0-204.92.4.4.el9uek.aarch64" 3 old-boot
+    verify_build_id() { return 2; }
+    assert_equals "2" "$(decide_with_flags kernel-uek systemd)" \
+        "a stale systemd does not reboot a host whose kernel never boots"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/decision.log")" "3 consecutive reboots for 6.12.0-204.92.4.4.el9uek.aarch64" \
+        "the limit is the reason"
+}
+
+test_decision_other_kernel_family_vetoes_every_trigger() {
+    load_needs_reboot_library
+    stub_genuine_uek_update
+    export STUB_RPM_EVR="2.34-274"
+    assert_equals "2" "$(decide_with_flags kernel glibc)" "an RHCK update on a UEK host waits for an operator"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/decision.log")" "kernel: not the running kernel's package (kernel-uek-core)" \
+        "the other family is the reason"
 }
 
 test_classify_keeps_package_when_verifier_missing() {
@@ -985,6 +1180,7 @@ stub_needs_restarting() {
     export STUB_CACHE_ONLY_RESULT="$1" STUB_REFRESHED_RESULT="$2"
     timeout() {
         local result="${STUB_REFRESHED_RESULT}" argument
+        while [[ "$1" == --* ]]; do shift; done
         shift
         printf 'dnf %s\n' "${*:2}" >> "${STUB_LOG}"
         for argument in "$@"; do
@@ -1037,7 +1233,6 @@ test_decision_temporary_file_failure_removes_nothing() {
 stub_run_main() {
     check_conflicts() { :; }
     warn_on_unapplied_security_advisories() { :; }
-    warn_on_unread_config_keys() { :; }
     pgrep() { return 1; }
     systemd-inhibit() {
         printf 'systemd-inhibit %s\n' "$*" >> "${STUB_LOG}"
@@ -1183,7 +1378,7 @@ test_services_restart_is_bounded() {
     }
     local output
     output=$(restart_stale_services 2>&1)
-    assert_contains "$(cat "${STUB_LOG}")" "timeout 300s ${TEST_ROOT_DIR}/usr/bin/systemctl try-restart sshd.service" \
+    assert_contains "$(cat "${STUB_LOG}")" "timeout --kill-after=300s 300s ${TEST_ROOT_DIR}/usr/bin/systemctl try-restart sshd.service" \
         "each restart runs under the configured bound"
     assert_contains "${output}" "did not finish within 300s" "an expired restart is reported"
 }
@@ -1198,7 +1393,7 @@ test_reboot_is_scheduled_on_a_named_unit() {
     assert_contains "${dispatch_call}" "OnFailure=dnf-automatic-reboot-notify@dnf-automatic-reboot-scheduled-reboot.service.service" \
         "a reboot that fails to start is reported"
     assert_contains "${dispatch_call}" "--on-active=300" "after the configured delay"
-    assert_contains "${dispatch_call}" "reboot-if-pending.sh 60 1800" \
+    assert_contains "${dispatch_call}" "reboot-if-pending.sh 300 1800" \
         "through the pending check, with the configured lock and inhibitor waits"
     assert_contains "${SCHEDULED_REBOOT_SUMMARY}" "cancel with: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh" \
         "the summary says how to cancel it"
@@ -1300,6 +1495,23 @@ test_conflicts_pass_on_prepared_host() {
     local exit_code=0
     ( check_conflicts ) >/dev/null 2>&1 || exit_code=$?
     assert_exit_code 0 "${exit_code}" "reboot = never and apply_updates = yes pass"
+}
+
+test_services_exclusions_are_additive() {
+    printf 'restart_services_excluded_patterns = postgresql.service, container-*.service\n' \
+        > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    load_run_library
+    local unit_name
+    for unit_name in dbus.service dbus-broker.service systemd-logind.service user@1000.service \
+                     getty@tty1.service serial-getty@ttyS0.service autovt@tty2.service \
+                     dnf-automatic-reboot.service dnf-automatic-watchdog.service \
+                     postgresql.service container-web.service; do
+        is_excluded_unit "${unit_name}" || fail "${unit_name} must not be restarted"
+    done
+    is_excluded_unit sshd.service && fail "sshd.service is not excluded"
+    RESTART_SERVICES_EXCLUDED_PATTERNS=""
+    is_excluded_unit dbus.service || fail "an empty list keeps the built-in exclusions"
+    return 0
 }
 
 test_services_excluded_units_are_not_restarted() {
@@ -1447,12 +1659,6 @@ test_services_template_units_are_excluded_by_glob() {
     return 0
 }
 
-test_wall_messages_trailing_comment_is_not_part_of_the_value() {
-    load_run_library
-    printf 'wall_messages = no  # quiet\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    wall_msg "dnf-automatic-reboot: test message"
-    assert_not_contains "$(cat "${STUB_LOG}")" "wall " "wall_messages = no with a comment disables wall"
-}
 
 test_services_disabled_by_config() {
     load_run_library
@@ -1560,11 +1766,27 @@ test_watchdog_warning_reaches_the_stub_not_the_host() {
         "the child process used the exported wall stub"
 }
 
-test_watchdog_hard_timeout_while_updating_does_not_reboot() {
+# stall_recorded_run PID AGE_MINUTES STALLED_MINUTES: the progress record of
+# the run write_watchdog_state wrote, written through the watchdog library in
+# a subshell, for a test that then runs watchdog.sh as a child process.
+stall_recorded_run() {
+    ( load_watchdog_library; write_stalled_progress_record "$1" "$2" "$3" ) >/dev/null 2>&1
+}
+
+# write_stalled_progress_record PID AGE_MINUTES STALLED_MINUTES: the progress
+# record of the run write_watchdog_state wrote, with its current signature
+# last changed STALLED_MINUTES ago.  Needs the watchdog library.
+write_stalled_progress_record() {
+    printf 'run=%s %s\nsignature=%s\nchanged_uptime=%s\n' \
+        "$1" "$(( TEST_UPTIME_SECONDS - $2 * 60 ))" "$(read_dnf_progress_signature)" \
+        "$(( TEST_UPTIME_SECONDS - $3 * 60 ))" > "${PROGRESS_FILE}"
+}
+
+test_watchdog_stalled_update_does_not_reboot() {
     sleep 60 &
     local background_pid=$!
     write_watchdog_state updating 400 "${background_pid}"
-    stall_recorded_run "${background_pid}"
+    stall_recorded_run "${background_pid}" 400 190
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
     local recorded_calls
@@ -1574,33 +1796,16 @@ test_watchdog_hard_timeout_while_updating_does_not_reboot() {
         "a half-applied rpm transaction must not be rebooted into"
 }
 
-test_watchdog_hard_timeout_while_updating_cannot_be_forced() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    # An edited configuration may still carry the setting; nothing reads it.
-    printf '\nforce_reboot_on_hard_timeout = yes\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    load_watchdog_library
-    write_watchdog_state updating 400 "${background_pid}"
-    write_stalled_progress_record "${background_pid}" 400 190
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "the stalled run is stopped"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "a possibly half-applied transaction is never rebooted into"
-    assert_contains "$(cat "${LOG_FILE}")" "NOT rebooting. Check: dnf history info last; dnf check" "the log names the check instead"
-}
-
-test_watchdog_hard_timeout_while_checking_reboots() {
+test_watchdog_stalled_reboot_check_does_not_reboot() {
     sleep 60 &
     local background_pid=$!
-    # phase=checking means dnf-automatic already returned cleanly.
     write_watchdog_state checking 400 "${background_pid}"
+    stall_recorded_run "${background_pid}" 400 65
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
-    local recorded_calls
-    recorded_calls=$(cat "${STUB_LOG}")
-    assert_contains "${recorded_calls}" "kill --kill-whom=all" "whole cgroup is killed"
-    assert_contains "${recorded_calls}" "reboot-if-pending.sh 60 1800" "safe to reboot after a clean dnf"
+    assert_contains "$(cat "${STUB_LOG}")" "kill --kill-whom=all" "the stuck run is killed"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run" "the next run decides the reboot"
+    assert_not_contains "$(cat "${STUB_LOG}")" "systemctl reboot" "the watchdog never reboots"
 }
 
 test_watchdog_kill_option_follows_systemd_version() {
@@ -1612,12 +1817,12 @@ test_watchdog_kill_option_follows_systemd_version() {
         "an unreadable version takes the spelling every surveyed version accepts"
 }
 
-test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who() {
+test_watchdog_stall_on_systemd_239_kills_with_kill_who() {
     export STUB_SYSTEMD_VERSION=239
     sleep 60 &
     local background_pid=$!
     write_watchdog_state updating 400 "${background_pid}"
-    stall_recorded_run "${background_pid}"
+    stall_recorded_run "${background_pid}" 400 190
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     kill "${background_pid}" 2>/dev/null
     assert_contains "$(cat "${STUB_LOG}")" "kill --kill-who=all" "EL8 spelling used on systemd 239"
@@ -1627,49 +1832,25 @@ test_watchdog_reused_pid_is_not_the_run() {
     sleep 60 &
     local background_pid=$!
     # The run died and its PID now belongs to an unrelated process; systemd
-    # reports the unit inactive (MainPID 0).  Past the hard timeout the
-    # watchdog must not kill that process or reboot.
+    # reports the unit inactive (MainPID 0).  However long it looks stalled,
+    # the watchdog must not kill that process.
     export STUB_MAIN_PID=0
     write_watchdog_state checking 400 "${background_pid}"
+    stall_recorded_run "${background_pid}" 400 190
     bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
     local process_survived=no
     kill -0 "${background_pid}" 2>/dev/null && process_survived=yes
     kill "${background_pid}" 2>/dev/null
     assert_equals "yes" "${process_survived}" "the unrelated process is left running"
-    assert_not_contains "$(cat "${STUB_LOG}")" "systemctl reboot" "no reboot for a run that is gone"
-    assert_not_contains "$(cat "${STUB_LOG}")" "systemd-run" "no scheduled reboot for a run that is gone"
     assert_not_contains "$(cat "${STUB_LOG}")" "systemctl kill" "no cgroup kill for a run that is gone"
 }
 
-test_watchdog_hung_reboot_check_is_undecidable() {
-    load_watchdog_library
-    # The check the watchdog runs when the main run is stuck in phase=checking
-    # can hang the same way; it must end, or no later cycle reaches the hard
-    # timeout.
-    timeout() { printf 'timeout %s\n' "$*" >> "${STUB_LOG}"; return 124; }
-    run_independent_reboot_check >/dev/null 2>&1
-    assert_exit_code 2 "$?" "a check that did not finish is undecidable, never a reboot"
-    assert_contains "$(cat "${STUB_LOG}")" "360s ${TEST_ROOT_DIR}/usr/libexec/dnf-automatic-reboot/needs-reboot.sh" \
-        "bounded at three needs-restarting timeouts"
-}
-
-# stub_watchdog_host: stubs what the sourced watchdog would reach on the host.
-# MainPID comes from STUB_MAIN_PID, which write_watchdog_state sets.
-stub_watchdog_host() {
-    pgrep() { return 1; }
-    ss() { :; }
-    unit_main_pid() { printf '%s' "${STUB_MAIN_PID:-}"; }
-    kill_service_cgroup() { printf 'kill_service_cgroup\n' >> "${STUB_LOG}"; }
-    schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
-}
-
-# stub_watchdog_kill_path: like stub_watchdog_host, but keeps the real
-# kill_service_cgroup.  The cgroup kill succeeds unless STUB_KILL_FAILS=yes,
-# and records whether the recovery file existed; systemd reports the unit
-# STUB_ACTIVE_STATE, failed by default.
+# stub_watchdog_kill_path: stubs what the sourced watchdog would reach on the
+# host, keeping the real kill_service_cgroup.  MainPID comes from
+# STUB_MAIN_PID, which write_watchdog_state sets.  The cgroup kill succeeds
+# unless STUB_KILL_FAILS=yes, and records whether the recovery file existed;
+# systemd reports the unit STUB_ACTIVE_STATE, failed by default.
 stub_watchdog_kill_path() {
-    pgrep() { return 1; }
-    ss() { :; }
     unit_main_pid() { printf '%s' "${STUB_MAIN_PID:-}"; }
     unit_active_state() { printf '%s' "${STUB_ACTIVE_STATE:-failed}"; }
     signal_unit_processes() {
@@ -1678,170 +1859,29 @@ stub_watchdog_kill_path() {
         [[ "${STUB_KILL_FAILS:-}" == "yes" ]] && return 1
         return 0
     }
-    submit_reboot() {
-        printf 'submit_reboot delay=%s recovery_file=%s state_file=%s reboot_pending_file=%s\n' \
-            "$1" "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${STATE_FILE}")" \
-            "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
-    }
-    schedule_reboot() {
-        printf 'schedule_reboot recovery_file=%s reboot_pending_file=%s\n' \
-            "$(file_presence "${RECOVERY_FILE}")" "$(file_presence "${REBOOT_PENDING_FILE}")" >> "${STUB_LOG}"
-        [[ "${STUB_SCHEDULE_FAILS:-}" == "yes" ]] && return 1
-        [[ "${STUB_SCHEDULE_UNKNOWN:-}" == "yes" ]] && return 2
-        [[ "${STUB_SCHEDULE_INTERRUPTED:-}" == "yes" ]] && kill -TERM "${BASHPID}"
-        return 0
-    }
     read_scheduled_reboot_status() { printf '%s' "${STUB_SCHEDULED_REBOOT_STATUS:-none}"; }
 }
 
-# file_presence PATH -> present or absent
-file_presence() {
-    if [[ -e "$1" ]]; then printf present; else printf absent; fi
-}
-
-test_watchdog_failed_kill_keeps_supervision() {
+# run_stalled_watchdog PHASE AGE_MINUTES STALLED_MINUTES [DNF_LOG_MESSAGE...]
+# One sourced watchdog cycle over a live run in PHASE whose processes changed
+# nothing for STALLED_MINUTES; the messages go to the run's part of dnf.log.
+# Sets WATCHDOG_EXIT_CODE.
+run_stalled_watchdog() {
+    local run_phase="$1" age_minutes="$2" stalled_minutes="$3"
+    shift 3
     sleep 60 &
-    local background_pid=$! exit_code=0
+    local background_pid=$!
     load_watchdog_library
-    write_watchdog_state checking 400 "${background_pid}"
+    write_watchdog_state "${run_phase}" "${age_minutes}" "${background_pid}"
+    if [[ "$#" -gt 0 ]]; then
+        start_run_dnf_log
+        append_dnf_log_messages "$@"
+    fi
+    write_stalled_progress_record "${background_pid}" "${age_minutes}" "${stalled_minutes}"
     stub_watchdog_kill_path
-    export STUB_KILL_FAILS=yes
-    ( main ) >/dev/null 2>&1 || exit_code=$?
+    WATCHDOG_EXIT_CODE=0
+    ( main ) >/dev/null 2>&1 || WATCHDOG_EXIT_CODE=$?
     kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "a failed kill fails the watchdog"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "no reboot over a run that may still be updating"
-    [[ -f "${STATE_FILE}" ]] || fail "the state file must survive a failed kill"
-    [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery file must be removed"
-    return 0
-}
-
-test_watchdog_unconfirmed_kill_signals_no_pid() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state checking 400 "${background_pid}"
-    stub_watchdog_kill_path
-    export STUB_ACTIVE_STATE=activating
-    KILL_CONFIRM_SEC=1
-    # The unit is still active after the kill.  Its recorded PID number may
-    # belong to another process by now, so it is never signalled on its own.
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    local process_survived=no
-    kill -0 "${background_pid}" 2>/dev/null && process_survived=yes
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "an unconfirmed kill fails the watchdog"
-    assert_equals "yes" "${process_survived}" "the PID is not signalled directly"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "and nothing is rebooted"
-    [[ -f "${STATE_FILE}" ]] || fail "the state file must survive an unconfirmed kill"
-    return 0
-}
-
-test_watchdog_no_run_starts_during_the_kill() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state checking 400 "${background_pid}"
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 0 "${exit_code}" "a confirmed kill at the hard timeout succeeds"
-    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes recovery_file=present" \
-        "the main unit is blocked from starting while its run is killed"
-    # A run starting after the kill would have its state file removed and
-    # be rebooted under; the marker must outlast the reboot request.
-    assert_contains "$(cat "${STUB_LOG}")" "submit_reboot delay=0 recovery_file=present state_file=absent reboot_pending_file=present" \
-        "no run can start between the state cleanup and the reboot"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the reboot-pending marker must stay until the reboot"
-    [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery marker ends with recovery"
-    return 0
-}
-
-test_state_is_published_by_rename() {
-    load_run_library
-    START_TIMESTAMP=100 START_UPTIME_SECONDS=50
-    write_state updating || fail "first write"
-    local first_inode
-    first_inode=$(stat -c '%i' "${STATE_FILE}")
-    write_state checking || fail "second write"
-    assert_contains "$(cat "${STATE_FILE}")" "phase=checking" "the new content is published"
-    [[ "$(stat -c '%i' "${STATE_FILE}")" != "${first_inode}" ]] \
-        || fail "rewritten in place: a reader could see it empty"
-    compgen -G "${STATE_FILE}.??????" >/dev/null && fail "a temporary file was left behind"
-    assert_equals "600" "$(stat -c '%a' "${STATE_FILE_LOCK}")" "the state lock is owner-only"
-}
-
-test_state_removal_keeps_a_changed_file() {
-    load_watchdog_library
-    printf 'phase=updating\nstart=1\nstart_uptime=1\npid=4194304\n' > "${STATE_FILE}"
-    local inspected_snapshot
-    inspected_snapshot=$(read_run_state)
-    # A new run publishes its state between the read and the removal.
-    printf 'phase=updating\nstart=2\nstart_uptime=2\npid=%s\n' "$$" > "${STATE_FILE}"
-    local removal_result=0
-    remove_run_state_if_unchanged "${inspected_snapshot}" || removal_result=$?
-    assert_exit_code 1 "${removal_result}" "the inspected run is gone"
-    assert_contains "$(cat "${STATE_FILE}")" "pid=$$" "the new run's state is kept"
-    remove_run_state_if_unchanged "$(read_run_state)" || fail "an unchanged file is removed"
-    [[ -f "${STATE_FILE}" ]] && fail "removed"
-    return 0
-}
-
-test_watchdog_dead_run_cleanup_keeps_a_successor() {
-    load_watchdog_library
-    write_watchdog_state updating 400 4194304
-    export SUCCESSOR_PID=$$
-    # While the watchdog inspects the dead run, its successor starts.
-    recorded_pid_identity() {
-        printf 'phase=updating\nstart=9\nstart_uptime=9\npid=%s\n' "${SUCCESSOR_PID}" > "${STATE_FILE}"
-        : > "${LOCK_FILE}"
-        return 1
-    }
-    ( main ) >/dev/null 2>&1
-    assert_contains "$(cat "${STATE_FILE}" 2>/dev/null)" "pid=${SUCCESSOR_PID}" \
-        "the successor stays supervised"
-    [[ -f "${LOCK_FILE}" ]] || fail "the successor's lock file is kept"
-    return 0
-}
-
-test_run_cleanup_keeps_another_runs_state() {
-    load_run_library
-    PUBLISHED_RUN_STATE=$'phase=checking\nstart=1\nstart_uptime=1\npid=111'
-    printf 'phase=updating\nstart=2\nstart_uptime=2\npid=222\n' > "${STATE_FILE}"
-    ( cleanup ) >/dev/null 2>&1
-    assert_contains "$(cat "${STATE_FILE}" 2>/dev/null)" "pid=222" "only this run's state is removed"
-}
-
-test_watchdog_scheduled_reboot_keeps_runs_blocked() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state checking 70 "${background_pid}"
-    stub_watchdog_kill_path
-    run_independent_reboot_check() { return 1; }
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 0 "${exit_code}" "the reboot is scheduled"
-    assert_contains "$(cat "${STUB_LOG}")" "schedule_reboot recovery_file=present reboot_pending_file=present" \
-        "blocked through the decision, and marked pending before the request"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "no update may start before the scheduled reboot"
-    [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery marker ends with recovery"
-    return 0
-}
-
-# stall_recorded_run PID: dnf has changed nothing for 190 minutes in the
-# 400-minute-old run write_watchdog_state wrote, past both stall windows, so
-# the watchdog run as a child process kills it at the hard timeout.
-stall_recorded_run() {
-    ( load_watchdog_library; write_stalled_progress_record "$1" 400 190 ) >/dev/null 2>&1
-}
-
-# write_stalled_progress_record PID AGE_MINUTES STALLED_MINUTES: the progress
-# record of the run write_watchdog_state wrote, with dnf's current signature
-# last changed STALLED_MINUTES ago.  Needs the watchdog library.
-write_stalled_progress_record() {
-    printf 'run=%s %s\nsignature=%s\nchanged_uptime=%s\nannounced=%s\n' \
-        "$1" "$(( TEST_UPTIME_SECONDS - $2 * 60 ))" "$(dnf_progress_signature)" \
-        "$(( TEST_UPTIME_SECONDS - $3 * 60 ))" "${4:-no}" > "${PROGRESS_FILE}"
 }
 
 # append_dnf_log_messages MESSAGE... - lines as dnf 4 writes them to dnf.log.
@@ -1861,11 +1901,11 @@ start_run_dnf_log() {
         >> "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state"
 }
 
-# recorded_dnf_run_phase -> dnf_run_phase for the position in the state file.
+# recorded_dnf_run_phase -> read_dnf_run_phase for the position in the state file.
 recorded_dnf_run_phase() {
     local state_snapshot
     state_snapshot=$(cat "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.state")
-    dnf_run_phase "$(run_state_field "${state_snapshot}" dnf_log_inode)" \
+    read_dnf_run_phase "$(run_state_field "${state_snapshot}" dnf_log_inode)" \
                   "$(run_state_field "${state_snapshot}" dnf_log_offset)"
 }
 
@@ -1926,108 +1966,84 @@ test_watchdog_dnf_phase_follows_one_rotation() {
 test_watchdog_dnf_phase_without_a_position_is_unknown() {
     load_watchdog_library
     append_dnf_log_messages "--- logging initialized ---"
-    assert_equals "unknown" "$(dnf_run_phase "" "")" "no position recorded"
-    assert_equals "unknown" "$(dnf_run_phase none 0)" "no dnf.log when the run started"
-    assert_equals "unknown" "$(dnf_run_phase "$(stat -c %i "${TEST_ROOT_DIR}/var/log/dnf.log")" 999999)" \
+    assert_equals "unknown" "$(read_dnf_run_phase "" "")" "no position recorded"
+    assert_equals "unknown" "$(read_dnf_run_phase none 0)" "no dnf.log when the run started"
+    assert_equals "unknown" "$(read_dnf_run_phase "$(stat -c %i "${TEST_ROOT_DIR}/var/log/dnf.log")" 999999)" \
         "a log shorter than the position was replaced"
 }
 
-test_watchdog_stall_before_the_transaction_is_stopped_early() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    # 70 minutes old, far from the hard timeout, downloading, no change for 65.
-    write_watchdog_state updating 70 "${background_pid}"
-    start_run_dnf_log
-    append_dnf_log_messages "--- logging initialized ---"
-    write_stalled_progress_record "${background_pid}" 70 65
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 0 "${exit_code}" "a confirmed stall is recovered"
-    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "killed before the hard timeout"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "nothing was installed: no reboot"
-    assert_contains "$(cat "${LOG_FILE}")" "has not started its rpm transaction (dnf phase: download)" "the log says why"
+test_watchdog_stall_before_the_transaction_is_stopped() {
+    run_stalled_watchdog updating 70 65 "--- logging initialized ---"
+    assert_exit_code 0 "${WATCHDOG_EXIT_CODE}" "a confirmed stall is recovered"
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "60 minutes without progress"
+    assert_contains "$(cat "${LOG_FILE}")" "before installing anything (dnf phase: download)" "the log says why"
     assert_contains "$(cat "${STUB_LOG}")" "Nothing was installed; the next run tries again." "users are told"
     [[ -f "${STATE_FILE}" ]] && fail "the killed run's state is removed"
     return 0
 }
 
-test_watchdog_stall_after_the_transaction_check_is_stopped_early() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state updating 70 "${background_pid}"
-    start_run_dnf_log
-    append_dnf_log_messages "--- logging initialized ---" "Running transaction check" "Transaction check succeeded."
-    write_stalled_progress_record "${background_pid}" 70 65
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "rpm only checked: still safe to stop"
+test_watchdog_stall_after_the_transaction_check_is_stopped() {
+    run_stalled_watchdog updating 70 65 "--- logging initialized ---" "Running transaction check" "Transaction check succeeded."
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "rpm only checked: nothing installed"
 }
 
 test_watchdog_short_stall_before_the_transaction_is_left_running() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state updating 70 "${background_pid}"
-    start_run_dnf_log
-    append_dnf_log_messages "--- logging initialized ---"
-    write_stalled_progress_record "${background_pid}" 70 30
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
+    run_stalled_watchdog updating 70 30 "--- logging initialized ---"
     assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "30 minutes is within the window"
 }
 
-test_watchdog_stall_in_the_transaction_waits_for_the_hard_timeout() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    # rpm's transaction has started and nothing changed for 65 minutes, but
-    # the run is 70 minutes old: a silent scriptlet is left alone.
-    write_watchdog_state updating 70 "${background_pid}"
-    start_run_dnf_log
-    append_dnf_log_messages "--- logging initialized ---" "Running transaction"
-    write_stalled_progress_record "${background_pid}" 70 65
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "never stopped early mid-transaction"
+test_watchdog_transaction_gets_the_longer_window() {
+    run_stalled_watchdog updating 400 70 "--- logging initialized ---" "Running transaction"
+    assert_exit_code 0 "${WATCHDOG_EXIT_CODE}" "a silent scriptlet is no failure"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "70 minutes is within the transaction's window"
+    assert_contains "$(cat "${LOG_FILE}")" "unchanged for 70min of 180min), dnf phase: transaction" "the log names the window"
 }
 
-test_watchdog_unknown_phase_is_not_stopped_early() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
+test_watchdog_stalled_transaction_is_stopped_at_any_age() {
+    # No age floor: 190 minutes without progress, in a run 200 minutes old.
+    run_stalled_watchdog updating 200 190 "--- logging initialized ---" "Running transaction"
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "stopped once the window passes"
+    assert_contains "$(cat "${LOG_FILE}")" "an rpm transaction may be incomplete, not rebooting. Check: dnf history info last; dnf check" \
+        "the log names what to inspect"
+    assert_contains "$(cat "${STUB_LOG}")" "Check: dnf history info last; dnf check" "so do users"
+}
+
+test_watchdog_unknown_phase_gets_the_longer_window() {
     # No recorded position: the transaction may have started.
-    write_watchdog_state updating 70 "${background_pid}"
-    write_stalled_progress_record "${background_pid}" 70 65
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
+    run_stalled_watchdog updating 70 65
     assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "unknown is handled as a transaction"
 }
 
-test_watchdog_transaction_gets_the_longer_window() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state updating 400 "${background_pid}"
-    start_run_dnf_log
-    append_dnf_log_messages "--- logging initialized ---" "Running transaction"
-    write_stalled_progress_record "${background_pid}" 400 70
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 0 "${exit_code}" "a silent scriptlet is no failure"
-    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "70 minutes is within the transaction's window"
-    assert_contains "$(cat "${LOG_FILE}")" "(dnf phase: transaction); its processes last read or wrote 70min ago - left running until they stop for 180min" \
-        "the log names the window that applies"
-    assert_contains "$(cat "${STUB_LOG}")" "It is stopped only once its processes read and write nothing for 180min." "and so do users"
+test_watchdog_stalled_reboot_check_is_stopped() {
+    : > "${TEST_ROOT_DIR}/stub.log"
+    run_stalled_watchdog checking 400 65
+    assert_exit_code 0 "${WATCHDOG_EXIT_CODE}" "a confirmed stall is recovered"
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "60 minutes without progress in the reboot check"
+    assert_contains "$(cat "${LOG_FILE}")" "the next run decides whether to reboot" "the log says what follows"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "the watchdog requests no reboot"
+    [[ -f "${STATE_FILE}" ]] && fail "the killed run's state is removed"
+    return 0
 }
 
+test_watchdog_short_stall_in_the_reboot_check_is_left_running() {
+    run_stalled_watchdog checking 400 30
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "30 minutes is within the window"
+}
+
+test_watchdog_progressing_run_is_left_running_at_any_age() {
+    local run_phase
+    for run_phase in updating checking; do
+        (
+            : > "${STUB_LOG}"
+            # 25 hours old, its processes read or wrote 10 minutes ago.
+            run_stalled_watchdog "${run_phase}" 1500 10 "--- logging initialized ---"
+            assert_exit_code 0 "${WATCHDOG_EXIT_CODE}" "${run_phase}: a working run is no failure"
+            assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "${run_phase}: never stopped for its age"
+            [[ -f "${STATE_FILE}" ]] || fail "${run_phase}: the run stays supervised"
+        ) || fail "${run_phase} must be left running"
+    done
+    return 0
+}
 
 test_watchdog_progress_counts_only_the_runs_processes() {
     load_watchdog_library
@@ -2035,24 +2051,24 @@ test_watchdog_progress_counts_only_the_runs_processes() {
     write_process_io 101 500 0
     write_process_io 102 1000 2000
     local before_download after_other_dnf after_download
-    before_download=$(dnf_progress_signature)
+    before_download=$(read_dnf_progress_signature)
     assert_equals "processes=2 read=1500 written=2000" "${before_download}" "summed over the cgroup"
     # dnf-makecache.timer, or a dnf run by hand, writes to dnf's cache and logs.
     mkdir -p "${TEST_ROOT_DIR}/var/cache/dnf/baseos"
     printf 'metadata' > "${TEST_ROOT_DIR}/var/cache/dnf/baseos/repomd.xml"
     append_dnf_log_messages "--- logging initialized ---" "Metadata cache created."
-    after_other_dnf=$(dnf_progress_signature)
+    after_other_dnf=$(read_dnf_progress_signature)
     assert_equals "${before_download}" "${after_other_dnf}" "another dnf command is not this run's progress"
     # librepo writes the next chunk of a package to its file.
     write_process_io 102 1000 6096
-    after_download=$(dnf_progress_signature)
+    after_download=$(read_dnf_progress_signature)
     [[ "${after_download}" != "${after_other_dnf}" ]] || fail "bytes the run writes are progress"
     # A scriptlet that exited, its counters gone with it.
     write_run_cgroup 101
-    [[ "$(dnf_progress_signature)" != "${after_download}" ]] || fail "a process exiting is progress"
+    [[ "$(read_dnf_progress_signature)" != "${after_download}" ]] || fail "a process exiting is progress"
     # A process listed but already gone from /proc is left out.
     write_run_cgroup 101 103
-    assert_equals "processes=1 read=500 written=0" "$(dnf_progress_signature)" "only readable counters count"
+    assert_equals "processes=1 read=500 written=0" "$(read_dnf_progress_signature)" "only readable counters count"
 }
 
 test_watchdog_progress_finds_the_cgroup_v1_hierarchy() {
@@ -2061,22 +2077,22 @@ test_watchdog_progress_finds_the_cgroup_v1_hierarchy() {
     mkdir -p "${TEST_ROOT_DIR}/sys/fs/cgroup/systemd/system.slice/dnf-automatic-reboot.service"
     printf '201\n' > "${TEST_ROOT_DIR}/sys/fs/cgroup/systemd/system.slice/dnf-automatic-reboot.service/cgroup.procs"
     write_process_io 201 10 20
-    assert_equals "processes=1 read=10 written=20" "$(dnf_progress_signature)" "the v1 cgroup is read"
+    assert_equals "processes=1 read=10 written=20" "$(read_dnf_progress_signature)" "the v1 cgroup is read"
 }
 
 test_watchdog_unreadable_progress_is_no_signature() {
     load_watchdog_library
     local exit_code=0
-    dnf_progress_signature >/dev/null 2>&1 || exit_code=$?
+    read_dnf_progress_signature >/dev/null 2>&1 || exit_code=$?
     assert_exit_code 1 "${exit_code}" "no cgroup in the tree"
     write_run_cgroup 101
     exit_code=0
-    dnf_progress_signature >/dev/null 2>&1 || exit_code=$?
+    read_dnf_progress_signature >/dev/null 2>&1 || exit_code=$?
     assert_exit_code 1 "${exit_code}" "a process whose counters cannot be read"
     export STUB_CONTROL_GROUP=""
     write_process_io 101 1 1
     exit_code=0
-    dnf_progress_signature >/dev/null 2>&1 || exit_code=$?
+    read_dnf_progress_signature >/dev/null 2>&1 || exit_code=$?
     assert_exit_code 1 "${exit_code}" "systemctl does not name the cgroup"
 }
 
@@ -2096,43 +2112,7 @@ test_watchdog_other_dnf_commands_do_not_hold_a_stalled_run() {
     assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "the hung run is stopped"
 }
 
-test_watchdog_progressing_update_is_left_running() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state updating 400 "${background_pid}"
-    write_stalled_progress_record "${background_pid}" 400 10
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 0 "${exit_code}" "a working dnf is no failure"
-    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "past the hard timeout, dnf changed something 10 minutes ago"
-    assert_equals "1" "$(grep -c 'the update has run past 320min' "${STUB_LOG}")" "logged-in users are told once"
-    assert_contains "$(cat "${LOG_FILE}")" "left running until they stop for 180min" "the log says why"
-    [[ -f "${STATE_FILE}" ]] || fail "the run stays supervised"
-    return 0
-}
-
-test_watchdog_stalled_update_is_stopped() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state updating 400 "${background_pid}"
-    write_stalled_progress_record "${background_pid}" 400 190
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 0 "${exit_code}" "a confirmed stall is recovered"
-    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "nothing changed for 190 minutes: killed"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "and, still updating, not rebooted"
-    assert_contains "$(cat "${LOG_FILE}")" "the run's processes read and wrote nothing for 190min (dnf phase: unknown)" \
-        "the log says why"
-    assert_contains "$(cat "${LOG_FILE}")" "Check: dnf history info last; dnf check" "and what to inspect"
-    assert_contains "$(cat "${STUB_LOG}")" "Check: dnf history info last; dnf check" "so do users"
-}
-
-test_watchdog_dnf_activity_restarts_the_stall_window() {
+test_watchdog_activity_restarts_the_stall_window() {
     sleep 60 &
     local background_pid=$! exit_code=0
     load_watchdog_library
@@ -2149,32 +2129,27 @@ test_watchdog_dnf_activity_restarts_the_stall_window() {
 }
 
 test_watchdog_records_progress_of_each_run_from_its_first_cycle() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    # A record left by an earlier run that stalled long ago.
-    printf 'run=4194304 1\nsignature=old\nchanged_uptime=1\nannounced=yes\n' > "${PROGRESS_FILE}"
-    write_watchdog_state updating 400 "${background_pid}"
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "another run's stall says nothing about this one"
-    assert_contains "$(cat "${PROGRESS_FILE}")" "run=${background_pid} $(( TEST_UPTIME_SECONDS - 400 * 60 ))" \
-        "the record now belongs to this run"
-    assert_contains "$(cat "${PROGRESS_FILE}")" "changed_uptime=${TEST_UPTIME_SECONDS}" "first sight counts as progress"
-    assert_equals "1" "$(grep -c 'the update has run past' "${STUB_LOG}")" "and this run is announced"
-}
-
-test_watchdog_records_progress_before_the_hard_timeout() {
-    sleep 60 &
-    local background_pid=$!
-    load_watchdog_library
-    write_watchdog_state updating 70 "${background_pid}"
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1
-    kill "${background_pid}" 2>/dev/null
-    assert_contains "$(cat "${PROGRESS_FILE}" 2>/dev/null)" "run=${background_pid} " \
-        "the history exists when the hard timeout comes"
+    local run_phase
+    for run_phase in updating checking; do
+        (
+            sleep 60 &
+            local background_pid=$!
+            load_watchdog_library
+            # A record left by an earlier run that stalled long ago.
+            printf 'run=4194304 1\nsignature=old\nchanged_uptime=1\n' > "${PROGRESS_FILE}"
+            write_watchdog_state "${run_phase}" 400 "${background_pid}"
+            stub_watchdog_kill_path
+            ( main ) >/dev/null 2>&1
+            kill "${background_pid}" 2>/dev/null
+            assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" \
+                "${run_phase}: another run's stall says nothing about this one"
+            assert_contains "$(cat "${PROGRESS_FILE}")" "run=${background_pid} $(( TEST_UPTIME_SECONDS - 400 * 60 ))" \
+                "${run_phase}: the record now belongs to this run"
+            assert_contains "$(cat "${PROGRESS_FILE}")" "changed_uptime=${TEST_UPTIME_SECONDS}" \
+                "${run_phase}: first sight counts as progress"
+        ) || fail "${run_phase} must be recorded"
+    done
+    return 0
 }
 
 test_watchdog_unrecordable_progress_stops_nothing() {
@@ -2189,7 +2164,7 @@ test_watchdog_unrecordable_progress_stops_nothing() {
     kill "${background_pid}" 2>/dev/null
     assert_exit_code 1 "${exit_code}" "the watchdog fails, so OnFailure= reports it"
     assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "a stall that cannot be confirmed kills nothing"
-    assert_contains "$(cat "${LOG_FILE}")" "its progress cannot be recorded (${PROGRESS_FILE} cannot be written)" "and says why"
+    assert_contains "$(cat "${LOG_FILE}")" "${PROGRESS_FILE} cannot be written - a stall cannot be told from progress" "and says why"
 }
 
 test_watchdog_unreadable_counters_stop_nothing() {
@@ -2207,59 +2182,110 @@ test_watchdog_unreadable_counters_stop_nothing() {
     assert_contains "$(cat "${LOG_FILE}")" "the I/O counters of dnf-automatic-reboot.service's processes cannot be read" "and says why"
 }
 
-test_watchdog_stall_windows_cannot_be_turned_off() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    # A window of 0 would kill at the hard timeout whatever dnf is doing.
-    printf '\nwatchdog_stall_min = 0\nwatchdog_transaction_stall_min = 0\n' \
-        >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    local load_output
-    load_output=$(load_watchdog_library 2>&1)
-    load_watchdog_library 2>/dev/null
-    assert_equals "60" "${STALL_MIN}" "watchdog_stall_min keeps its default"
-    assert_equals "180" "${TRANSACTION_STALL_MIN}" "watchdog_transaction_stall_min keeps its default"
-    assert_contains "${load_output}" "watchdog_stall_min=0 is outside 1..999999999 - using default 60" "and says so"
-    assert_contains "${load_output}" "watchdog_transaction_stall_min=0 is outside 1..999999999 - using default 180" "for both"
-    # A transaction past the hard timeout that changed something 10 minutes ago.
-    write_watchdog_state updating 400 "${background_pid}"
-    start_run_dnf_log
-    append_dnf_log_messages "--- logging initialized ---" "Running transaction"
-    write_stalled_progress_record "${background_pid}" 400 10
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "a working transaction is never killed"
+# file_presence PATH -> present or absent
+file_presence() {
+    if [[ -e "$1" ]]; then printf present; else printf absent; fi
 }
 
-test_watchdog_recovery_without_reboot_allows_runs_again() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    # phase=updating at the hard timeout, dnf stalled: killed, not rebooted.
-    write_watchdog_state updating 400 "${background_pid}"
-    write_stalled_progress_record "${background_pid}" 400 190
-    stub_watchdog_kill_path
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 0 "${exit_code}" "recovery completes"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "no reboot while updating"
-    [[ -f "${RECOVERY_FILE}" ]] && fail "with no reboot pending the next run must be allowed"
+test_watchdog_failed_kill_keeps_supervision() {
+    export STUB_KILL_FAILS=yes
+    run_stalled_watchdog checking 400 65
+    assert_exit_code 1 "${WATCHDOG_EXIT_CODE}" "a failed kill fails the watchdog"
+    [[ -f "${STATE_FILE}" ]] || fail "the state file must survive a failed kill"
+    [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery file must be removed"
     return 0
 }
 
-test_watchdog_failed_schedule_allows_runs_again() {
+test_watchdog_unconfirmed_kill_signals_no_pid() {
     sleep 60 &
     local background_pid=$! exit_code=0
     load_watchdog_library
-    write_watchdog_state checking 70 "${background_pid}"
+    write_watchdog_state checking 400 "${background_pid}"
+    write_stalled_progress_record "${background_pid}" 400 65
     stub_watchdog_kill_path
-    export STUB_SCHEDULE_FAILS=yes
-    run_independent_reboot_check() { return 1; }
+    export STUB_ACTIVE_STATE=activating
+    KILL_CONFIRMATION_TIMEOUT_SECONDS=1
+    # The unit is still active after the kill.  Its recorded PID number may
+    # belong to another process by now, so it is never signalled on its own.
     ( main ) >/dev/null 2>&1 || exit_code=$?
+    local process_survived=no
+    kill -0 "${background_pid}" 2>/dev/null && process_survived=yes
     kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "the failed dispatch fails the watchdog"
-    [[ -f "${RECOVERY_FILE}" ]] && fail "no reboot is pending, so runs must be allowed again"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "a request that definitely failed removes its own marker"
+    assert_exit_code 1 "${exit_code}" "an unconfirmed kill fails the watchdog"
+    assert_equals "yes" "${process_survived}" "the PID is not signalled directly"
+    [[ -f "${STATE_FILE}" ]] || fail "the state file must survive an unconfirmed kill"
+    return 0
+}
+
+test_watchdog_no_run_starts_during_the_kill() {
+    run_stalled_watchdog checking 400 65
+    assert_exit_code 0 "${WATCHDOG_EXIT_CODE}" "a confirmed kill succeeds"
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes recovery_file=present" \
+        "the main unit is blocked from starting while its run is killed"
+    [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery marker ends with recovery"
+    return 0
+}
+
+test_state_is_published_by_rename() {
+    load_run_library
+    START_TIMESTAMP=100 START_UPTIME_SECONDS=50
+    publish_run_phase updating || fail "first write"
+    local first_inode
+    first_inode=$(stat -c '%i' "${STATE_FILE}")
+    publish_run_phase checking || fail "second write"
+    assert_contains "$(cat "${STATE_FILE}")" "phase=checking" "the new content is published"
+    [[ "$(stat -c '%i' "${STATE_FILE}")" != "${first_inode}" ]] \
+        || fail "rewritten in place: a reader could see it empty"
+    compgen -G "${STATE_FILE}.??????" >/dev/null && fail "a temporary file was left behind"
+    assert_equals "600" "$(stat -c '%a' "${STATE_FILE_LOCK}")" "the state lock is owner-only"
+}
+
+test_state_removal_keeps_a_changed_file() {
+    load_watchdog_library
+    printf 'phase=updating\nstart=1\nstart_uptime=1\npid=4194304\n' > "${STATE_FILE}"
+    local inspected_snapshot
+    inspected_snapshot=$(read_run_state)
+    # A new run publishes its state between the read and the removal.
+    printf 'phase=updating\nstart=2\nstart_uptime=2\npid=%s\n' "$$" > "${STATE_FILE}"
+    local removal_result=0
+    remove_run_state_if_unchanged "${inspected_snapshot}" || removal_result=$?
+    assert_exit_code 1 "${removal_result}" "the inspected run is gone"
+    assert_contains "$(cat "${STATE_FILE}")" "pid=$$" "the new run's state is kept"
+    remove_run_state_if_unchanged "$(read_run_state)" || fail "an unchanged file is removed"
+    [[ -f "${STATE_FILE}" ]] && fail "removed"
+    return 0
+}
+
+test_watchdog_dead_run_cleanup_keeps_a_successor() {
+    load_watchdog_library
+    write_watchdog_state updating 400 4194304
+    export SUCCESSOR_PID=$$
+    # While the watchdog inspects the dead run, its successor starts.
+    check_recorded_pid_identity() {
+        printf 'phase=updating\nstart=9\nstart_uptime=9\npid=%s\n' "${SUCCESSOR_PID}" > "${STATE_FILE}"
+        : > "${LOCK_FILE}"
+        return 1
+    }
+    ( main ) >/dev/null 2>&1
+    assert_contains "$(cat "${STATE_FILE}" 2>/dev/null)" "pid=${SUCCESSOR_PID}" \
+        "the successor stays supervised"
+    [[ -f "${LOCK_FILE}" ]] || fail "the successor's lock file is kept"
+    return 0
+}
+
+test_run_cleanup_keeps_another_runs_state() {
+    load_run_library
+    PUBLISHED_RUN_STATE=$'phase=checking\nstart=1\nstart_uptime=1\npid=111'
+    printf 'phase=updating\nstart=2\nstart_uptime=2\npid=222\n' > "${STATE_FILE}"
+    ( cleanup ) >/dev/null 2>&1
+    assert_contains "$(cat "${STATE_FILE}" 2>/dev/null)" "pid=222" "only this run's state is removed"
+}
+
+test_watchdog_recovery_allows_runs_again() {
+    run_stalled_watchdog updating 400 190
+    assert_exit_code 0 "${WATCHDOG_EXIT_CODE}" "recovery completes"
+    [[ -f "${RECOVERY_FILE}" ]] && fail "the next run must be allowed"
+    [[ -f "${REBOOT_PENDING_FILE}" ]] && fail "and no reboot holds it"
     return 0
 }
 
@@ -2279,72 +2305,32 @@ test_watchdog_markers_block_the_main_unit() {
 }
 
 test_watchdog_later_failure_keeps_a_pending_reboot() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
     # A reboot requested earlier is still pending when a later watchdog cycle
     # fails for an unrelated reason.
-    : > "${REBOOT_PENDING_FILE}"
-    write_watchdog_state checking 400 "${background_pid}"
-    stub_watchdog_kill_path
+    : > "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.reboot-pending"
     export STUB_KILL_FAILS=yes
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "the later watchdog fails"
+    run_stalled_watchdog checking 400 65
+    assert_exit_code 1 "${WATCHDOG_EXIT_CODE}" "the later watchdog fails"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the pending reboot must keep update runs blocked"
     [[ -f "${RECOVERY_FILE}" ]] && fail "the failed recovery's own marker is removed"
     return 0
 }
 
-test_watchdog_interrupted_request_keeps_a_marker() {
-    sleep 60 &
-    local background_pid=$! exit_code=0 output
-    load_watchdog_library
-    write_watchdog_state checking 70 "${background_pid}"
-    stub_watchdog_kill_path
-    run_independent_reboot_check() { return 1; }
-    # Stopped at TimeoutStartSec= while systemd-run is submitting the reboot:
-    # whether the timer exists is unknown.
-    export STUB_SCHEDULE_INTERRUPTED=yes
-    output=$( ( main ) 2>&1 ) || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 143 "${exit_code}" "the watchdog was terminated"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "an interrupted request must never leave both markers absent"
-    assert_contains "${output}" "reached systemd is unknown" "the unknown outcome is reported"
-    assert_contains "${output}" "cancel-reboot.sh" "with the recovery command"
-}
-
-test_watchdog_failed_request_keeps_an_earlier_marker() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    : > "${REBOOT_PENDING_FILE}"
-    write_watchdog_state checking 70 "${background_pid}"
-    stub_watchdog_kill_path
-    export STUB_SCHEDULE_FAILS=yes
-    run_independent_reboot_check() { return 1; }
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "the failed dispatch fails the watchdog"
-    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "a failed request removes only the marker it created"
-    return 0
-}
-
 test_watchdog_reports_a_marker_left_by_the_killed_run() {
-    sleep 60 &
-    local background_pid=$! exit_code=0 output
-    load_watchdog_library
     # The stuck run was killed while it requested a reboot; no timer exists.
-    : > "${REBOOT_PENDING_FILE}"
-    write_watchdog_state checking 70 "${background_pid}"
-    stub_watchdog_kill_path
-    run_independent_reboot_check() { return 0; }
-    output=$( ( main ) 2>&1 ) || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "blocked update runs reach OnFailure="
-    assert_contains "${output}" "no reboot is scheduled" "the leftover marker is named"
+    : > "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.reboot-pending"
+    run_stalled_watchdog checking 400 65
+    assert_exit_code 1 "${WATCHDOG_EXIT_CODE}" "blocked update runs reach OnFailure="
+    assert_contains "$(cat "${LOG_FILE}")" "no reboot is scheduled" "the leftover marker is named"
     [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "the watchdog does not decide the outcome for the operator"
     return 0
+}
+
+test_watchdog_scheduled_reboot_is_not_reported_as_leftover() {
+    : > "${TEST_ROOT_DIR}/run/dnf-automatic-reboot.reboot-pending"
+    export STUB_SCHEDULED_REBOOT_STATUS=waiting
+    run_stalled_watchdog checking 400 65
+    assert_exit_code 0 "${WATCHDOG_EXIT_CODE}" "a marker with its reboot waiting is in order"
 }
 
 test_watchdog_replaced_run_is_not_killed() {
@@ -2354,76 +2340,51 @@ test_watchdog_replaced_run_is_not_killed() {
     replacement_pid=$!
     export REPLACEMENT_PID="${replacement_pid}"
     load_watchdog_library
-    write_watchdog_state checking 70 "${original_pid}"
-    pgrep() { return 1; }
-    ss() { :; }
+    write_watchdog_state checking 400 "${original_pid}"
+    write_stalled_progress_record "${original_pid}" 400 65
+    stub_watchdog_kill_path
     unit_main_pid() { cat "${TEST_ROOT_DIR}/main-pid"; }
     printf '%s' "${original_pid}" > "${TEST_ROOT_DIR}/main-pid"
-    schedule_reboot() { printf 'schedule_reboot\n' >> "${STUB_LOG}"; }
-    # While the watchdog checks, the stuck run ends and the next run starts
-    # updating.  The old verdict must not kill it or reboot the host.
-    run_independent_reboot_check() {
+    # Between the stall verdict and the kill, the stuck run ends and the next
+    # run starts updating.  The old verdict must not kill it.
+    begin_recovery() {
         printf 'phase=updating\nstart=0\nstart_uptime=%s\npid=%s\n' \
             "$(( TEST_UPTIME_SECONDS - 60 ))" "${REPLACEMENT_PID}" > "${STATE_FILE}"
         printf '%s' "${REPLACEMENT_PID}" > "${TEST_ROOT_DIR}/main-pid"
-        return 1
+        : > "${RECOVERY_FILE}"
+        trap end_recovery EXIT
     }
-    output=$( main 2>&1 ) || exit_code=$?
+    output=$( ( main ) 2>&1 ) || exit_code=$?
     local replacement_survived=no
     kill -0 "${replacement_pid}" 2>/dev/null && replacement_survived=yes
     kill "${original_pid}" "${replacement_pid}" 2>/dev/null
     assert_exit_code 0 "${exit_code}" "a run that ended normally is no failure"
     assert_equals "yes" "${replacement_survived}" "the replacement run is left running"
-    assert_not_contains "${output}" "systemctl kill" "no cgroup kill"
-    assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "no reboot on the old verdict"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "no cgroup kill"
     assert_contains "$(cat "${STATE_FILE}")" "phase=updating" "the replacement's state file is kept"
 }
 
 test_watchdog_unknown_identity_is_not_acted_on() {
-    sleep 60 &
-    local background_pid=$! exit_code=0 output
-    load_watchdog_library
     export STUB_MAIN_PID=""
-    write_watchdog_state checking 400 "${background_pid}"
-    stub_watchdog_host
-    submit_reboot() { printf 'submit_reboot\n' >> "${STUB_LOG}"; }
-    # Past the hard timeout, but systemctl reports no MainPID: the live PID
-    # may not be the run.
-    output=$( main 2>&1 ) || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "an unestablished identity fails the watchdog"
-    assert_not_contains "$(cat "${STUB_LOG}")" "kill_service_cgroup" "nothing is killed"
-    assert_not_contains "$(cat "${STUB_LOG}")" "submit_reboot" "and nothing is rebooted"
+    run_stalled_watchdog checking 400 65
+    assert_exit_code 1 "${WATCHDOG_EXIT_CODE}" "a stalled run of unknown identity fails the watchdog"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "nothing is killed"
+    : > "${STUB_LOG}"
+    run_stalled_watchdog checking 400 10
+    assert_exit_code 0 "${WATCHDOG_EXIT_CODE}" "a progressing one is only a warning"
 }
 
-test_watchdog_dispatch_failure_fails_the_watchdog() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state checking 70 "${background_pid}"
-    stub_watchdog_host
-    kill_service_cgroup() { return 0; }
-    schedule_reboot() { return 1; }
-    run_independent_reboot_check() { return 1; }
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "a reboot that could not be scheduled reaches OnFailure="
+test_watchdog_ignores_the_configuration() {
+    # The watchdog reads no settings: an invalid file does not leave a hung
+    # run unsupervised.
+    printf 'garbage\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+    run_stalled_watchdog updating 400 190
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "the stalled run is stopped"
 }
 
-test_watchdog_helper_failure_is_not_no_reboot() {
-    sleep 60 &
-    local background_pid=$! exit_code=0 output
-    load_watchdog_library
-    # Past the soft timeout in phase=checking with dnf idle: the watchdog runs
-    # its own check.  Everything that reaches the host is stubbed.
-    write_watchdog_state checking 70 "${background_pid}"
-    stub_watchdog_host
-    run_independent_reboot_check() { return 127; }
-    output=$( main 2>&1 ) || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "an unexpected helper status fails the watchdog"
-    assert_not_contains "${output}" "no reboot needed" "not reported as a clean result"
-    assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "and does not reboot"
+test_watchdog_never_requests_a_reboot() {
+    assert_equals "" "$(grep -nE 'request_reboot|submit_reboot|systemctl reboot|reboot-if-pending' "${REPO_ROOT}/scripts/watchdog.sh")" \
+        "every reboot decision is the run's"
 }
 
 test_watchdog_unit_has_a_start_timeout() {
@@ -2433,18 +2394,6 @@ test_watchdog_unit_has_a_start_timeout() {
     start_timeout=$(sed -n 's/^TimeoutStartSec=//p' "${REPO_ROOT}/units/dnf-automatic-watchdog.service")
     [[ -n "${start_timeout}" && "${start_timeout}" != "infinity" ]] \
         || fail "dnf-automatic-watchdog.service needs a finite TimeoutStartSec, has [${start_timeout}]"
-}
-
-test_watchdog_reboots_through_the_pending_check() {
-    sleep 60 &
-    local background_pid=$!
-    write_watchdog_state checking 400 "${background_pid}"
-    bash "${REPO_ROOT}/scripts/watchdog.sh" >/dev/null 2>&1
-    kill "${background_pid}" 2>/dev/null
-    assert_not_contains "$(cat "${STUB_LOG}")" "systemctl reboot" \
-        "the watchdog never reboots directly, only through reboot-if-pending.sh"
-    assert_contains "$(cat "${STUB_LOG}")" "--unit=dnf-automatic-reboot-scheduled-reboot" "on the named unit"
-    assert_not_contains "$(cat "${STUB_LOG}")" "--on-active" "at once"
 }
 
 # ---------------------------------------------------------------------------
@@ -2982,7 +2931,7 @@ test_run_unsynchronised_clock_does_not_update() {
     output=$( ( main ) 2>&1 ) || exit_code=$?
     assert_exit_code 1 "${exit_code}" "an unconfirmed clock fails the run"
     assert_not_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "nothing is installed"
-    assert_contains "$(cat "${STUB_LOG}")" "chronyc waitsync 60 0.1 0 10" "bounded at clock_sync_wait_sec"
+    assert_contains "$(cat "${STUB_LOG}")" "chronyc waitsync 60 0.1 0 10" "bounded at clock_sync_timeout_seconds"
     assert_contains "${output}" "did not report a synchronised clock within 600s" "and says why"
 }
 
@@ -2995,8 +2944,8 @@ test_run_clock_wait_has_a_hard_deadline() {
     local exit_code=0 output
     output=$( ( main ) 2>&1 ) || exit_code=$?
     assert_exit_code 1 "${exit_code}" "a client stopped at the deadline fails the run"
-    assert_contains "$(cat "${STUB_LOG}")" "timeout --kill-after=30s 600s chronyc waitsync" \
-        "SIGTERM at clock_sync_wait_sec, SIGKILL kill_grace_sec later"
+    assert_contains "$(cat "${STUB_LOG}")" "timeout --kill-after=300s 600s chronyc waitsync" \
+        "SIGTERM at clock_sync_timeout_seconds, SIGKILL KILL_GRACE_SECONDS later"
     assert_not_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "nothing is installed"
     assert_contains "${output}" "still running at 600s" "and says why"
     assert_contains "${output}" "(chronyc: no reply within 10s)" "and that chronyc did not answer either"
@@ -3021,8 +2970,6 @@ test_run_unsynchronised_clock_names_chronyc_reply() {
 }
 
 test_run_has_no_dnf_deadline() {
-    # An edited configuration may still carry the deadline; nothing reads it.
-    printf '\ndnf_timeout_min = 60\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
     load_run_library
     stub_run_main
     local exit_code=0 output
@@ -3034,31 +2981,45 @@ test_run_has_no_dnf_deadline() {
     assert_contains "${output}" "no deadline; the watchdog stops it only once dnf stalls" "and the log says so"
 }
 
-# stub_check_config_program: check-config.sh, called by run.sh through its
-# installed path, runs the repository's copy against the test tree.
-stub_check_config_program() {
-    eval "${LIBRARY_DIRECTORY}/check-config.sh() { bash \"\${REPO_ROOT}/scripts/check-config.sh\" \"\$@\"; }"
+# write_old_config_key - a key an earlier version read, as an edited copy
+# kept across an upgrade still carries.
+write_old_config_key() {
+    printf '\n[timeouts]\nwatchdog_hard_timeout_min = 180\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
 }
 
-test_run_warns_about_unread_config_keys() {
-    install_shipped_config
-    printf '\ndnf_timeout_min = 60\nwatchdog_hard_timeout_min = 180\n' \
-        >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+test_run_invalid_config_installs_nothing() {
+    write_old_config_key
     load_run_library
-    stub_check_config_program
-    local output
-    output=$(warn_on_unread_config_keys 2>&1)
-    assert_contains "${output}" "/etc/dnf/automatic-reboot.conf sets dnf_timeout_min, which this version does not read - remove the line; all differences: /usr/libexec/dnf-automatic-reboot/check-config.sh" \
-        "the dead line is named, with the command for the full list"
-    assert_not_contains "${output}" "watchdog_hard_timeout_min" \
-        "a value the operator may have chosen is not repeated at every run"
+    stub_run_main
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "the run fails, so OnFailure= reports it"
+    assert_contains "${output}" "watchdog_hard_timeout_min is not a setting of this version" "the line is named"
+    assert_contains "${output}" "not updating and not rebooting until /etc/dnf/automatic-reboot.conf is valid - check it with: /usr/libexec/dnf-automatic-reboot/check-config.sh" \
+        "and what it stops"
+    grep -qx 'dnf-automatic' "${STUB_LOG}" && fail "nothing is installed"
+    assert_not_contains "$(cat "${STUB_LOG}")" "makecache" "nothing is even refreshed"
+    assert_contains "$(cat "${STUB_LOG}")" "wall dnf-automatic-reboot: Updates NOT started - /etc/dnf/automatic-reboot.conf is invalid." \
+        "logged-in users are told"
+    [[ -e "${STATE_FILE}" ]] && fail "no state file: there is no run to supervise"
+    return 0
 }
 
-test_run_unread_config_check_is_silent_without_differences() {
-    install_shipped_config
-    load_run_library
-    stub_check_config_program
-    assert_equals "" "$(warn_on_unread_config_keys 2>&1)" "nothing to report"
+test_needs_reboot_invalid_config_is_undecidable() {
+    write_old_config_key
+    load_needs_reboot_library
+    run_needs_restarting() { NEEDS_RESTARTING_OUTPUT=$'  * glibc'; return 1; }
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 2 "${exit_code}" "no reboot is decided from an invalid file"
+}
+
+test_watchdog_invalid_config_without_run_is_quiet() {
+    write_old_config_key
+    load_watchdog_library
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "nothing to supervise; the run reports the file"
 }
 
 test_run_without_chronyc_does_not_update() {
@@ -3092,8 +3053,8 @@ test_run_refreshes_metadata_before_updating() {
     local exit_code=0 refresh_line_number inhibitor_line_number
     ( main ) >/dev/null 2>&1 || exit_code=$?
     assert_exit_code 0 "${exit_code}" "a refreshed cache is the normal run"
-    assert_contains "$(cat "${STUB_LOG}")" "timeout --kill-after=30s 900s ${TEST_ROOT_DIR}/usr/bin/dnf -q makecache --refresh" \
-        "every repository is marked expired and fetched, bounded at metadata_refresh_timeout_sec"
+    assert_contains "$(cat "${STUB_LOG}")" "timeout --kill-after=300s 1800s ${TEST_ROOT_DIR}/usr/bin/dnf -q makecache --refresh" \
+        "every repository is marked expired and fetched, bounded at metadata_refresh_timeout_seconds"
     refresh_line_number=$(grep -n 'makecache --refresh' "${STUB_LOG}" | cut -d: -f1 | head -1)
     inhibitor_line_number=$(grep -n '^systemd-inhibit' "${STUB_LOG}" | cut -d: -f1 | head -1)
     if [[ -z "${refresh_line_number}" || -z "${inhibitor_line_number}" \
@@ -3118,20 +3079,7 @@ test_run_failed_metadata_refresh_still_updates() {
     export STUB_MAKECACHE_RC=124 STUB_MAKECACHE_OUTPUT=""
     output=$( ( main ) 2>&1 ) || exit_code=$?
     assert_exit_code 0 "${exit_code}" "a refresh stopped at the deadline does not stop the update either"
-    assert_contains "${output}" "still running at 900s and was stopped" "and says why"
-}
-
-test_run_metadata_refresh_can_be_turned_off() {
-    printf '\n[updates]\nrefresh_metadata = no\n' >> "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    sed -i 's/^refresh_metadata = yes$//' "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    load_run_library
-    stub_run_main
-    local exit_code=0 output
-    output=$( ( main ) 2>&1 ) || exit_code=$?
-    assert_exit_code 0 "${exit_code}" "the operator opted out"
-    assert_not_contains "$(cat "${STUB_LOG}")" "makecache" "nothing is fetched"
-    assert_contains "$(cat "${STUB_LOG}")" "systemd-inhibit" "and the update runs"
-    assert_contains "${output}" "Updates installed (packages: 2); no reboot needed" "with no qualification on the completion line"
+    assert_contains "${output}" "still running at 1800s and was stopped" "and says why"
 }
 
 test_run_does_not_update_before_a_pending_reboot() {
@@ -3262,21 +3210,22 @@ test_invariant_every_script_is_shipped() {
     return 0
 }
 
-test_invariant_script_defaults_match_the_shipped_config() {
-    # A script default applies when the key is missing from the config, and
-    # check-config.sh names the shipped value as that default: every one-word
-    # default in the scripts must equal the shipped value.
-    local conf_file="${REPO_ROOT}/conf/automatic-reboot.conf" config_key default_value shipped_value
-    local checked_count=0
-    while read -r config_key default_value; do
-        shipped_value=$(sed -n "s/^${config_key} = //p" "${conf_file}")
-        assert_equals "${shipped_value}" "${default_value}" "default of ${config_key}"
-        checked_count=$(( checked_count + 1 ))
-    done < <(grep -ohE '\$\(get_config_(value|integer) [a-z_]+ [A-Za-z0-9_.-]+[ )]' "${REPO_ROOT}"/scripts/*.sh \
-             | tr -d ')' | awk '{ print $2, $3 }' | sort -u)
-    [[ "${checked_count}" -gt 20 ]] || fail "only ${checked_count} defaults found - the pattern no longer matches"
-    assert_equals "" "$(grep -n 'dnf_timeout_min' "${conf_file}" "${REPO_ROOT}"/scripts/*.sh)" \
-        "no deadline is configured or read"
+test_invariant_every_setting_is_read_and_known() {
+    # Every key a script reads is in the schema, and every key in the schema
+    # is read somewhere: a dead key would pass for a setting.
+    load_config_library
+    local config_key read_keys
+    read_keys=$(grep -ohE '\$\(config_value [a-z_]+\)' "${REPO_ROOT}"/scripts/*.sh | tr -d ')' | awk '{ print $2 }' | sort -u)
+    read_keys+=$'\n'$(grep -ohE 'check-config.sh --get [a-z_]+' "${SPEC_FILE}" | awk '{ print $3 }')
+    while IFS= read -r config_key; do
+        [[ -n "${config_key}" ]] || continue
+        [[ -n "${CONFIG_KEY_TYPES[${config_key}]+set}" ]] || fail "${config_key} is read but not in the schema"
+    done <<< "${read_keys}"
+    for config_key in "${CONFIG_KEYS[@]}"; do
+        grep -qxF "${config_key}" <<< "${read_keys}" || fail "${config_key} is in the schema but nothing reads it"
+    done
+    assert_equals "" "$(grep -nE 'get_config_(value|integer)|grep[^|]*[^_]CONFIG_FILE' "${REPO_ROOT}"/scripts/*.sh)" \
+        "no script parses the file on its own"
 }
 
 test_invariant_posttrans_reports_config_differences() {
@@ -3467,49 +3416,6 @@ unknown|1|no
 TABLE
 }
 
-test_watchdog_unknown_schedule_keeps_the_marker() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state checking 70 "${background_pid}"
-    stub_watchdog_kill_path
-    run_independent_reboot_check() { return 1; }
-    export STUB_SCHEDULE_UNKNOWN=yes
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "an unknown outcome reaches OnFailure="
-    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "a reboot that may arrive late keeps update runs held"
-    [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery marker still ends with the watchdog"
-    return 0
-}
-
-test_watchdog_unknown_immediate_reboot_keeps_the_marker() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    write_watchdog_state checking 400 "${background_pid}"
-    stub_watchdog_kill_path
-    submit_reboot() { return 2; }
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 1 "${exit_code}" "an unknown outcome reaches OnFailure="
-    [[ -f "${REBOOT_PENDING_FILE}" ]] || fail "a reboot that may arrive late keeps update runs held"
-    return 0
-}
-
-test_watchdog_scheduled_reboot_is_not_reported_as_leftover() {
-    sleep 60 &
-    local background_pid=$! exit_code=0
-    load_watchdog_library
-    : > "${REBOOT_PENDING_FILE}"
-    write_watchdog_state checking 70 "${background_pid}"
-    stub_watchdog_kill_path
-    run_independent_reboot_check() { return 0; }
-    export STUB_SCHEDULED_REBOOT_STATUS=waiting
-    ( main ) >/dev/null 2>&1 || exit_code=$?
-    kill "${background_pid}" 2>/dev/null
-    assert_exit_code 0 "${exit_code}" "a marker with its reboot waiting is in order"
-}
 
 # notify: a failed deferred reboot says whether updates stay blocked
 load_notify_library() {
@@ -3591,6 +3497,25 @@ test_notify_without_invocation_falls_back_to_the_unit() {
     return 0
 }
 
+test_notify_walls_whatever_the_configuration() {
+    local config_state
+    for config_state in "garbage" "missing"; do
+        (
+            if [[ "${config_state}" == "missing" ]]; then
+                rm -f "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+            else
+                printf '%s\n' "${config_state}" > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
+            fi
+            : > "${STUB_LOG}"
+            load_notify_library
+            ( main dnf-automatic-reboot.service ) >/dev/null 2>&1
+            assert_contains "$(cat "${STUB_LOG}")" "wall dnf-automatic-reboot: dnf-automatic-reboot.service FAILED." \
+                "${config_state}: the failure notice goes out"
+        ) || fail "${config_state} must not silence a failure notice"
+    done
+    return 0
+}
+
 test_notify_failed_reboot_without_marker_is_not_blocked() {
     load_notify_library
     ( main dnf-automatic-reboot-scheduled-reboot.service ) >/dev/null 2>&1
@@ -3644,9 +3569,18 @@ run_preflight() {
     [[ -s "${scriptlet_file}" ]] || fail "could not extract %pre from the spec"
     # Functions shadow the commands inside the child bash, as elsewhere.
     rpm() {
+        local kernel_version
         if [[ "$1" == "-qf" ]]; then
             [[ -n "${STUB_RUNNING_KERNEL_PACKAGE}" ]] || return 1
             printf '%s\n' "${STUB_RUNNING_KERNEL_PACKAGE}"
+            return 0
+        fi
+        # -ql: every installed release's vmlinuz, as the kernel package owns it.
+        if [[ "$1" == "-ql" ]]; then
+            while IFS= read -r kernel_version; do
+                [[ -n "${kernel_version}" ]] && printf '/lib/modules/%s/vmlinuz\n/lib/modules/%s/modules.dep\n' \
+                    "${kernel_version}" "${kernel_version}"
+            done <<< "${STUB_KERNEL_VERSIONS}"
             return 0
         fi
         if [[ "$*" == *VERSION* && "${!#}" == "dnf-automatic-reboot" ]]; then
@@ -3931,28 +3865,30 @@ run_test "parser: rejects multi-word bullet"         test_parser_rejects_multi_w
 run_test "parser: yields nothing without bullets"    test_parser_yields_nothing_without_bullets
 
 printf 'config\n'
-run_test "config: every documented key resolves"     test_config_every_key_resolves
-run_test "config: prefix keys do not collide"        test_config_prefix_keys_do_not_collide
+run_test "config: shipped file sets every default"   test_config_shipped_file_sets_every_default
+run_test "config: booleans accept every spelling"   test_config_booleans_accept_every_spelling
+run_test "config: blanks and comments keep values"  test_config_blanks_and_comments_never_change_a_value
+run_test "config: unknown key names its line"       test_config_unknown_key_names_its_line
+run_test "config: duplicate key is an error"        test_config_duplicate_key_is_an_error
+run_test "config: malformed lines are errors"       test_config_malformed_lines_are_errors
+run_test "config: integers decimal and bounded"     test_config_integers_are_decimal_and_bounded
+run_test "config: missing file is an error"         test_config_missing_file_is_an_error
+run_test "config: unit patterns are validated"      test_config_unit_patterns_are_validated
+run_test "config: diagnostics are printable"        test_config_diagnostics_are_printable
 run_test "config check: unedited is silent"          test_check_config_unedited_is_silent
 run_test "config check: names every difference"      test_check_config_names_every_difference
-run_test "config check: reads values as scripts do"   test_check_config_reads_values_as_the_scripts_do
-run_test "config check: --unread lists only names"   test_check_config_unread_lists_only_names
+run_test "config check: same values written apart"   test_check_config_same_values_written_differently
+run_test "config check: old file names replacement"  test_check_config_old_file_names_errors_and_replacement
 run_test "config check: no shipped copy fails"       test_check_config_without_shipped_copy_fails
-run_test "config: int rejects non-numeric"           test_config_int_rejects_non_numeric
-run_test "config: int rejects negative"              test_config_int_rejects_negative
-run_test "config: int reads leading zeros as decimal" test_config_int_reads_leading_zeros_as_decimal
-run_test "config: int enforces bounds"               test_config_int_enforces_bounds
 run_test "request: malformed delay submits nothing"  test_request_malformed_delay_submits_nothing
 
 printf 'kernel\n'
-run_test "kernel: running is newest is a false positive" test_kernel_running_is_newest_is_false_positive
-run_test "kernel: newer installed is genuine"        test_kernel_newer_installed_is_genuine
-run_test "kernel: not installed fails closed"        test_kernel_not_installed_is_genuine
-run_test "kernel: arch-stripped form matches"        test_kernel_arch_stripped_form_matches
-run_test "kernel: version sort is numeric"           test_kernel_version_sort_is_numeric
+run_test "kernel: running package owns the vmlinuz"  test_kernel_running_package_owns_the_running_vmlinuz
+run_test "kernel: release sort is numeric"           test_kernel_release_sort_is_numeric
+run_test "kernel: release carries any suffix"        test_kernel_release_carries_any_suffix
 
 printf 'grub\n'
-run_test "grub: default matches newest"              test_grub_default_matches_newest
+run_test "grub: default matches the release"         test_grub_default_matches_release
 run_test "grub: stale default is detected"           test_grub_default_is_stale
 run_test "grub: missing grubby is undetermined"      test_grub_unavailable_is_undetermined
 run_test "grub: unreadable grubenv is undetermined"  test_grub_unreadable_grubenv_is_undetermined
@@ -3973,7 +3909,6 @@ run_test "state: replacement is exact field"         test_state_replacement_is_e
 run_test "state: kernel attempts keyed on target"    test_state_kernel_attempts_keyed_on_target
 run_test "state: kernel attempts cleared"            test_state_kernel_attempts_cleared
 run_test "state: attempts cleared when target runs unflagged" test_state_attempts_cleared_when_target_runs_unflagged
-run_test "state: attempts cleared for arch-stripped release" test_state_attempts_cleared_for_arch_stripped_release
 run_test "state: attempts kept while old kernel runs" test_state_attempts_kept_while_old_kernel_runs
 
 printf 'learning\n'
@@ -3985,6 +3920,16 @@ run_test "learning: pending same boot still reboots" test_learning_pending_same_
 run_test "learning: new evr restarts the cycle"      test_learning_new_evr_restarts_cycle
 
 printf 'classify\n'
+run_test "classify: kernel family decided once"      test_classify_kernel_family_is_decided_once
+run_test "classify: family false positive drops both" test_classify_kernel_family_false_positive_drops_both
+run_test "classify: other kernel family withholds"    test_classify_other_kernel_family_withholds
+run_test "classify: unowned running kernel withholds" test_classify_unowned_running_kernel_withholds
+run_test "classify: unreadable releases withhold"     test_classify_unreadable_releases_withhold
+run_test "classify: unreadable grub proceeds, counts" test_classify_unreadable_grub_default_proceeds_and_counts
+run_test "classify: real-time family reaches grub"    test_classify_real_time_family_reaches_the_grub_check
+run_test "decision: stale grub vetoes every trigger"  test_decision_stale_grub_default_vetoes_every_trigger
+run_test "decision: attempt limit vetoes every trigger" test_decision_attempt_limit_vetoes_every_trigger
+run_test "decision: other family vetoes every trigger" test_decision_other_kernel_family_vetoes_every_trigger
 run_test "classify: withholds on stale grub default" test_classify_withholds_on_stale_grub_default
 run_test "classify: withholds at attempt limit"      test_classify_withholds_at_attempt_limit
 run_test "classify: unrecorded attempt withholds the reboot" test_classify_unrecorded_attempt_withholds_the_reboot
@@ -4033,11 +3978,11 @@ run_test "conflicts: refuse apply_updates off"      test_conflicts_refuse_apply_
 run_test "conflicts: pass on prepared host"         test_conflicts_pass_on_prepared_host
 
 printf 'services\n'
+run_test "services: exclusions are additive"         test_services_exclusions_are_additive
 run_test "services: excluded units are not restarted" test_services_excluded_units_are_not_restarted needs-exec
 run_test "services: disabled by config"              test_services_disabled_by_config
 run_test "services: restart is bounded"              test_services_restart_is_bounded
 run_test "services: template units excluded by glob" test_services_template_units_are_excluded_by_glob
-run_test "services: wall_messages comment is ignored" test_wall_messages_trailing_comment_is_not_part_of_the_value
 
 printf 'watchdog\n'
 run_test "watchdog: no state file is a noop"         test_watchdog_no_state_file_is_a_noop
@@ -4045,13 +3990,7 @@ run_test "watchdog: dead pid does not reboot"        test_watchdog_dead_pid_does
 run_test "watchdog: warning reaches the stub, not the host" test_watchdog_warning_reaches_the_stub_not_the_host
 run_test "watchdog: ignores wall clock step"         test_watchdog_ignores_wall_clock_step
 run_test "watchdog: state without uptime is malformed" test_watchdog_state_without_uptime_is_malformed
-run_test "watchdog: hard timeout while updating does not reboot" test_watchdog_hard_timeout_while_updating_does_not_reboot needs-exec
-run_test "watchdog: hard timeout while updating cannot be forced" test_watchdog_hard_timeout_while_updating_cannot_be_forced
-run_test "watchdog: hard timeout while checking reboots"         test_watchdog_hard_timeout_while_checking_reboots         needs-exec
-run_test "watchdog: reboots through the pending check" test_watchdog_reboots_through_the_pending_check needs-exec
 run_test "watchdog: kill option follows systemd version" test_watchdog_kill_option_follows_systemd_version
-run_test "watchdog: hung reboot check is undecidable" test_watchdog_hung_reboot_check_is_undecidable
-run_test "watchdog: helper failure is not no-reboot" test_watchdog_helper_failure_is_not_no_reboot
 run_test "watchdog: replaced run is not killed"      test_watchdog_replaced_run_is_not_killed
 run_test "watchdog: failed kill keeps supervision"   test_watchdog_failed_kill_keeps_supervision
 run_test "watchdog: unconfirmed kill signals no pid" test_watchdog_unconfirmed_kill_signals_no_pid
@@ -4060,13 +3999,8 @@ run_test "state: published by rename"                test_state_is_published_by_
 run_test "state: removal keeps a changed file"       test_state_removal_keeps_a_changed_file
 run_test "watchdog: dead run cleanup keeps a successor" test_watchdog_dead_run_cleanup_keeps_a_successor
 run_test "run: cleanup keeps another run's state"    test_run_cleanup_keeps_another_runs_state
-run_test "watchdog: scheduled reboot keeps runs blocked" test_watchdog_scheduled_reboot_keeps_runs_blocked
-run_test "watchdog: recovery without reboot allows runs" test_watchdog_recovery_without_reboot_allows_runs_again
-run_test "watchdog: failed schedule allows runs again" test_watchdog_failed_schedule_allows_runs_again
 run_test "watchdog: markers block the main unit"     test_watchdog_markers_block_the_main_unit
 run_test "watchdog: later failure keeps a pending reboot" test_watchdog_later_failure_keeps_a_pending_reboot
-run_test "watchdog: interrupted request keeps a marker" test_watchdog_interrupted_request_keeps_a_marker
-run_test "watchdog: failed request keeps an earlier marker" test_watchdog_failed_request_keeps_an_earlier_marker
 run_test "watchdog: reports a marker left by the killed run" test_watchdog_reports_a_marker_left_by_the_killed_run
 run_test "cancel: stops the timer and allows runs"   test_cancel_stops_the_timer_and_allows_runs
 run_test "cancel: then a late firing does not reboot" test_cancel_then_a_late_firing_does_not_reboot
@@ -4104,13 +4038,13 @@ run_test "run: unsynchronised clock does not update" test_run_unsynchronised_clo
 run_test "run: clock wait has a hard deadline"      test_run_clock_wait_has_a_hard_deadline
 run_test "run: unsynchronised clock names chronyc reply" test_run_unsynchronised_clock_names_chronyc_reply
 run_test "run: has no dnf deadline"                  test_run_has_no_dnf_deadline
-run_test "run: warns about unread config keys"       test_run_warns_about_unread_config_keys
-run_test "run: unread config check silent when same" test_run_unread_config_check_is_silent_without_differences
+run_test "run: invalid config installs nothing"     test_run_invalid_config_installs_nothing
+run_test "decision: invalid config is undecidable"  test_needs_reboot_invalid_config_is_undecidable
+run_test "watchdog: invalid config without run is quiet" test_watchdog_invalid_config_without_run_is_quiet
 run_test "run: without chronyc does not update"      test_run_without_chronyc_does_not_update
 run_test "run: clock requirement can be turned off"  test_run_clock_requirement_can_be_turned_off
 run_test "run: refreshes metadata before updating"   test_run_refreshes_metadata_before_updating
 run_test "run: failed metadata refresh still updates" test_run_failed_metadata_refresh_still_updates
-run_test "run: metadata refresh can be turned off"   test_run_metadata_refresh_can_be_turned_off
 run_test "run: does not update before a pending reboot" test_run_does_not_update_before_a_pending_reboot
 run_test "run: unknown reboot state does not update" test_run_unknown_reboot_state_does_not_update
 run_test "watchdog: dnf phase follows the markers" test_watchdog_dnf_phase_follows_the_markers
@@ -4118,24 +4052,15 @@ run_test "watchdog: dnf phase matches whole messages only" test_watchdog_dnf_pha
 run_test "watchdog: dnf phase of unknown log format is unknown" test_watchdog_dnf_phase_of_an_unknown_log_format_is_unknown
 run_test "watchdog: dnf phase follows one rotation" test_watchdog_dnf_phase_follows_one_rotation
 run_test "watchdog: dnf phase without a position is unknown" test_watchdog_dnf_phase_without_a_position_is_unknown
-run_test "watchdog: stall before the transaction is stopped early" test_watchdog_stall_before_the_transaction_is_stopped_early
-run_test "watchdog: stall after the transaction check is stopped early" test_watchdog_stall_after_the_transaction_check_is_stopped_early
 run_test "watchdog: short stall before the transaction is left running" test_watchdog_short_stall_before_the_transaction_is_left_running
-run_test "watchdog: stall in the transaction waits for the hard timeout" test_watchdog_stall_in_the_transaction_waits_for_the_hard_timeout
-run_test "watchdog: unknown phase is not stopped early" test_watchdog_unknown_phase_is_not_stopped_early
 run_test "watchdog: transaction gets the longer window" test_watchdog_transaction_gets_the_longer_window
 run_test "watchdog: progress counts only the run's processes" test_watchdog_progress_counts_only_the_runs_processes
 run_test "watchdog: progress finds the cgroup v1 hierarchy" test_watchdog_progress_finds_the_cgroup_v1_hierarchy
 run_test "watchdog: unreadable progress is no signature" test_watchdog_unreadable_progress_is_no_signature
 run_test "watchdog: other dnf commands do not hold a stalled run" test_watchdog_other_dnf_commands_do_not_hold_a_stalled_run
-run_test "watchdog: progressing update is left running" test_watchdog_progressing_update_is_left_running
-run_test "watchdog: stalled update is stopped"     test_watchdog_stalled_update_is_stopped
-run_test "watchdog: dnf activity restarts the stall window" test_watchdog_dnf_activity_restarts_the_stall_window
 run_test "watchdog: records each run from its first cycle" test_watchdog_records_progress_of_each_run_from_its_first_cycle
-run_test "watchdog: records progress before the hard timeout" test_watchdog_records_progress_before_the_hard_timeout
 run_test "watchdog: unrecordable progress stops nothing" test_watchdog_unrecordable_progress_stops_nothing
 run_test "watchdog: unreadable counters stop nothing" test_watchdog_unreadable_counters_stop_nothing
-run_test "watchdog: stall windows cannot be turned off" test_watchdog_stall_windows_cannot_be_turned_off
 run_test "invariant: only reboot-if-pending reboots" test_invariant_only_reboot_if_pending_reboots
 run_test "invariant: marker removers are known"     test_invariant_marker_removers_are_known
 run_test "invariant: dispatched file removed only on refusal" test_invariant_dispatched_file_is_removed_only_on_refusal
@@ -4146,7 +4071,7 @@ run_test "invariant: flock uses documented short options" test_invariant_flock_u
 run_test "invariant: state file written only by rename" test_invariant_state_file_written_only_by_rename
 run_test "invariant: probe assigns its library before use" test_invariant_probe_assigns_its_library_before_use
 run_test "invariant: every script is shipped"       test_invariant_every_script_is_shipped
-run_test "invariant: script defaults match the shipped config" test_invariant_script_defaults_match_the_shipped_config
+run_test "invariant: every setting is read and known" test_invariant_every_setting_is_read_and_known
 run_test "invariant: posttrans reports config differences" test_invariant_posttrans_reports_config_differences
 run_test "invariant: versions agree"                test_invariant_versions_agree
 run_test "reader: unit snapshot job forms"          test_reader_unit_snapshot_job_forms
@@ -4158,19 +4083,30 @@ run_test "cancel: unstoppable timer still cancels"  test_cancel_with_unstoppable
 run_test "cancel: running service before dispatch cancels" test_cancel_with_running_reboot_service_before_dispatch_cancels
 run_test "request: dispatched reboot is not requested again" test_request_dispatched_reboot_is_not_requested_again
 run_test "run: pending reboot states table"         test_run_pending_reboot_states_table
-run_test "watchdog: unknown schedule keeps the marker" test_watchdog_unknown_schedule_keeps_the_marker
-run_test "watchdog: unknown immediate reboot keeps the marker" test_watchdog_unknown_immediate_reboot_keeps_the_marker
 run_test "watchdog: scheduled reboot is not reported as leftover" test_watchdog_scheduled_reboot_is_not_reported_as_leftover
 run_test "notify: failed reboot names blocked updates" test_notify_failed_reboot_names_blocked_updates
 run_test "notify: failed dispatched reboot says reboot" test_notify_failed_dispatched_reboot_says_reboot
 run_test "notify: failed reboot without marker is not blocked" test_notify_failed_reboot_without_marker_is_not_blocked
+run_test "notify: walls whatever the configuration"  test_notify_walls_whatever_the_configuration
 run_test "notify: quotes only the failed run"         test_notify_quotes_only_the_failed_run
 run_test "notify: without invocation falls back to the unit" test_notify_without_invocation_falls_back_to_the_unit
 run_test "watchdog: unknown identity is not acted on" test_watchdog_unknown_identity_is_not_acted_on
-run_test "watchdog: dispatch failure fails the watchdog" test_watchdog_dispatch_failure_fails_the_watchdog
 run_test "watchdog: unit has a start timeout"        test_watchdog_unit_has_a_start_timeout
+run_test "watchdog: stalled update does not reboot" test_watchdog_stalled_update_does_not_reboot needs-exec
+run_test "watchdog: stalled reboot check does not reboot" test_watchdog_stalled_reboot_check_does_not_reboot needs-exec
+run_test "watchdog: systemd 239 kills with --kill-who" test_watchdog_stall_on_systemd_239_kills_with_kill_who needs-exec
+run_test "watchdog: stall before the transaction is stopped" test_watchdog_stall_before_the_transaction_is_stopped
+run_test "watchdog: stall after the transaction check is stopped" test_watchdog_stall_after_the_transaction_check_is_stopped
+run_test "watchdog: stalled transaction stopped at any age" test_watchdog_stalled_transaction_is_stopped_at_any_age
+run_test "watchdog: unknown phase gets the longer window" test_watchdog_unknown_phase_gets_the_longer_window
+run_test "watchdog: stalled reboot check is stopped" test_watchdog_stalled_reboot_check_is_stopped
+run_test "watchdog: short stall in reboot check is left" test_watchdog_short_stall_in_the_reboot_check_is_left_running
+run_test "watchdog: progressing run left at any age" test_watchdog_progressing_run_is_left_running_at_any_age
+run_test "watchdog: activity restarts the stall window" test_watchdog_activity_restarts_the_stall_window
+run_test "watchdog: recovery allows runs again" test_watchdog_recovery_allows_runs_again
+run_test "watchdog: ignores the configuration" test_watchdog_ignores_the_configuration
+run_test "watchdog: never requests a reboot" test_watchdog_never_requests_a_reboot
 run_test "watchdog: reused pid is not the run"        test_watchdog_reused_pid_is_not_the_run       needs-exec
-run_test "watchdog: systemd 239 kills with --kill-who" test_watchdog_hard_timeout_on_systemd_239_kills_with_kill_who needs-exec
 
 printf 'preflight\n'
 run_test "preflight: prepared host passes"           test_preflight_prepared_host_passes           needs-rpmspec

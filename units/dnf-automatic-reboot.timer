@@ -12,9 +12,9 @@
 #   OnCalendar=*-*-* 21:00:00 UTC
 #
 # The empty OnCalendar= clears this default.  A time without a zone is
-# the host's local time.  Keep runs more than watchdog_hard_timeout_min
-# (default 320 minutes) apart.  A run that dnf keeps busy longer is not
-# stopped; a slot that comes meanwhile joins that run and is skipped.
+# the host's local time.  A run is never stopped for its age; a slot that
+# comes while one is still going joins that run and is skipped, so runs do
+# not overlap however close they are.
 #
 # Three runs a day, by where the users are.  PRG = Prague, NYC = New
 # York, SIN = Singapore.  PRG and NYC hours are winter/summer time; SIN

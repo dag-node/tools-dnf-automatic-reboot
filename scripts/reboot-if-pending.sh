@@ -25,7 +25,7 @@
 #
 # A reboot that does not start - blocked, inhibitors unreadable, or a failed
 # systemctl reboot while the host stays up - is retried every
-# REBOOT_RETRY_INTERVAL_SEC until INHIBITED_WAIT_SECONDS have passed; between
+# REBOOT_RETRY_INTERVAL_SECONDS until INHIBITED_WAIT_SECONDS have passed; between
 # attempts the dispatched file is removed and the lock released, so the
 # reboot can still be cancelled.  It never uses --force.  A failed systemctl
 # reboot is checked against the host's shutdown state first: logind may have
@@ -69,7 +69,7 @@ log_error() {
 }
 
 # Interval between attempts while a shutdown inhibitor refuses the reboot.
-readonly REBOOT_RETRY_INTERVAL_SEC=30
+readonly REBOOT_RETRY_INTERVAL_SECONDS=30
 
 # blocking_inhibitors -> the block-mode shutdown inhibitors logind lists, one
 # per "; ", or "none listed".
@@ -135,8 +135,8 @@ attempt_reboot() {
 }
 
 main() {
-    local lock_wait_seconds="${1:-60}" inhibited_wait_seconds="${2:-0}" retry_deadline attempt_result
-    [[ "${lock_wait_seconds}" =~ ^[0-9]{1,9}$ ]] || lock_wait_seconds=60
+    local lock_wait_seconds="${1:-${REBOOT_REQUEST_LOCK_TIMEOUT_SECONDS}}" inhibited_wait_seconds="${2:-0}" retry_deadline attempt_result
+    [[ "${lock_wait_seconds}" =~ ^[0-9]{1,9}$ ]] || lock_wait_seconds="${REBOOT_REQUEST_LOCK_TIMEOUT_SECONDS}"
     [[ "${inhibited_wait_seconds}" =~ ^[0-9]{1,9}$ ]] || inhibited_wait_seconds=0
     lock_wait_seconds=$(( 10#${lock_wait_seconds} ))
     inhibited_wait_seconds=$(( 10#${inhibited_wait_seconds} ))
@@ -152,8 +152,8 @@ main() {
             log_error "the reboot did not start within ${inhibited_wait_seconds}s: ${REBOOT_NOT_STARTED_REASON} - update runs stay held; reboot the host, or allow updates again with: ${CANCEL_REBOOT_COMMAND}"
             exit 1
         fi
-        log_warning "the reboot did not start: ${REBOOT_NOT_STARTED_REASON} - retrying in ${REBOOT_RETRY_INTERVAL_SEC}s"
-        sleep "${REBOOT_RETRY_INTERVAL_SEC}"
+        log_warning "the reboot did not start: ${REBOOT_NOT_STARTED_REASON} - retrying in ${REBOOT_RETRY_INTERVAL_SECONDS}s"
+        sleep "${REBOOT_RETRY_INTERVAL_SECONDS}"
     done
 }
 

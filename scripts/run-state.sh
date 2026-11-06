@@ -16,7 +16,7 @@
 
 readonly STATE_FILE_LOCK="${TEST_ROOT}/run/dnf-automatic-reboot.state.lock"
 # Writers and removers hold the lock for one rename or one comparison.
-readonly STATE_FILE_LOCK_WAIT_SEC=10
+readonly STATE_FILE_LOCK_TIMEOUT_SECONDS=10
 
 # prepare_state_file_lock - creates STATE_FILE_LOCK 0600 and sets it to 0600
 # in place: flock(2) locks through a read-only descriptor, so a user able to
@@ -35,9 +35,9 @@ write_run_state() {
     local state_content="$1" lock_descriptor temporary_file write_result=0
     prepare_state_file_lock || return 1
     exec {lock_descriptor}>>"${STATE_FILE_LOCK}" || return 1
-    if ! flock -w "${STATE_FILE_LOCK_WAIT_SEC}" "${lock_descriptor}"; then
+    if ! flock -w "${STATE_FILE_LOCK_TIMEOUT_SECONDS}" "${lock_descriptor}"; then
         exec {lock_descriptor}>&-
-        log_error "${STATE_FILE_LOCK} not acquired within ${STATE_FILE_LOCK_WAIT_SEC}s"
+        log_error "${STATE_FILE_LOCK} not acquired within ${STATE_FILE_LOCK_TIMEOUT_SECONDS}s"
         return 1
     fi
     if temporary_file=$(mktemp "${STATE_FILE}.XXXXXX" 2>/dev/null); then
@@ -83,9 +83,9 @@ remove_run_state_if_unchanged() {
     shift
     prepare_state_file_lock || return 2
     exec {lock_descriptor}>>"${STATE_FILE_LOCK}" || return 2
-    if ! flock -w "${STATE_FILE_LOCK_WAIT_SEC}" "${lock_descriptor}"; then
+    if ! flock -w "${STATE_FILE_LOCK_TIMEOUT_SECONDS}" "${lock_descriptor}"; then
         exec {lock_descriptor}>&-
-        log_error "${STATE_FILE_LOCK} not acquired within ${STATE_FILE_LOCK_WAIT_SEC}s - state file left alone"
+        log_error "${STATE_FILE_LOCK} not acquired within ${STATE_FILE_LOCK_TIMEOUT_SECONDS}s - state file left alone"
         return 2
     fi
     if current_snapshot=$(read_run_state) && [[ "${current_snapshot}" == "${expected_snapshot}" ]]; then

@@ -2,22 +2,17 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # check-config.sh
 # ---------------------------------------------------------------------------
-# Compares /etc/dnf/automatic-reboot.conf with the configuration this version
-# ships, /usr/share/dnf-automatic-reboot/automatic-reboot.conf, and names the
-# lines to change by hand.  The file in /etc is %config(noreplace): it keeps
-# its keys and values across upgrades, and every shipped key is set
-# explicitly, so an edited copy also keeps the defaults it was edited with.
-# Nothing here edits it.
+# Validates /etc/dnf/automatic-reboot.conf with the parser every script uses
+# (config.sh), and names the settings that differ from the configuration this
+# version ships, /usr/share/dnf-automatic-reboot/automatic-reboot.conf.
+# Nothing here edits either file.
 #
-#   check-config.sh           every difference; %posttrans runs it
-#   check-config.sh --unread  only the keys this version does not read, one
-#                             name per line; run.sh logs them at every start
+#   check-config.sh   every error, or every difference; %posttrans runs it
 #
-# Both files are read as get_config_value reads them: the last KEY = VALUE
-# line of a key counts, without leading blanks or a trailing comment.
-#
-# Exit codes: 0 = no difference, 1 = differences printed, 2 = a file cannot be
-# read or the option is unknown.
+# Exit codes:
+#   0  valid, every value as shipped
+#   1  valid, with values that differ from the shipped ones
+#   2  invalid or unreadable, or a usage error; the errors go to stdout
 # ---------------------------------------------------------------------------
 set -euo pipefail
 IFS=$'\n\t'
@@ -30,88 +25,83 @@ readonly TEST_ROOT="${DNF_AUTOMATIC_REBOOT_TEST_ROOT:-}"
 
 readonly CONFIG_FILE="${TEST_ROOT}/etc/dnf/automatic-reboot.conf"
 readonly SHIPPED_CONFIG_FILE="${TEST_ROOT}/usr/share/dnf-automatic-reboot/automatic-reboot.conf"
+# Where rpm puts the shipped file when the one in /etc was edited.
+readonly NEW_CONFIG_FILE="${CONFIG_FILE}.rpmnew"
+readonly CHECK_CONFIG_COMMAND=/usr/libexec/dnf-automatic-reboot/check-config.sh
 
-# config_settings FILE -> "KEY<TAB>VALUE" per key, in the order keys first
-# appear.  Comment and section lines are skipped.
-config_settings() {
-    awk '
-        /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=/ {
-            key = $0
-            sub(/^[[:space:]]*/, "", key)
-            sub(/[[:space:]]*=.*$/, "", key)
-            value = $0
-            sub(/^[^=]*=[[:space:]]*/, "", value)
-            sub(/[[:space:]]*#.*$/, "", value)
-            sub(/[[:space:]]+$/, "", value)
-            if (!(key in values)) key_order[++key_count] = key
-            values[key] = value
-        }
-        END { for (key_index = 1; key_index <= key_count; key_index++) printf "%s\t%s\n", key_order[key_index], values[key_order[key_index]] }
-    ' "$1"
+# load_config and config_value.
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
+
+# operator_path PATH -> PATH without the test suite's prefix.
+operator_path() {
+    printf '%s' "${1#"${TEST_ROOT}"}"
 }
 
-# compare_config_settings MODE SHIPPED_SETTINGS INSTALLED_SETTINGS -> one line
-# per difference; in mode "unread" only the names of keys not shipped.
-compare_config_settings() {
-    awk -F'\t' -v report_mode="$1" '
-        FNR == NR {
-            if ($1 != "") { shipped[$1] = $2; shipped_order[++shipped_count] = $1 }
-            next
-        }
-        $1 != "" { installed[$1] = $2; installed_order[++installed_count] = $1 }
-        END {
-            for (key_index = 1; key_index <= installed_count; key_index++) {
-                key = installed_order[key_index]
-                if (key in shipped) continue
-                if (report_mode == "unread") print key
-                else printf "  not read by this version, remove the line:  %s = %s\n", key, installed[key]
-            }
-            if (report_mode == "unread") exit
-            for (key_index = 1; key_index <= shipped_count; key_index++) {
-                key = shipped_order[key_index]
-                if (!(key in installed)) printf "  not set, the built-in default applies:  %s = %s (shipped)\n", key, shipped[key]
-            }
-            for (key_index = 1; key_index <= installed_count; key_index++) {
-                key = installed_order[key_index]
-                if ((key in shipped) && installed[key] != shipped[key])
-                    printf "  differs from the shipped value:  %s = %s (shipped: %s)\n", key, installed[key], shipped[key]
-            }
-        }
-    ' <(printf '%s\n' "$2") <(printf '%s\n' "$3")
+# print_invalid_config_report - the errors, and how to start from the file
+# this version ships without losing the operator's copy.
+print_invalid_config_report() {
+    local config_error replacement_command
+    printf 'dnf-automatic-reboot: %s is not valid for this version:\n' "$(operator_path "${CONFIG_FILE}")"
+    for config_error in "${CONFIG_ERRORS[@]}"; do
+        printf '  %s\n' "${config_error}"
+    done
+    printf 'Update runs stop, and no reboot is requested, until it is valid.\n'
+    if [[ -f "${NEW_CONFIG_FILE}" ]]; then
+        replacement_command="mv $(operator_path "${NEW_CONFIG_FILE}") $(operator_path "${CONFIG_FILE}")"
+        printf 'The configuration this version ships is %s.  Keep a copy of yours, compare, replace:\n' \
+            "$(operator_path "${NEW_CONFIG_FILE}")"
+        printf '  cp -p %s %s.bak\n' "$(operator_path "${CONFIG_FILE}")" "$(operator_path "${CONFIG_FILE}")"
+        printf '  diff -u %s.bak %s\n' "$(operator_path "${CONFIG_FILE}")" "$(operator_path "${NEW_CONFIG_FILE}")"
+    else
+        replacement_command="cp $(operator_path "${SHIPPED_CONFIG_FILE}") $(operator_path "${CONFIG_FILE}")"
+        printf 'The configuration this version ships is %s.  Keep a copy of yours, compare, replace:\n' \
+            "$(operator_path "${SHIPPED_CONFIG_FILE}")"
+        printf '  cp -p %s %s.bak\n' "$(operator_path "${CONFIG_FILE}")" "$(operator_path "${CONFIG_FILE}")"
+        printf '  diff -u %s.bak %s\n' "$(operator_path "${CONFIG_FILE}")" "$(operator_path "${SHIPPED_CONFIG_FILE}")"
+    fi
+    printf '  %s\n' "${replacement_command}"
+    printf 'then carry your changes over and run %s again.\n' "${CHECK_CONFIG_COMMAND}"
 }
 
-main() {
-    local report_mode=all installed_settings shipped_settings differences
-    case "${1:-}" in
-        "")       ;;
-        --unread) report_mode=unread ;;
-        *)
-            printf 'usage: %s [--unread]\n' "${0##*/}" >&2
-            exit 2
-            ;;
-    esac
-    if ! shipped_settings=$(config_settings "${SHIPPED_CONFIG_FILE}" 2>/dev/null); then
-        printf 'cannot read %s\n' "${SHIPPED_CONFIG_FILE#"${TEST_ROOT}"}" >&2
+# report_config_differences - validates both files; exit 0, 1 or 2 as above.
+report_config_differences() {
+    local config_key differences=()
+    declare -A shipped_values=()
+    if ! load_config "${SHIPPED_CONFIG_FILE}"; then
+        printf 'cannot read %s as this version ships it:\n' "$(operator_path "${SHIPPED_CONFIG_FILE}")"
+        printf '  %s\n' "${CONFIG_ERRORS[@]}"
         exit 2
     fi
-    if ! installed_settings=$(config_settings "${CONFIG_FILE}" 2>/dev/null); then
-        printf 'cannot read %s\n' "${CONFIG_FILE#"${TEST_ROOT}"}" >&2
+    for config_key in "${CONFIG_KEYS[@]}"; do
+        shipped_values["${config_key}"]="${CONFIG_VALUES[${config_key}]}"
+    done
+    if ! load_config "${CONFIG_FILE}"; then
+        print_invalid_config_report
         exit 2
     fi
-    differences=$(compare_config_settings "${report_mode}" "${shipped_settings}" "${installed_settings}")
-    [[ -n "${differences}" ]] || exit 0
-    if [[ "${report_mode}" == "unread" ]]; then
-        printf '%s\n' "${differences}"
-        exit 1
-    fi
-    printf 'dnf-automatic-reboot: %s differs from the configuration this version ships.\n' "${CONFIG_FILE#"${TEST_ROOT}"}"
-    printf 'The package does not edit it; change by hand what should change:\n'
-    printf '%s\n' "${differences}"
-    printf 'Compare: diff -u %s %s\n' "${SHIPPED_CONFIG_FILE#"${TEST_ROOT}"}" "${CONFIG_FILE#"${TEST_ROOT}"}"
+    for config_key in "${CONFIG_KEYS[@]}"; do
+        if [[ "${CONFIG_VALUES[${config_key}]}" != "${shipped_values[${config_key}]}" ]]; then
+            differences+=("  ${config_key} = ${CONFIG_VALUES[${config_key}]} (shipped: ${shipped_values[${config_key}]:-empty})")
+        fi
+    done
+    [[ "${#differences[@]}" -gt 0 ]] || exit 0
+    printf 'dnf-automatic-reboot: %s is valid; these settings differ from the ones this version ships:\n' \
+        "$(operator_path "${CONFIG_FILE}")"
+    printf '%s\n' "${differences[@]}"
+    printf 'Compare: diff -u %s %s\n' "$(operator_path "${SHIPPED_CONFIG_FILE}")" "$(operator_path "${CONFIG_FILE}")"
     exit 1
 }
 
-# Sourcing defines the functions without running the comparison.
+main() {
+    if [[ "$#" -gt 0 ]]; then
+        printf 'usage: %s\n' "${0##*/}" >&2
+        exit 2
+    fi
+    report_config_differences
+}
+
+# Sourcing defines the functions without running the check.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi

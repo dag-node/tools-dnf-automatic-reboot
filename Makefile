@@ -24,7 +24,8 @@ SCRIPTS = scripts/run.sh \
           scripts/check-config.sh
 # Sourced, never executed.
 LIBRARIES = scripts/reboot-request.sh \
-            scripts/run-state.sh
+            scripts/run-state.sh \
+            scripts/config.sh
 UNITS   = units/dnf-automatic-reboot.service \
           units/dnf-automatic-reboot.timer \
           units/dnf-automatic-watchdog.service \

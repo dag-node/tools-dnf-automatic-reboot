@@ -9,9 +9,9 @@ Wants=network-online.target
 # when chrony-wait.service fails, and at once when nothing is ordered before
 # it (systemd-time-wait-sync.service is absent on UEK R8).  run.sh requires
 # the synchronisation itself: it runs `chronyc waitsync`, bounded by
-# clock_sync_wait_sec, and installs nothing until chronyd confirms the clock.
-# The RPM %post enables chrony-wait.service when [time] enable_chrony_wait =
-# yes, which makes the ordering wait at boot too.
+# clock_sync_timeout_seconds, and installs nothing until chronyd confirms the clock.
+# The RPM %post enables chrony-wait.service, which makes the ordering wait
+# at boot too.
 # Prerequisite on this host (see doc/README):
 #   /etc/chrony.conf must contain: makestep 1 -1
 Requires=time-sync.target
@@ -34,8 +34,9 @@ ExecStart=/usr/libexec/dnf-automatic-reboot/run.sh
 # run.sh removes the lock on clean exit; belt-and-suspenders removal here
 ExecStopPost=/usr/bin/rm -f /run/dnf-automatic-reboot.lock
 RemainAfterExit=no
-# run.sh owns all its own timeouts via the `timeout` command.
-# Do not let systemd kill it independently.
+# dnf-automatic runs with no deadline, which would stop an rpm transaction
+# as readily as a download; the watchdog stops a run whose processes stall.
+# run.sh bounds its other steps with timeout(1).
 TimeoutStartSec=infinity
 # needs-restarting output is translated; the parsers match C strings.
 Environment=LC_ALL=C
