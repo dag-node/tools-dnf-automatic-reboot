@@ -22,9 +22,9 @@ On Red Hat Enterprise Linux 8, `dnf-automatic` does not restart after
 updates at all.
 
 This package filters out the false restart requests and restarts only when
-the restart applies an update. Before a kernel restart it checks that the new
-kernel is the one that will boot; if not, it does not restart and
-logs why.
+the restart applies an update. Before every restart it checks that the newest
+kernel is the one that will boot. If not, it does not restart for any update
+until the boot setting is fixed, and each night's alert says how to fix it.
 
 It installs on Enterprise Linux 8 and 9 (Red Hat Enterprise Linux, Oracle
 Linux, Rocky Linux, AlmaLinux) with the standard GRUB boot menu.
@@ -88,13 +88,14 @@ install packages without checking their signatures, are reported in the log.
 
 An update is never stopped while dnf is still working, so a download over a
 slow link, or an upgrade to the next minor release on a Raspberry Pi, can take
-as long as it needs. A separate watchdog checks every five minutes. If the
-update reads and writes nothing for an hour before it starts installing, the
-watchdog stops the run and alerts you; nothing was installed, and the next run
-tries again. Once installing has started, it waits until the run has gone on
-for five hours and twenty minutes and has been idle for three hours, then stops
-it and alerts you with the commands that show what to repair; it does not
-restart while packages may be half-installed.
+as long as it needs. A separate watchdog checks every five minutes and stops
+a run only when it has stopped working. If the update reads and writes nothing
+for an hour before it starts installing, the watchdog stops the run and alerts
+you; nothing was installed, and the next run tries again. Once installing has
+started, it waits for three idle hours, then stops the run and alerts you with
+the commands that show what to repair. If the restart check after the update
+hangs for an hour, the watchdog stops it, and the next night's run decides the
+restart. The watchdog itself never restarts the computer.
 
 When something goes wrong, logged-in users get a message on their terminal and
 the details go to `/var/log/dnf-automatic-reboot.log`.
@@ -153,28 +154,33 @@ and the log names the line to fix.
 
 A `WARNING` about `GRUB_SAVEDEFAULT=true` does not stop the install. It means
 that choosing an older kernel from the boot menu once makes it the default;
-after that, restarts for new kernels are held back, and the log says so, until
-`sudo grubby --set-default` points at the newest kernel again.
+after that, the package restarts for no update, and each night's run fails
+naming the command that fixes it, until `sudo grubby --set-default` points at
+the newest kernel again.
 
 ## Changing the settings
 
 Settings are in `/etc/dnf/automatic-reboot.conf`; each one is explained in the
-file. An upgrade keeps your copy as it is. After installing or upgrading, the
-installer lists every line that differs from the settings the new version
-ships: settings it no longer reads, new settings your copy does not have, and
-values that differ, such as a default from an older version. It changes
-nothing; edit the file by hand where you want the new value. Run
-`sudo /usr/libexec/dnf-automatic-reboot/check-config.sh` to see the list again.
-A setting that is no longer read is also named in the log at every run.
+file, with its default and the values it accepts. After editing, check the file:
+
+```bash
+sudo /usr/libexec/dnf-automatic-reboot/check-config.sh
+```
+
+It names every mistake with its line number, or lists the settings that differ
+from the defaults. A mistake stops the updates and restarts: a misspelt or
+unknown setting, one set twice, a value outside its range, or a yes/no setting
+that is not `yes`, `true`, `on`, `1`, `no`, `false`, `off` or `0`. The nightly
+run then fails and the alert names the line, so a typo never leaves the
+computer running on a setting you did not choose.
 
 The settings people change most:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `reboot_delay_sec` | `300` | Seconds between the warning and the restart |
-| `always_reboot` | `no` | `yes` restarts after every update, needed or not |
+| `restart_services_excluded_patterns` | empty | Services you restart yourself, such as `postgresql.service` |
+| `metadata_refresh_timeout_seconds` | `1800` | Raise on a slow link, such as a modem connection |
 | `restart_services` | `yes` | `no` leaves updated background services running the old program |
-| `wall_messages` | `yes` | `no` stops the messages to logged-in users |
 
 To run at another time, override the timer:
 
@@ -214,6 +220,21 @@ correct time at boot, those false alarms do not occur.
 
 ## Upgrading from an earlier version
 
+An upgrade replaces `/etc/dnf/automatic-reboot.conf` if you never edited it.
+If you did, it keeps your copy, puts the new one beside it as
+`/etc/dnf/automatic-reboot.conf.rpmnew`, and prints what to do. When your copy
+names a setting the new version does not read, the nightly run does not install
+updates or restart the computer until the copy is valid; its alert names the
+problem. This also applies when the nightly run installs the upgrade itself.
+Keep a copy, start from the new file, and carry your values over:
+
+```bash
+sudo cp -p /etc/dnf/automatic-reboot.conf /etc/dnf/automatic-reboot.conf.bak
+sudo mv /etc/dnf/automatic-reboot.conf.rpmnew /etc/dnf/automatic-reboot.conf
+sudoedit /etc/dnf/automatic-reboot.conf
+sudo /usr/libexec/dnf-automatic-reboot/check-config.sh
+```
+
 Versions before 1.4.0 cannot be upgraded in place. Remove the old version,
 then install as in [Quick start](#quick-start):
 
@@ -242,8 +263,8 @@ state. A settings file you changed is kept as
 ## More information
 
 - [doc/README](doc/README), installed as
-  `/usr/share/doc/dnf-automatic-reboot/README`: every setting, the log, and
-  how restart decisions are made.
+  `/usr/share/doc/dnf-automatic-reboot/README`: the settings file, the log,
+  and how restart decisions are made.
 - [doc/END-TO-END-TEST.md](doc/END-TO-END-TEST.md): checking on a live host
   that a reboot waits for shutdown inhibitors and can be cancelled.
 - Source and issues: <https://github.com/dag-node/tools-dnf-automatic-reboot>
