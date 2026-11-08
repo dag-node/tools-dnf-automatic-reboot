@@ -784,7 +784,10 @@ enumerated and no second transaction is resolved. `check-update` would not do: i
 lists updates without resolving a transaction, and its exit 100 means any one is
 listed. `--updates` lists only packages the sack offers, and `excludepkgs=` takes
 packages out of the sack, hence `--disableexcludes=all`; versionlock filters only
-while dnf resolves a transaction, which `updateinfo` does not. Every package row is
+while dnf resolves a transaction, which `updateinfo` does not. An older kernel kept
+beside a newer one is not listed: on RHEL 8.10 (three kernels installed) and OL 9.8
+(two), with over a hundred security advisories on the installed kernels, the listing
+named no kernel row. Every package row is
 reported, as `ID (PACKAGE, PACKAGE)`: one advisory can cover several packages and only
 some be kept out. It is one query under `dnf_query_timeout_seconds`; a listing that
 fails is logged as an incomplete report, not read as "nothing outstanding".
