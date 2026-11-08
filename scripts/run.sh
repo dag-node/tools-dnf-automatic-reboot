@@ -49,7 +49,8 @@ readonly DNF_CONFIG_FILE="${TEST_ROOT}/etc/dnf/dnf.conf"
 readonly REPOSITORY_CONFIG_DIRECTORY="${TEST_ROOT}/etc/yum.repos.d"
 readonly STATE_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.state"
 readonly LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.lock"
-readonly UPTIME_FILE="${TEST_ROOT}/proc/uptime"
+readonly PROC_DIRECTORY="${TEST_ROOT}/proc"
+readonly UPTIME_FILE="${PROC_DIRECTORY}/uptime"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
 readonly DNF_BIN="${TEST_ROOT}/usr/bin/dnf"
@@ -150,6 +151,56 @@ warn_on_unsigned_repositories() {
         send_wall_message "dnf-automatic-reboot: WARNING - unsigned repositories enabled (${unsigned_repository_ids})." \
                           "Unattended updates from them are not signature-checked."
     fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# read_process_control_group PID -> the cgroup of PID in systemd's hierarchy:
+# the name=systemd line of cgroup v1 (EL8), else the 0:: line of the unified
+# hierarchy (EL9).  Returns 1 when the file cannot be read or names neither.
+# ---------------------------------------------------------------------------
+read_process_control_group() {
+    local process_id="$1"
+    awk '
+        { control_group = $0; sub(/^[^:]*:[^:]*:/, "", control_group) }
+        $0 ~ /^[0-9]+:name=systemd:/ { named_hierarchy = control_group }
+        $0 ~ /^0::/                  { unified_hierarchy = control_group }
+        END {
+            if (named_hierarchy != "") print named_hierarchy
+            else if (unified_hierarchy != "") print unified_hierarchy
+            else exit 1
+        }
+    ' "${PROC_DIRECTORY}/${process_id}/cgroup" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Pre-flight: name every other dnf process already running.
+#
+# Warned, not fatal: dnf serialises on its own lock, so this run waits for it,
+# and the warning gives a logged-in admin the chance to hold off.  Every dnf
+# command shares the process name, so only its cgroup tells the
+# distribution's dnf-makecache.service apart; its processes are left out.  A
+# process is named by its PID, process name and cgroup, which says who started
+# it; never by its arguments, which can carry a credential such as
+# --setopt=proxy_password=, and the warning goes to every logged-in user.  A
+# process whose cgroup cannot be read is no longer running.
+# ---------------------------------------------------------------------------
+warn_on_concurrent_dnf() {
+    local process_id process_name process_control_group concurrent_dnf_processes=()
+
+    while IFS=' ' read -r process_id process_name; do
+        [[ "${process_id}" =~ ^[0-9]+$ ]] || continue
+        process_control_group=$(read_process_control_group "${process_id}") || continue
+        [[ "${process_control_group}" == */dnf-makecache.service ]] && continue
+        concurrent_dnf_processes+=("pid ${process_id} ${process_name} in ${process_control_group//[^[:print:]]/?}")
+    done < <(pgrep -l -x 'dnf|dnf-3|dnf-automatic' 2>/dev/null || true)
+
+    [[ "${#concurrent_dnf_processes[@]}" -gt 0 ]] || return 0
+    local concurrent_dnf_summary
+    concurrent_dnf_summary=$(join_with "; " "${concurrent_dnf_processes[@]}")
+    log_warning "another dnf command is running (${concurrent_dnf_summary}) - this run waits for the dnf lock"
+    send_wall_message "dnf-automatic-reboot: WARNING - dnf is already running (${concurrent_dnf_summary})." \
+                      "Automatic update will wait for the dnf lock. Do not reboot manually until this completes."
     return 0
 }
 
@@ -703,14 +754,7 @@ main() {
     fi
     warn_on_unsigned_repositories
 
-    # Detect concurrent dnf - warn but do not abort; dnf serialises via its
-    # own lock so this is safe.  The warning gives admins a chance to hold off.
-    if pgrep -x dnf > /dev/null 2>&1 || pgrep -x dnf-3 > /dev/null 2>&1 \
-       || pgrep -x dnf-automatic > /dev/null 2>&1; then
-        log_warning "dnf process already running - will contend on dnf lock"
-        send_wall_message "dnf-automatic-reboot: WARNING - manual dnf detected. Automatic update" \
-                          "will wait for the dnf lock. Do not reboot manually until this completes."
-    fi
+    warn_on_concurrent_dnf
 
     refresh_repository_metadata \
         || METADATA_REFRESH_FAILURE_SUMMARY=" (metadata refresh failed, cached metadata used)"

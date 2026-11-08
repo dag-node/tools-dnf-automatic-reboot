@@ -550,6 +550,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   minutes later, so it cannot hold the run open.
 - FIX: A repository with enabled=off, or any other spelling dnf reads as false, is no longer
   reported as an enabled unsigned repository.
+- FIX: dnf-makecache.timer's run no longer reads as a manual dnf command. The warning names
+  each other dnf process by PID and cgroup, never by its arguments, which can carry a
+  password.
 - DOCS: dnf-automatic-reboot.timer explains how to override the schedule and how far apart runs
   must stay, with three-a-day schedules weighted on the US, Asia, the EU or global traffic.
 

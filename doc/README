@@ -21,7 +21,10 @@ Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
   - An independent watchdog timer stops a run whose processes have read
     and written nothing for too long, and leaves a working run alone
     however long it takes.  It never reboots; see "Fixed limits".
-  - Detects concurrent manual dnf invocations and warns logged-in users.
+  - Names, by PID and cgroup, any dnf command already running and warns
+    logged-in users; dnf-makecache.service, the distribution's metadata
+    timer, is left out.  Arguments are never shown: they can carry a
+    password.
   - Refuses to run while /etc/dnf/automatic-reboot.conf has an error; see
     "Configuration".
 

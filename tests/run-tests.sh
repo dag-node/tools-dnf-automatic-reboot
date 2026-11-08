@@ -1475,6 +1475,57 @@ test_run_update_runs_inside_the_inhibitor() {
         "dnf-automatic is the lock's own command, with no deadline between them"
 }
 
+# make_dnf_process PID CGROUP ARGUMENT... -> a /proc entry for a dnf process
+# in CGROUP, as /proc/PID/cgroup names it, running ARGUMENT...
+make_dnf_process() {
+    local process_id="$1" control_group="$2"
+    shift 2
+    mkdir -p "${TEST_ROOT_DIR}/proc/${process_id}"
+    printf '0::%s\n' "${control_group}" > "${TEST_ROOT_DIR}/proc/${process_id}/cgroup"
+    printf '%s\0' "$@" > "${TEST_ROOT_DIR}/proc/${process_id}/cmdline"
+}
+
+test_run_concurrent_makecache_is_not_reported() {
+    load_run_library
+    # dnf-makecache.timer's run shares the process name dnf with every command.
+    make_dnf_process 4242 /system.slice/dnf-makecache.service \
+        /usr/bin/python3 /usr/bin/dnf makecache --timer
+    pgrep() { printf '4242 dnf\n'; }
+    assert_equals "" "$(warn_on_concurrent_dnf 2>&1)" "the metadata timer is not reported"
+    assert_equals "" "$(cat "${STUB_LOG}")" "and no wall message is sent"
+}
+
+test_run_concurrent_makecache_is_recognised_on_cgroup_v1() {
+    load_run_library
+    # EL8's per-controller cgroup file, as read on RHEL 8.10.
+    mkdir -p "${TEST_ROOT_DIR}/proc/4242"
+    printf '%s\n' '12:cpuset:/' '8:memory:/system.slice/dnf-makecache.service' \
+        '1:name=systemd:/system.slice/dnf-makecache.service' > "${TEST_ROOT_DIR}/proc/4242/cgroup"
+    pgrep() { printf '4242 dnf\n'; }
+    assert_equals "" "$(warn_on_concurrent_dnf 2>&1)" "the metadata timer is not reported"
+}
+
+test_run_concurrent_dnf_command_is_named_without_arguments() {
+    load_run_library
+    make_dnf_process 4242 /system.slice/dnf-makecache.service \
+        /usr/bin/python3 /usr/bin/dnf makecache --timer
+    # Arguments can carry a credential, and the warning reaches every user.
+    make_dnf_process 4343 /user.slice/user-1000.slice/session-3.scope \
+        /usr/bin/python3 /usr/bin/dnf --setopt=proxy_password=placeholder-secret upgrade
+    # 4444 exited between the listing and the read.
+    pgrep() { printf '4242 dnf\n4343 dnf\n4444 dnf\n'; }
+    local reported
+    reported=$(warn_on_concurrent_dnf 2>&1)
+    assert_contains "${reported}" "pid 4343 dnf in /user.slice/user-1000.slice/session-3.scope" \
+        "the process is named by pid, name and cgroup"
+    assert_not_contains "${reported} $(cat "${STUB_LOG}" "${LOG_FILE}" 2>/dev/null)" "placeholder-secret" \
+        "no argument reaches the journal, the log file or the wall message"
+    assert_not_contains "${reported}" "4242" "the metadata timer is left out"
+    assert_not_contains "${reported}" "4444" "a process gone is left out"
+    assert_contains "$(cat "${STUB_LOG}")" "wall dnf-automatic-reboot: WARNING - dnf is already running" \
+        "logged-in users are told"
+}
+
 # ---------------------------------------------------------------------------
 # services: restarting the wrong unit takes the host down
 # ---------------------------------------------------------------------------
@@ -3960,6 +4011,9 @@ run_test "decision: temporary file failure removes nothing" test_decision_tempor
 printf 'run\n'
 run_test "run: refused inhibitor stops the update"   test_run_refused_inhibitor_stops_the_update
 run_test "run: update runs inside the inhibitor"     test_run_update_runs_inside_the_inhibitor
+run_test "run: concurrent makecache is not reported" test_run_concurrent_makecache_is_not_reported
+run_test "run: concurrent makecache on cgroup v1"    test_run_concurrent_makecache_is_recognised_on_cgroup_v1
+run_test "run: concurrent dnf named without arguments" test_run_concurrent_dnf_command_is_named_without_arguments
 run_test "run: helper failure fails the run"        test_run_helper_failure_fails_the_run
 run_test "run: scheduled reboot holds update runs"   test_run_scheduled_reboot_holds_update_runs
 run_test "run: failed schedule removes its marker"   test_run_failed_schedule_removes_its_marker
