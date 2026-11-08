@@ -548,6 +548,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   RPM runs it after every install and upgrade. The file is not edited.
 - FIX: A dnf query or a service restart that ignores SIGTERM at its timeout is killed five
   minutes later, so it cannot hold the run open.
+- FIX: A repository with enabled=off, or any other spelling dnf reads as false, is no longer
+  reported as an enabled unsigned repository.
 - DOCS: dnf-automatic-reboot.timer explains how to override the schedule and how far apart runs
   must stay, with three-a-day schedules weighted on the US, Asia, the EU or global traffic.
 

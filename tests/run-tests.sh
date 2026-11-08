@@ -1553,6 +1553,20 @@ test_repositories_unsigned_but_disabled_is_ignored() {
         "disabled repo is not reported"
 }
 
+test_repositories_every_false_spelling_is_disabled() {
+    load_run_library
+    mkdir -p "${TEST_ROOT_DIR}/etc/yum.repos.d"
+    # libdnf's OptionBool reads off and no, in any case, as false.
+    printf '[off_lower]\nenabled=off\ngpgcheck=0\n[off_mixed]\nenabled = Off\ngpgcheck=0\n[no_upper]\nenabled=NO\ngpgcheck=0\n[on_unsigned]\nenabled=on\ngpgcheck=0\n' \
+        > "${TEST_ROOT_DIR}/etc/yum.repos.d/test.repo"
+    local reported
+    reported=$(warn_on_unsigned_repositories 2>&1)
+    assert_not_contains "${reported}" "off_lower" "enabled=off is disabled"
+    assert_not_contains "${reported}" "off_mixed" "enabled = Off is disabled"
+    assert_not_contains "${reported}" "no_upper" "enabled=NO is disabled"
+    assert_contains "${reported}" "on_unsigned" "enabled=on is still reported"
+}
+
 test_repositories_all_signed_is_silent() {
     load_run_library
     mkdir -p "${TEST_ROOT_DIR}/etc/yum.repos.d"
@@ -3961,6 +3975,7 @@ run_test "run: service restarts stay supervised"    test_run_service_restarts_st
 printf 'repositories\n'
 run_test "repositories: unsigned enabled repo is reported"  test_repositories_unsigned_enabled_is_reported
 run_test "repositories: unsigned but disabled is ignored"   test_repositories_unsigned_but_disabled_is_ignored
+run_test "repositories: every false spelling is disabled"   test_repositories_every_false_spelling_is_disabled
 run_test "repositories: all signed is silent"               test_repositories_all_signed_is_silent
 
 printf 'advisories\n'

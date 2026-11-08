@@ -121,8 +121,8 @@ warn_on_unsigned_repositories() {
     unsigned_repository_ids=$(awk '
         function section_is_unsigned() {
             if (section_name == "") return 0
-            if (section_enabled == "0" || section_enabled == "False" \
-                || section_enabled == "false" || section_enabled == "no") return 0
+            # The false values of the libdnf OptionBool, in any case.
+            if (tolower(section_enabled) ~ /^(0|no|false|off)$/) return 0
             return section_gpgcheck == "0"
         }
         function read_value(line,   value) {

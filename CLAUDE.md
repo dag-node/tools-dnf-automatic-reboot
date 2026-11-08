@@ -753,7 +753,8 @@ an unsigned repository is a code path nobody is watching, so it must at least be
 loud.
 
 The check reads `/etc/yum.repos.d/*.repo` and `/etc/dnf/dnf.conf` and reports
-only an explicit `gpgcheck=0` in a section that is not explicitly disabled. dnf's
+only an explicit `gpgcheck=0` in a section that is not explicitly disabled, `enabled=`
+taking libdnf's false values (`0`, `no`, `false`, `off`, in any case). dnf's
 own default is deliberately not modelled: a check that reports repositories which
 are in fact fine becomes a check operators learn to ignore. It reports and
 continues rather than aborting — a local unsigned repository is somebody's
