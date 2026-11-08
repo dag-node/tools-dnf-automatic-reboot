@@ -285,16 +285,14 @@ Repository metadata freshness
   grep -E 'has expired|using cache for' /var/log/dnf.log | tail -20
 
 
-Advisories dnf will not apply
-------------------------------
+Advisories an update did not install
+------------------------------------
 
-  After each update, any security advisory that applies to this host but that
-  dnf refuses to install is reported at error level and to wall(1).
-
-  dnf updateinfo reads the whole package sack; the depsolver does not.  A
-  repository priority=, an excludepkgs=, a disabled channel or a versionlock
-  leaves an advisory permanently visible-but-unappliable while every run
-  reports success and the host stays unpatched.
+  After each successful update, every security advisory that still applies
+  to this host is reported at error level and to wall(1), with the packages
+  it names: the update just run did not install it.  A repository priority=,
+  an excludepkgs=, a versionlock or a dependency dnf cannot satisfy keeps it
+  out while every run reports success and the host stays unpatched.
 
   Repository priority is the common cause.  From dnf.conf(5): "If there is
   more than one candidate package for a particular operation, the one from a
@@ -306,9 +304,8 @@ Advisories dnf will not apply
   kernel* are different package names and never compete, so UEK needs none.
 
   # Diagnose a report
-  dnf updateinfo list --updates --security      # what dnf says applies
-  dnf check-update --security; echo "rc=$?"     # 100 = actionable, 0 = nothing
-  dnf --assumeno --setopt='*.priority=99' update --security
+  dnf --disableexcludes=all updateinfo list --updates --security   # what applies
+  dnf --assumeno --disableexcludes=all --setopt='*.priority=99' update --security
 
   # If levelling priorities surfaces the updates, remove priority= from the
   # distribution repositories.  Keep it only on third-party repos (EPEL).

@@ -200,8 +200,7 @@ STUB
 
     # dnf ... needs-restarting -r prints STUB_NEEDS_RESTARTING_OUTPUT and exits
     # STUB_NEEDS_RESTARTING_RC; -s prints STUB_STALE_SERVICES.
-    # updateinfo prints STUB_SECURITY_ADVISORIES; check-update exits
-    # STUB_CHECK_UPDATE_RC (100 = upgrades available, 0 = none).
+    # updateinfo prints STUB_SECURITY_ADVISORIES.
     cat > "${TEST_ROOT_DIR}/usr/bin/dnf" <<'STUB'
 #!/bin/bash
 printf 'dnf %s\n' "$*" >> "${STUB_LOG}"
@@ -209,9 +208,6 @@ for argument in "$@"; do
     if [[ "${argument}" == "updateinfo" ]]; then
         printf '%s\n' "${STUB_SECURITY_ADVISORIES:-}"
         exit 0
-    fi
-    if [[ "${argument}" == "check-update" ]]; then
-        exit "${STUB_CHECK_UPDATE_RC:-0}"
     fi
     if [[ "${argument}" == "-s" ]]; then
         printf '%s\n' "${STUB_STALE_SERVICES:-}"
@@ -1669,83 +1665,135 @@ test_repositories_all_signed_is_silent() {
 # ---------------------------------------------------------------------------
 # advisories: an advisory dnf refuses to install must never pass as success
 # ---------------------------------------------------------------------------
-test_advisories_unappliable_is_an_error() {
+# stub_advisory_listing: the advisory listing, run under timeout, prints
+# STUB_SECURITY_ADVISORIES and exits STUB_UPDATEINFO_RC; every call is
+# recorded, and any other dnf query fails.
+stub_advisory_listing() {
+    timeout() {
+        printf 'timeout %s\n' "$*" >> "${STUB_LOG}"
+        if [[ "$*" == *updateinfo* ]]; then
+            printf '%s\n' "${STUB_SECURITY_ADVISORIES:-}"
+            return "${STUB_UPDATEINFO_RC:-0}"
+        fi
+        return 1
+    }
+}
+
+test_advisories_left_after_the_run_are_an_error() {
     load_run_library
-    # What gw looked like: updateinfo names two advisories, the depsolver
-    # resolves to nothing because a repository priority= masks the newer build.
+    stub_advisory_listing
+    # What gw looked like: a repository priority= masked the newer builds, and
+    # the run reported success.
     export STUB_SECURITY_ADVISORIES="ELSA-2026-26533 Important/Sec. dracut-057-115.git20260527.0.1.el9_8.aarch64
 ELSA-2025-15874 Moderate/Sec.  python3-cryptography-36.0.1-5.el9_6.aarch64"
-    export STUB_CHECK_UPDATE_RC=0
     local reported
     reported=$(warn_on_unapplied_security_advisories 2>&1)
-    # sort -u, so the order is deterministic rather than dnf's output order.
-    assert_contains "${reported}" "ELSA-2025-15874,ELSA-2026-26533" "both advisory ids named"
-    assert_contains "${reported}" "will not install" "reported at error level"
+    assert_contains "${reported}" \
+        "did not install them: ELSA-2025-15874 (python3-cryptography-36.0.1-5.el9_6.aarch64); ELSA-2026-26533 (dracut-057-115.git20260527.0.1.el9_8.aarch64)" \
+        "each advisory is named at error level, with its package"
+    assert_contains "$(cat "${STUB_LOG}")" "wall dnf-automatic-reboot: WARNING - security advisories (ELSA-2025-15874,ELSA-2026-26533)" \
+        "logged-in users are told"
+}
+
+test_advisories_every_package_of_an_advisory_is_named() {
+    load_run_library
+    stub_advisory_listing
+    # One advisory, two packages: excludepkgs= keeps one out while the other
+    # could be installed, and both rows stay listed after the run.
+    export STUB_SECURITY_ADVISORIES="ELSA-2026-30001 Important/Sec. openssl-3.5.1-4.el9_8.aarch64
+ELSA-2026-30001 Important/Sec. openssl-libs-3.5.1-4.el9_8.aarch64"
+    assert_contains "$(warn_on_unapplied_security_advisories 2>&1)" \
+        "ELSA-2026-30001 (openssl-3.5.1-4.el9_8.aarch64, openssl-libs-3.5.1-4.el9_8.aarch64)" \
+        "every package row is reported"
 }
 
 test_advisories_red_hat_colon_ids_are_matched() {
     load_run_library
+    stub_advisory_listing
     # Red Hat's id shape, as listed on a RHEL 8 host.  A dash-only pattern
     # matched none of these, so the warning never fired on RHEL.
     export STUB_SECURITY_ADVISORIES="RHSA-2020:3011              Moderate/Sec.  NetworkManager-1:1.22.8-5.el8_2.x86_64"
-    export STUB_CHECK_UPDATE_RC=0
-    assert_contains "$(warn_on_unapplied_security_advisories 2>&1)" "RHSA-2020:3011" \
-        "a colon-separated advisory id is reported"
+    assert_contains "$(warn_on_unapplied_security_advisories 2>&1)" \
+        "RHSA-2020:3011 (NetworkManager-1:1.22.8-5.el8_2.x86_64)" "a colon-separated advisory id is reported"
 }
 
 test_advisories_oracle_revision_suffix_is_matched() {
     load_run_library
+    stub_advisory_listing
     # Oracle's id with a revision suffix, as listed on an OL9 host.
     export STUB_SECURITY_ADVISORIES="ELSA-2026-60226-0 Moderate/Sec.  attr-2.6.0-1.el9_8.aarch64"
-    export STUB_CHECK_UPDATE_RC=0
-    assert_contains "$(warn_on_unapplied_security_advisories 2>&1)" "ELSA-2026-60226-0" \
+    assert_contains "$(warn_on_unapplied_security_advisories 2>&1)" "ELSA-2026-60226-0 (attr-2.6.0-1.el9_8.aarch64)" \
         "an advisory id with a revision suffix is reported"
 }
 
 test_advisories_epel_ids_are_matched() {
     load_run_library
+    stub_advisory_listing
     # EPEL's id form: dash-joined prefix, hexadecimal number; listed with the
     # leading spaces an updateinfo line for a pending advisory carries.
     export STUB_SECURITY_ADVISORIES="  FEDORA-EPEL-2024-bf31852fe0 Moderate/Sec.  w3m-0.5.3-63.git20230121.el8.x86_64"
-    export STUB_CHECK_UPDATE_RC=0
     assert_contains "$(warn_on_unapplied_security_advisories 2>&1)" "FEDORA-EPEL-2024-bf31852fe0" \
         "an EPEL advisory id is reported"
 }
 
-test_advisories_still_pending_is_only_a_warning() {
+test_advisories_odd_package_field_still_reports_the_advisory() {
     load_run_library
-    export STUB_SECURITY_ADVISORIES="ELSA-2026-26533 Important/Sec. dracut-057-115.el9_8.aarch64"
-    export STUB_CHECK_UPDATE_RC=100
-    # 100 means dnf can still install them, so this is not the stuck case.
-    assert_not_contains "$(warn_on_unapplied_security_advisories 2>&1)" "will not install" \
-        "appliable advisories are not an error"
+    stub_advisory_listing
+    export STUB_SECURITY_ADVISORIES="ELSA-2026-26533 Important/Sec. dracut<057>"
+    assert_contains "$(warn_on_unapplied_security_advisories 2>&1)" "ELSA-2026-26533 (?)" \
+        "the advisory is reported, the field of another shape is not"
 }
 
 test_advisories_none_is_silent() {
     load_run_library
+    stub_advisory_listing
     export STUB_SECURITY_ADVISORIES=""
-    export STUB_CHECK_UPDATE_RC=0
     assert_equals "" "$(warn_on_unapplied_security_advisories 2>&1)" "nothing to report"
 }
 
 test_advisories_ignores_non_advisory_lines() {
     load_run_library
+    stub_advisory_listing
     # Only PREFIX-YEAR-NUMBER shaped first fields count, so a stray metadata or
     # warning line cannot be reported as an advisory id.
     export STUB_SECURITY_ADVISORIES="Last metadata expiration check: 0:00:02 ago on Fri 31 Jul 2026.
 ELSA-2026-26533 Important/Sec. dracut-057-115.el9_8.aarch64"
-    export STUB_CHECK_UPDATE_RC=0
     local reported
     reported=$(warn_on_unapplied_security_advisories 2>&1)
     assert_contains "${reported}" "ELSA-2026-26533" "real advisory reported"
     assert_not_contains "${reported}" "metadata" "header line is not an advisory"
 }
 
+test_advisories_one_listing_ignores_exclusions() {
+    load_run_library
+    stub_advisory_listing
+    # excludepkgs= takes the package out of the sack, and updateinfo --updates
+    # lists only what the sack offers.  The run that just finished is the
+    # transaction check, so no other dnf query is made.
+    export STUB_SECURITY_ADVISORIES="ELSA-2026-26533 Important/Sec. openssl-3.5.1-4.el9_8.aarch64"
+    warn_on_unapplied_security_advisories >/dev/null 2>&1
+    assert_contains "$(grep '^timeout' "${STUB_LOG}")" "--disableexcludes=all updateinfo list --updates --security" \
+        "the listing ignores excludepkgs="
+    assert_equals "1" "$(grep -c '^timeout' "${STUB_LOG}")" "one bounded dnf query"
+}
+
+test_advisories_failed_listing_is_reported_as_incomplete() {
+    load_run_library
+    stub_advisory_listing
+    # 124: the listing ran out of time.
+    export STUB_SECURITY_ADVISORIES="ELSA-2026-26533 Important/Sec. dracut-057-115.el9_8.aarch64" STUB_UPDATEINFO_RC=124
+    local reported
+    reported=$(warn_on_unapplied_security_advisories 2>&1)
+    assert_contains "${reported}" "dnf updateinfo exited 124" "the failure is named"
+    assert_contains "${reported}" "incomplete" "the report says it is incomplete"
+    assert_not_contains "${reported}" "did not install" "a partial listing is not reported as advisories"
+}
+
 test_advisories_disabled_by_config() {
     load_run_library
+    stub_advisory_listing
     WARN_UNAPPLIED_ADVISORIES=no
     export STUB_SECURITY_ADVISORIES="ELSA-2026-26533 Important/Sec. dracut-057-115.el9_8.aarch64"
-    export STUB_CHECK_UPDATE_RC=0
     assert_equals "" "$(warn_on_unapplied_security_advisories 2>&1)" "silent when disabled"
 }
 
@@ -4109,13 +4157,16 @@ run_test "repositories: every false spelling is disabled"   test_repositories_ev
 run_test "repositories: all signed is silent"               test_repositories_all_signed_is_silent
 
 printf 'advisories\n'
-run_test "advisories: unappliable advisory is an error"   test_advisories_unappliable_is_an_error        needs-exec
-run_test "advisories: red hat colon ids are matched"      test_advisories_red_hat_colon_ids_are_matched  needs-exec
-run_test "advisories: oracle revision suffix is matched" test_advisories_oracle_revision_suffix_is_matched needs-exec
-run_test "advisories: epel ids are matched"               test_advisories_epel_ids_are_matched          needs-exec
-run_test "advisories: still pending is only a warning"    test_advisories_still_pending_is_only_a_warning needs-exec
-run_test "advisories: none is silent"                     test_advisories_none_is_silent                 needs-exec
-run_test "advisories: ignores non-advisory lines"         test_advisories_ignores_non_advisory_lines     needs-exec
+run_test "advisories: left after the run are an error"   test_advisories_left_after_the_run_are_an_error
+run_test "advisories: every package of one is named"     test_advisories_every_package_of_an_advisory_is_named
+run_test "advisories: red hat colon ids are matched"      test_advisories_red_hat_colon_ids_are_matched
+run_test "advisories: oracle revision suffix is matched" test_advisories_oracle_revision_suffix_is_matched
+run_test "advisories: epel ids are matched"               test_advisories_epel_ids_are_matched
+run_test "advisories: odd package field still reported"   test_advisories_odd_package_field_still_reports_the_advisory
+run_test "advisories: none is silent"                     test_advisories_none_is_silent
+run_test "advisories: ignores non-advisory lines"         test_advisories_ignores_non_advisory_lines
+run_test "advisories: one listing ignores exclusions"     test_advisories_one_listing_ignores_exclusions
+run_test "advisories: failed listing is incomplete"       test_advisories_failed_listing_is_reported_as_incomplete
 run_test "advisories: disabled by config"                 test_advisories_disabled_by_config
 
 printf 'conflicts\n'

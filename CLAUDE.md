@@ -765,30 +765,34 @@ deliberate choice, and refusing to patch the host is the worse outcome.
 is filtered to existing paths first. Passing an unexpanded glob would have the
 same effect.
 
-## Advisories dnf will not apply
+## Advisories an update did not install
 
-`run.sh` reports, after each update, any security advisory that applies to this
-host but that dnf refuses to install.
+`run.sh` reports, after each update, every security advisory that applies to this
+host but that the update did not install.
 
-`dnf updateinfo` reads the whole package sack; the depsolver does not. A
-repository `priority=`, an `excludepkgs=`, a disabled channel or a versionlock
-can leave an advisory permanently visible-but-unappliable, and the update run
+A repository `priority=`, an `excludepkgs=`, a versionlock or a dependency dnf cannot
+satisfy can keep an advisory's update off the host for good, and the update run
 reports success either way. The host simply never receives the fix, and nothing
 says so — the same class of silent failure this package exists to prevent, one
 layer further down.
 
-The check compares what dnf itself reports as applicable
-(`updateinfo list --updates --security`) against whether a security transaction
-resolves to anything (`check-update --security`, exit 100 = yes, 0 = none). That
-catches any cause without enumerating causes. It runs *after* `dnf-automatic`,
-where anything still outstanding is genuinely stuck rather than merely pending.
+The check runs only after `dnf-automatic` has exited 0, set by the gate to download and
+install every update of its `upgrade_type`. That run is the transaction check: an
+advisory still listed by `--disableexcludes=all updateinfo list --updates --security`
+afterwards is one dnf did not install, whatever kept it out, so no cause is
+enumerated and no second transaction is resolved. `check-update` would not do: it
+lists updates without resolving a transaction, and its exit 100 means any one is
+listed. `--updates` lists only packages the sack offers, and `excludepkgs=` takes
+packages out of the sack, hence `--disableexcludes=all`; versionlock filters only
+while dnf resolves a transaction, which `updateinfo` does not. Every package row is
+reported, as `ID (PACKAGE, PACKAGE)`: one advisory can cover several packages and only
+some be kept out. It is one query under `dnf_query_timeout_seconds`; a listing that
+fails is logged as an incomplete report, not read as "nothing outstanding".
 Advisory IDs are matched by shape (`PREFIX-YEAR-NUMBER` as Oracle's `ELSA-2026-26533`,
 `PREFIX-YEAR:NUMBER` as Red Hat's `RHSA-2020:3011`, either with an optional `-REVISION`
 as Oracle's `ELSA-2026-60226-0`; EPEL's `FEDORA-EPEL-2024-bf31852fe0` has a dash-joined
-prefix and a hexadecimal number), so a line of any other shape in
-the output is not reported as an advisory. Known gap: `check-update --security`
-exits 100 when any security update is installable, so a stuck advisory next to an
-installable one is logged as outstanding at warning level, not at error level.
+prefix and a hexadecimal number), so a line of any other shape in the output is not
+reported as an advisory; a package field of another shape reports the advisory with `?`.
 
 **Repository priority is the trap to know.** `dnf.conf(5)`: *"If there is more
 than one candidate package for a particular operation, the one from a repo with
@@ -801,10 +805,9 @@ and `kernel*` are distinct package names and never compete, so UEK needs no
 priority.
 
 ```bash
-# Does anything apply that dnf will not install?
-dnf updateinfo list --updates --security      # what dnf says applies
-dnf check-update --security; echo "rc=$?"     # 100 = actionable, 0 = nothing
-dnf --assumeno --setopt='*.priority=99' update --security   # levels priorities
+# What applies that the last run did not install, and what keeps it out
+dnf --disableexcludes=all updateinfo list --updates --security
+dnf --assumeno --disableexcludes=all --setopt='*.priority=99' update --security
 ```
 
 ## Repository metadata is refreshed before every update

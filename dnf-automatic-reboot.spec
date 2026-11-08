@@ -579,6 +579,12 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   too. The refusal names the four lines to set under [commands]: upgrade_type = default (or
   security), download_updates = yes, apply_updates = yes, reboot = never. On EL8, whose
   dnf-automatic has no reboot setting, reboot is no longer checked.
+- FIX: Every security advisory that still applies after a successful update is reported at
+  error level and to logged-in users, with each package it names, whatever kept it out:
+  excludepkgs=, a repository priority=, a versionlock or a dependency dnf cannot satisfy.
+  1.5.0 left out an advisory whose package excludepkgs= kept out, and only warned about one
+  listed next to any installable update. A listing that fails or runs out of time is
+  reported as an incomplete report.
 - FIX: A repository with enabled=off, or any other spelling dnf reads as false, is no longer
   reported as an enabled unsigned repository.
 - FIX: dnf-makecache.timer's run no longer reads as a manual dnf command. The warning names

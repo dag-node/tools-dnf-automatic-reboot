@@ -520,55 +520,61 @@ join_with() {
 }
 
 # ---------------------------------------------------------------------------
-# Post-update: report security advisories dnf will not apply.
+# Post-update: report security advisories this run did not install.
 #
-# `dnf updateinfo` reads the whole package sack; the depsolver does not.  A
-# repository priority=, an excludepkgs=, a disabled channel or a versionlock
-# can leave an advisory permanently visible-but-unappliable.  The update run
-# reports success either way, so the host quietly never receives the fix - the
-# exact failure this whole package exists to prevent, one layer further down.
+# A repository priority=, an excludepkgs=, a versionlock or a dependency dnf
+# cannot satisfy can keep an advisory's update off the host for good, and the
+# update run reports success either way, so the host quietly never receives the
+# fix - the failure this package exists to prevent, one layer further down.
 #
-# Run after dnf-automatic, where anything still outstanding is genuinely stuck
-# rather than merely pending.  The comparison is between what dnf itself says
-# applies to this host and whether a security transaction resolves to anything,
-# so any cause is caught without having to enumerate them.
+# Called only after dnf-automatic exited 0, set (check_conflicts) to download
+# and install every update of its upgrade_type.  That run is the transaction
+# check: a security advisory still listed for an installed package afterwards
+# is one dnf did not install, whatever kept it out, so no cause is enumerated
+# and no second transaction is resolved.  `--updates` lists only packages the
+# sack offers, and excludepkgs= removes packages from the sack, so the listing
+# runs with --disableexcludes=all; versionlock filters only while dnf resolves
+# a transaction, which updateinfo does not.  Every package row is reported, as
+# one advisory can cover several packages and only some be kept out.  One
+# query, under one timeout; a listing that fails is reported as incomplete.
 # ---------------------------------------------------------------------------
 warn_on_unapplied_security_advisories() {
-    local pending_advisory_ids check_update_exit_code=0
+    local advisory_listing listing_exit_code=0 unapplied_advisories unapplied_advisory_ids
 
     [[ "${WARN_UNAPPLIED_ADVISORIES}" == "yes" ]] || return 0
 
-    # Advisory IDs are matched by shape, PREFIX-YEAR-NUMBER or PREFIX-YEAR:NUMBER
-    # with an optional `-REVISION`, the prefix one or more dash-joined words and
-    # the number alphanumeric (Oracle ELSA-2026-26533 and ELSA-2026-60226-0,
-    # Red Hat RHSA-2020:3011, EPEL FEDORA-EPEL-2024-bf31852fe0), not by excluding
-    # header text, so a line of any other shape is not reported as an advisory.
-    pending_advisory_ids=$(timeout --kill-after="${KILL_GRACE_SECONDS}s" "${DNF_QUERY_TIMEOUT_SECONDS}s" \
-        "${DNF_BIN}" -q -C updateinfo list --updates --security 2>/dev/null \
-        | awk 'NF >= 3 && $1 ~ /^[A-Za-z]+(-[A-Za-z]+)*-[0-9]+[-:][0-9A-Za-z]+(-[0-9]+)?$/ { print $1 }' \
-        | sort -u | paste -sd, -) || true
-
-    [[ -n "${pending_advisory_ids}" ]] || return 0
-
-    # check-update: 100 = upgrades available, 0 = none, anything else = failure.
-    timeout --kill-after="${KILL_GRACE_SECONDS}s" "${DNF_QUERY_TIMEOUT_SECONDS}s" \
-        "${DNF_BIN}" -q -C check-update --security >/dev/null 2>&1 \
-        || check_update_exit_code=$?
-
-    if [[ "${check_update_exit_code}" -eq 100 ]]; then
-        log_warning "security advisories still outstanding after this run: ${pending_advisory_ids}"
+    advisory_listing=$(timeout --kill-after="${KILL_GRACE_SECONDS}s" "${DNF_QUERY_TIMEOUT_SECONDS}s" \
+        "${DNF_BIN}" -q -C --disableexcludes=all updateinfo list --updates --security 2>/dev/null) \
+        || listing_exit_code=$?
+    if [[ "${listing_exit_code}" -ne 0 ]]; then
+        log_warning "could not list the security advisories that apply to this host (dnf updateinfo exited ${listing_exit_code}); this run's report of uninstalled advisories is incomplete"
         return 0
     fi
 
-    if [[ "${check_update_exit_code}" -ne 0 ]]; then
-        log_warning "could not confirm whether ${pending_advisory_ids} are appliable (dnf check-update exited ${check_update_exit_code})"
-        return 0
-    fi
+    # Rows are matched by shape, not by excluding header text, so a line of any
+    # other shape is not reported.  An advisory ID is PREFIX-YEAR-NUMBER or
+    # PREFIX-YEAR:NUMBER with an optional `-REVISION`, the prefix one or more
+    # dash-joined words and the number alphanumeric (Oracle ELSA-2026-26533 and
+    # ELSA-2026-60226-0, Red Hat RHSA-2020:3011, EPEL
+    # FEDORA-EPEL-2024-bf31852fe0); the package is the row's last field, an
+    # NEVRA of rpm's characters, or `?` when it is of another shape, so the
+    # advisory is still reported.  Prints `ID (PACKAGE, PACKAGE)` per advisory.
+    unapplied_advisories=$(printf '%s\n' "${advisory_listing}" | awk '
+        NF >= 3 && $1 ~ /^[A-Za-z]+(-[A-Za-z]+)*-[0-9]+[-:][0-9A-Za-z]+(-[0-9]+)?$/ {
+            print $1 "\t" ($NF ~ /^[A-Za-z0-9._+~^:-]+$/ ? $NF : "?")
+        }
+    ' | sort -u | awk -F'\t' '
+        $1 != advisory_id { if (advisory_id != "") print advisory_id " (" packages ")"; advisory_id = $1; packages = $2; next }
+        { packages = packages ", " $2 }
+        END { if (advisory_id != "") print advisory_id " (" packages ")" }
+    ')
+    [[ -n "${unapplied_advisories}" ]] || return 0
 
-    log_error "security advisories apply to this host but dnf will not install them: ${pending_advisory_ids} - the host stays unpatched and every run will report success; check repository priority=, excludepkgs=, disabled repositories and versionlock"
-    send_wall_message "dnf-automatic-reboot: WARNING - security advisories (${pending_advisory_ids})" \
-                      "apply to this host but dnf refuses to install them. Updates are NOT complete." \
-                      "Diagnose: dnf --assumeno --setopt='*.priority=99' update --security"
+    unapplied_advisory_ids=$(printf '%s\n' "${unapplied_advisories}" | awk '{ print $1 }' | paste -sd, -)
+    log_error "security advisories apply to this host but this run did not install them: $(printf '%s\n' "${unapplied_advisories}" | paste -sd';' - | sed 's/;/; /g') - the host stays unpatched while every run reports success; check excludepkgs=, repository priority=, versionlock and dnf's dependency errors"
+    send_wall_message "dnf-automatic-reboot: WARNING - security advisories (${unapplied_advisory_ids})" \
+                      "apply to this host but were not installed. Updates are NOT complete." \
+                      "Diagnose: dnf --assumeno --disableexcludes=all --setopt='*.priority=99' update --security"
     return 0
 }
 
