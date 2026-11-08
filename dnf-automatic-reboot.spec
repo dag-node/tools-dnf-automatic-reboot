@@ -493,59 +493,61 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 
 %changelog
 * Thu Oct 22 2026 DagNode <packages@dagnode.com> - 1.6.0-1
-- CHANGE: /etc/dnf/automatic-reboot.conf is replaced by a simpler one whose defaults suit an
-  unattended host, a Raspberry Pi without a battery-backed clock included, without edits. Its
-  settings: restart_services, restart_services_excluded_patterns,
-  service_restart_timeout_seconds, metadata_refresh_timeout_seconds, dnf_query_timeout_seconds,
-  warn_unsigned_repositories, warn_unapplied_advisories, require_clock_sync and
-  clock_sync_timeout_seconds. The reboot warning, the reboot retries, the kernel and GRUB
-  default checks, the metadata refresh and the service exclusions that protect the host always
-  apply. A mistake in the file stops update runs and reboots, and the failure notice names the
-  line, instead of leaving a default in force. An edited copy is kept on upgrade, with the new
-  file beside it as .rpmnew and the commands to replace it.
+- CHANGE: The host is never rebooted while packages are still installing. In 1.5.0,
+  dnf-automatic was stopped after 60 minutes and any remaining process was killed after 180
+  minutes. Long upgrades (e.g. the next minor EL release on a Raspberry Pi, or a slow download)
+  could be aborted with packages half-installed; with force_reboot_on_hard_timeout = yes the
+  watchdog then rebooted the host. The watchdog now only
+  stops a run whose own processes have shown no I/O for one hour before installation begins,
+  three hours while packages install, or one hour during the reboot check. Other dnf commands
+  do not keep a hung run alive. The watchdog itself never reboots. When it stops a run that may
+  have left packages half-installed, the alert names dnf history info last and dnf check; the
+  next run decides whether a reboot is needed.
+- CHANGE: The package now requires rpm-plugin-systemd-inhibit. Without it a package transaction
+  does not hold a shutdown inhibitor, so a scheduled reboot could interrupt a manual
+  transaction. With the plugin the reboot waits until the transaction finishes.
+- CHANGE: /etc/dnf/automatic-reboot.conf is reduced to the nine settings an operator actually
+  needs to change. Defaults are suitable for an unattended host (including a Raspberry Pi
+  without a battery-backed clock) with no editing required. All protective behaviour is always
+  active: metadata refresh before every run, reboot warning to logged-in users (with the cancel
+  command), every failure notice, kernel and GRUB default checks, verification and learning of
+  false reboot flags, chrony-wait.service, and the list of services that are never restarted.
+  A syntax or value error in the file prevents both update runs and reboots; the failure notice
+  names the offending line. An unedited 1.5.0 file is replaced on upgrade. An edited file is
+  left in place (the new version appears beside it as .rpmnew) and blocks every run until it is
+  replaced; check-config.sh prints the exact commands to do so.
+- CHANGE: Settings renamed (and tightened where noted):
+  restart_services_exclude -> restart_services_excluded_patterns (adds to the never-restart
+  list; empty by default);
+  restart_service_timeout_sec -> service_restart_timeout_seconds (range 10-900; 0 for unbounded
+  is no longer allowed);
+  needs_restarting_timeout_sec -> dnf_query_timeout_seconds;
+  metadata_refresh_timeout_sec -> metadata_refresh_timeout_seconds (default raised from 900 to
+  1800 for slow links);
+  clock_sync_wait_sec -> clock_sync_timeout_seconds.
+  Unchanged names: restart_services, warn_unsigned_repositories, warn_unapplied_advisories,
+  require_clock_sync.
+- CHANGE: Settings removed; behaviour is now fixed or always on.
+  Fixed values: reboot_delay_sec = 300 s, reboot_inhibited_wait_sec = 1800 s,
+  reboot_request_lock_wait_sec = 300 s, kill_grace_sec = 300 s,
+  watchdog_kill_confirm_sec = 300 s, kernel_reboot_attempt_limit = 3.
+  Always on: metadata refresh (refresh_metadata), kernel-version verification
+  (verify_kernel_version), GRUB-default verification (verify_grub_default), false-positive
+  learning (learn_false_positives), chrony-wait (enable_chrony_wait), wall messages
+  (wall_messages).
+  Built in: package filtering (filter_packages; running kernel packages checked by version,
+  systemd by build-id, everything else learned).
+  Replaced by the progress-based inactivity windows above: dnf_timeout_min,
+  watchdog_soft_timeout_min, watchdog_hard_timeout_min.
+  Gone: force_reboot_on_hard_timeout (watchdog never reboots) and always_reboot (a run reboots
+  only when an update actually requires it).
 - CHANGE: While the host would not boot its newest kernel, no reboot is requested for any
   update, and each run's alert names the repair. Real-time and 64k kernels are recognised.
-- CHANGE: Logged-in users always get the reboot warning, with the command that cancels it, and
-  every failure notice.
-- CHANGE: dnf-automatic-reboot.timer runs at 03:00 UTC instead of 03:00 local time, so the run
-  no longer moves with the host's time zone or daylight saving time. An override that clears
-  the default with an empty OnCalendar= keeps its own time. The timer does not start on a host
-  booted from rpm-ostree.
-- CHANGE: A run is stopped only when it stops making progress, never for its age, so a download
-  over a slow link or an upgrade to the next minor EL release on a Raspberry Pi runs to the end.
-  Progress is what the run's own processes read and write; other dnf commands do not keep a
-  hung run alive. A stalled run is stopped after an hour before anything is installed, after
-  three hours while it installs, and after an hour in its reboot check. The watchdog never
-  reboots: when it stops a run that may have half-installed packages it names
-  dnf history info last; dnf check, and after it stops a reboot check the next run decides.
-- CHANGE: The package requires rpm-plugin-systemd-inhibit. With it, an rpm transaction started
-  by hand holds the scheduled reboot until it ends, instead of being stopped halfway.
 - NEW: /usr/libexec/dnf-automatic-reboot/check-config.sh validates
   /etc/dnf/automatic-reboot.conf and lists every value that differs from the shipped one; the
   RPM runs it after every install and upgrade. The file is not edited.
-- NEW: When the watchdog stops a run whose rpm transaction may be incomplete, its message names
-  the commands that show what to repair: dnf history info last; dnf check.
-- FIX: A scheduled reboot goes ahead while users are logged in. systemctl reboot
-  --check-inhibitors=yes also refused while any other user had a session, so one open SSH login
-  failed the reboot after reboot_retry_timeout_seconds and held update runs until a manual reboot
-  or cancel-reboot.sh. The package now reads logind's block inhibitors itself; a package
-  transaction's inhibitor still holds the reboot, and the messages say why a reboot did not
-  start.
 - FIX: A dnf query or a service restart that ignores SIGTERM at its timeout is killed five
   minutes later, so it cannot hold the run open.
-- FIX: A failed clock check carries chronyc's last answer, so a chronyd that is not running no
-  longer reads like one that is still synchronising.
-- FIX: Failure notices name the failed unit as it is: every '-' in the name was printed as '/',
-  dnf/automatic/reboot.service, in the message and in the journalctl command it suggests. The
-  scheduled reboot's notice now says whether update runs are held.
-- FIX: A failure notice quotes only the journal lines of the run that failed; the unit's last
-  lines could reach into the run before.
-- FIX: Every run fetches current repository metadata (dnf makecache --refresh) before
-  dnf-automatic starts, within metadata_refresh_timeout_seconds (new, default 900).
-  dnf-automatic installed from the cache dnf-makecache.timer or metadata_expire had left, so
-  an advisory published since waited for the next run. A refresh that fails or runs out of
-  time is logged, the run continues from the cache, and the completion line says so.
-  refresh_metadata = no (new) turns the step off.
 - DOCS: dnf-automatic-reboot.timer explains how to override the schedule and how far apart runs
   must stay, with three-a-day schedules weighted on the US, Asia, the EU or global traffic.
 
@@ -564,6 +566,9 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   holds when upgrading from 1.4.0 while its watchdog has a reboot scheduled.
 - CHANGE: reboot_delay_sec defaults to 300, giving five minutes between the warning and the
   reboot to cancel it. An edited automatic-reboot.conf keeps its own value.
+- CHANGE: dnf-automatic-reboot.timer runs at 03:00 UTC instead of 03:00 local time, so the run
+  no longer moves with the host's time zone or daylight saving time. An OnCalendar= override
+  keeps its own time. The timer does not start on a host booted from rpm-ostree.
 - NEW: /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh cancels a pending reboot and allows
   update runs again; a timer that fires afterwards does not reboot. It exits 1 without
   changing anything while a reboot is being requested or carried out, once systemctl reboot
@@ -589,12 +594,13 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   most clock_sync_wait_sec (new, default 600, enforced with timeout); otherwise it fails. The
   package now requires chrony. The unit's ordering after
   time-sync.target did not require synchronisation to succeed, so a failed chrony-wait.service
-  let updates run with a wrong clock. require_clock_sync = no (new) turns the check off.
+  let updates run with a wrong clock. require_clock_sync = no (new) turns the check off. The
+  failure carries chronyc's last answer, which says whether chronyd answered at all.
 - FIX: The reboot respects shutdown inhibitors. From a service, systemctl reboot skipped the
   inhibitor check, so a package transaction started by hand during reboot_delay_sec could be cut
-  off. A refused reboot is retried every 30 seconds for reboot_inhibited_wait_sec (new, default
-  1800) and can be cancelled meanwhile. The watchdog no longer falls back to
-  systemctl reboot --force.
+  off. While a block inhibitor holds shutdown, the reboot is retried every 30 seconds for
+  reboot_inhibited_wait_sec (new, default 1800) and can be cancelled meanwhile. Logged-in users
+  do not hold it. The watchdog no longer falls back to systemctl reboot --force.
 - FIX: The watchdog no longer removes the state file of a run it did not inspect. run.sh wrote the
   file in place, and a watchdog reading it at that moment found it empty and deleted it as
   malformed; cleanup after a dead run could delete the state of the run that started next. Either
@@ -616,6 +622,16 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   warning no longer claims updates were installed.
 - FIX: A failed scheduled reboot's notice says whether update runs are still held and how to
   release them.
+- FIX: Failure notices name the failed unit as it is: every '-' in the name was printed as '/',
+  dnf/automatic/reboot.service, in the message and in the journalctl command it suggests.
+- FIX: A failure notice quotes only the journal lines of the run that failed; the unit's last
+  lines could reach into the run before.
+- FIX: Every run fetches current repository metadata (dnf makecache --refresh) before
+  dnf-automatic starts, within metadata_refresh_timeout_sec (new, default 900).
+  dnf-automatic installed from the cache dnf-makecache.timer or metadata_expire had left, so
+  an advisory published since waited for the next run. A refresh that fails or runs out of
+  time is logged, the run continues from the cache, and the completion line says so.
+  refresh_metadata = no (new) turns the step off.
 
 * Wed Sep 30 2026 DagNode <packages@dagnode.com> - 1.4.0-1
 - LICENSE: The project license is now GPL-2.0-or-later. Releases through 1.3 were licensed MIT,
