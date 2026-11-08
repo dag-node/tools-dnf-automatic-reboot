@@ -325,37 +325,61 @@ for timer in dnf-automatic.timer dnf-automatic-install.timer; do
     fi
 done
 
-# /etc/dnf/automatic.conf must not trigger reboots itself; this package does that.
+# /etc/dnf/automatic.conf is judged by what dnf-automatic itself reads from
+# it, asked of its own config loader, so a comment after a value, a key
+# outside [commands] or a later [commands] section counts as dnf-automatic
+# counts it.  dnf-automatic exits 0 having installed nothing while
+# download_updates or apply_updates is off, and on EL9 reboots on its own
+# unless reboot = never; EL8's has no reboot option (`unread`).  The query and
+# its shape are copies of those in run.sh.  The file is the operator's: it is
+# read, never written.
 ACONF="${PREFLIGHT_ROOT}/etc/dnf/automatic.conf"
-if [[ -f "${ACONF}" ]]; then
-    reboot_val=$(grep -E '^\s*reboot\s*=' "${ACONF}" 2>/dev/null \
-                 | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
-                 | tr -d '[:space:]') || true
-    if [[ -n "${reboot_val}" && "${reboot_val}" != "never" ]]; then
-        echo "ERROR: /etc/dnf/automatic.conf has 'reboot = ${reboot_val}'." >&2
+readonly PLATFORM_PYTHON="${PREFLIGHT_ROOT}/usr/libexec/platform-python"
+readonly AUTOMATIC_CONFIG_QUERY='import sys
+from dnf.automatic.main import AutomaticConfig
+commands = AutomaticConfig(sys.argv[1]).commands
+print("apply_updates=" + str(commands.apply_updates)
+      + " download_updates=" + str(commands.download_updates)
+      + " upgrade_type=" + str(commands.upgrade_type)
+      + " reboot=" + str(getattr(commands, "reboot", "unread")))'
+readonly AUTOMATIC_CONFIG_SHAPE='^apply_updates=(True|False) download_updates=(True|False) upgrade_type=([a-z]+) reboot=([a-z-]+)$'
+automatic_settings=$("${PLATFORM_PYTHON}" -I -c "${AUTOMATIC_CONFIG_QUERY}" "${ACONF}" 2>/dev/null) \
+    || automatic_settings=""
+automatic_config_refused=0
+if [[ ! "${automatic_settings}" =~ ${AUTOMATIC_CONFIG_SHAPE} ]]; then
+    echo "ERROR: dnf-automatic cannot load /etc/dnf/automatic.conf, so it would fail with it." >&2
+    automatic_config_refused=1
+else
+    apply_updates_value="${BASH_REMATCH[1]}"
+    download_updates_value="${BASH_REMATCH[2]}"
+    upgrade_type_value="${BASH_REMATCH[3]}"
+    automatic_reboot_value="${BASH_REMATCH[4]}"
+    if [[ "${apply_updates_value}" != "True" || "${download_updates_value}" != "True" ]]; then
+        echo "ERROR: dnf-automatic reads download_updates = ${download_updates_value} and apply_updates = ${apply_updates_value}" >&2
+        echo "       from /etc/dnf/automatic.conf, so it would install nothing and report success." >&2
+        automatic_config_refused=1
+    fi
+    if [[ "${upgrade_type_value}" != "default" && "${upgrade_type_value}" != "security" ]]; then
+        echo "ERROR: dnf-automatic reads upgrade_type = ${upgrade_type_value} from /etc/dnf/automatic.conf." >&2
+        echo "       This package knows default and security." >&2
+        automatic_config_refused=1
+    fi
+    if [[ "${automatic_reboot_value}" != "never" && "${automatic_reboot_value}" != "unread" ]]; then
+        echo "ERROR: dnf-automatic reads reboot = ${automatic_reboot_value} from /etc/dnf/automatic.conf." >&2
         echo "       dnf-automatic must not reboot independently of this package." >&2
-        echo "       Set it to 'never' in /etc/dnf/automatic.conf:  reboot = never" >&2
-        FAIL=1
+        automatic_config_refused=1
     fi
 fi
-
-# dnf-automatic must install what it downloads.  apply_updates defaults to
-# false in dnf-automatic, which then exits 0 after downloading, so every run
-# would report success without installing an update.  The file is the
-# operator's: this scriptlet reads it and does not write it.  True values are those libdnf's
-# OptionBool accepts.
-apply_updates_value=$(grep -E '^\s*apply_updates\s*=' "${ACONF}" 2>/dev/null \
-                      | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
-                      | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]') || true
-case "${apply_updates_value}" in
-    yes|true|1|on) ;;
-    *)
-        echo "ERROR: /etc/dnf/automatic.conf has 'apply_updates = ${apply_updates_value:-<unset>}'." >&2
-        echo "       dnf-automatic would download updates without installing them." >&2
-        echo "       Set it in /etc/dnf/automatic.conf:  apply_updates = yes" >&2
-        FAIL=1
-        ;;
-esac
+if [[ "${automatic_config_refused}" -ne 0 ]]; then
+    echo "       Set these lines under [commands] in /etc/dnf/automatic.conf, each on a" >&2
+    echo "       line of its own, with no comment after the value; upgrade_type may be" >&2
+    echo "       default or security:" >&2
+    echo "           upgrade_type = default" >&2
+    echo "           download_updates = yes" >&2
+    echo "           apply_updates = yes" >&2
+    echo "           reboot = never" >&2
+    FAIL=1
+fi
 
 if [[ "${FAIL}" -ne 0 ]]; then
     echo "" >&2
@@ -548,6 +572,13 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   RPM runs it after every install and upgrade. The file is not edited.
 - FIX: A dnf query or a service restart that ignores SIGTERM at its timeout is killed five
   minutes later, so it cannot hold the run open.
+- FIX: /etc/dnf/automatic.conf is checked by asking dnf-automatic's own config loader what it
+  reads. A comment after apply_updates = yes made dnf-automatic read an invalid value and only
+  download updates, and a line outside [commands] was taken as set; the install and every run
+  now refuse both. download_updates = no, with which dnf-automatic installs nothing, is refused
+  too. The refusal names the four lines to set under [commands]: upgrade_type = default (or
+  security), download_updates = yes, apply_updates = yes, reboot = never. On EL8, whose
+  dnf-automatic has no reboot setting, reboot is no longer checked.
 - FIX: A repository with enabled=off, or any other spelling dnf reads as false, is no longer
   reported as an enabled unsigned repository.
 - FIX: dnf-makecache.timer's run no longer reads as a manual dnf command. The warning names

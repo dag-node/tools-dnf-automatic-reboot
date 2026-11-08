@@ -719,9 +719,10 @@ and a run that installed a newer kernel logged no reboot attempt. A `reboot` or
 update waits for a manual reboot unless this package performs it. On Oracle Linux 9.8,
 `/usr/lib/python3.9/site-packages/dnf/automatic/main.py` defines both options and reboots
 when `reboot` is `when-changed`, or `when-needed` and `base.reboot_needed()` is true; it runs
-`reboot_command` through `os.system` and raises an error on a non-zero exit code. `%pre` and `check_conflicts`
-still require `reboot = never` on EL8: the key is inert there and is honoured on EL9, and one
-rule for both keeps the file's meaning the same across platforms.
+`reboot_command` through `os.system` and raises an error on a non-zero exit code. `%pre` and
+`check_conflicts` judge the file by what dnf-automatic's loader reads, and EL8's has no
+`reboot` option, so on EL8 the key is not checked. After an upgrade to EL9 the key takes
+effect, and `check_conflicts` refuses the first run if it is not `never`.
 
 With a correct clock, `needs-restarting -r` flagging a kernel means a kernel package was
 installed during this boot, which under unattended updates is a newer kernel awaiting a
@@ -937,9 +938,21 @@ compares ELF notes and does not read the clock, so skew does not affect it.
   the ESP copy, on EL9 EFI the ESP copy is a `configfile` stub), unable to advance
   the default on a kernel update (`GRUB_UPDATE_DEFAULT_KERNEL`, plus `DEFAULTKERNEL`
   on EL9, and the default already on the newest installed kernel), running a pre-1.4
-  version, or with `/etc/dnf/automatic.conf` not set
-  to `reboot = never` and `apply_updates = yes` (dnf-automatic defaults a missing
-  `apply_updates` to false and then exits 0 after only downloading).
+  version, or with an `/etc/dnf/automatic.conf` from which dnf-automatic would not
+  download and install every update and leave the reboot to this package. The file is
+  not parsed here: `AUTOMATIC_CONFIG_QUERY` in `run.sh` asks dnf-automatic's own
+  loader (`dnf.automatic.main.AutomaticConfig`, run by `/usr/libexec/platform-python -I`)
+  what it reads. The interpreter needs no `Requires`: EL8's `platform-python` runs dnf
+  itself, and on OL 9.8 `python3` owns it, the package behind `/usr/bin/python3`, under
+  which dnf-automatic runs. The gate requires `apply_updates` and `download_updates` true (with
+  either off, dnf-automatic exits 0 having installed nothing), `upgrade_type` `default` or
+  `security`, and `reboot` `never`, or absent from the loader, as on EL8. A file the loader
+  cannot parse, or an answer of another shape, is refused. A comment after a value, a key
+  outside `[commands]` or a later `[commands]` section, indented or not, therefore counts
+  exactly as dnf-automatic counts it: `apply_updates = yes # comment` read as `False` on
+  RHEL 8.10 (dnf 4.7) and OL 9.8 (dnf 4.14). The refusal names the four lines to set.
+  `%pre` carries a copy of the query and of its answer's shape, and a test keeps them
+  identical.
   `Requires(pre): dnf-automatic` puts that file in place before `%pre` reads it, and
   `run.sh` `check_conflicts` repeats the `automatic.conf` and stock-timer checks at
   every start, failing the run through `OnFailure=`. `GRUB_SAVEDEFAULT=true` only

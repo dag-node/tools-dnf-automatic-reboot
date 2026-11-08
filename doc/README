@@ -116,10 +116,16 @@ pre-install scriptlet validates them, and the GRUB settings in "UEK kernel
 default" below, and refuses to install if they are not satisfied.
 
   # 1. Configure dnf-automatic: disable its own reboot handling and ensure
-  #    updates are applied automatically.
+  #    updates are downloaded and applied.  upgrade_type may be default or
+  #    security.  Put any comment on a line of its own: dnf-automatic reads
+  #    "apply_updates = yes # x" as invalid.  The scriptlet and every run ask
+  #    dnf-automatic's own config loader what it reads from the file.
   vi /etc/dnf/automatic.conf
-      reboot = never
+      [commands]
+      upgrade_type = default
+      download_updates = yes
       apply_updates = yes
+      reboot = never
 
   # 2. Disable the stock dnf-automatic timers.  This package provides its
   #    own schedule; running both would apply updates twice.

@@ -138,7 +138,7 @@ make_test_root() {
     : > "${STUB_LOG}"
 
     cp "${REPO_ROOT}/conf/automatic-reboot.conf" "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
-    printf 'reboot = never\napply_updates = yes\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
+    printf '[commands]\napply_updates = yes\nreboot = never\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
     printf 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n' \
         > "${TEST_ROOT_DIR}/proc/sys/kernel/random/boot_id"
 
@@ -1529,23 +1529,63 @@ test_run_concurrent_dnf_command_is_named_without_arguments() {
 # ---------------------------------------------------------------------------
 # services: restarting the wrong unit takes the host down
 # ---------------------------------------------------------------------------
-test_conflicts_refuse_apply_updates_off() {
-    load_run_library
-    systemctl() { return 1; }
-    # Changed after install: every run would download and install nothing.
-    printf 'reboot = never\napply_updates = no\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
-    local output exit_code=0
-    output=$( check_conflicts 2>&1 ) || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "run refused"
-    assert_contains "${output}" "apply_updates = no" "names the setting"
+# stub_automatic_config_query: dnf-automatic's config loader, run under
+# timeout, prints STUB_AUTOMATIC_SETTINGS (a prepared EL9 host by default) and
+# exits STUB_AUTOMATIC_QUERY_RC; every other timeout runs as usual.
+stub_automatic_config_query() {
+    timeout() {
+        if [[ "$*" == *"${PLATFORM_PYTHON_BIN}"* ]]; then
+            printf 'timeout %s\n' "$*" >> "${STUB_LOG}"
+            printf '%s\n' "${STUB_AUTOMATIC_SETTINGS-apply_updates=True download_updates=True upgrade_type=default reboot=never}"
+            return "${STUB_AUTOMATIC_QUERY_RC:-0}"
+        fi
+        command timeout "$@"
+    }
 }
 
 test_conflicts_pass_on_prepared_host() {
     load_run_library
     systemctl() { return 1; }
+    stub_automatic_config_query
     local exit_code=0
     ( check_conflicts ) >/dev/null 2>&1 || exit_code=$?
-    assert_exit_code 0 "${exit_code}" "reboot = never and apply_updates = yes pass"
+    assert_exit_code 0 "${exit_code}" "what dnf-automatic reads passes"
+    assert_contains "$(cat "${STUB_LOG}")" "${PLATFORM_PYTHON_BIN} -I -c" \
+        "dnf-automatic's own loader is asked, in isolated mode"
+    assert_contains "$(cat "${STUB_LOG}")" "${AUTOMATIC_CONFIG_FILE}" "about /etc/dnf/automatic.conf"
+}
+
+test_conflicts_pass_el8_security_updates() {
+    load_run_library
+    systemctl() { return 1; }
+    stub_automatic_config_query
+    # EL8's dnf-automatic has no reboot option and never reboots.
+    export STUB_AUTOMATIC_SETTINGS="apply_updates=True download_updates=True upgrade_type=security reboot=unread"
+    local exit_code=0
+    ( check_conflicts ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "security updates on EL8 pass"
+}
+
+test_conflicts_refuse_what_dnf_automatic_would_not_do() {
+    load_run_library
+    systemctl() { return 1; }
+    stub_automatic_config_query
+    local automatic_settings query_exit_code expected_text output exit_code
+    while IFS='|' read -r automatic_settings query_exit_code expected_text; do
+        export STUB_AUTOMATIC_SETTINGS="${automatic_settings}" STUB_AUTOMATIC_QUERY_RC="${query_exit_code}"
+        exit_code=0
+        output=$( check_conflicts 2>&1 ) || exit_code=$?
+        assert_exit_code 1 "${exit_code}" "refused: [${automatic_settings}] exit ${query_exit_code}"
+        assert_contains "${output}" "${expected_text}" "says why: [${automatic_settings}]"
+        assert_contains "${output}" "apply_updates = yes, reboot = never" "names the lines to set"
+    done <<'CASES'
+apply_updates=False download_updates=True upgrade_type=default reboot=never|0|apply_updates = False
+apply_updates=True download_updates=False upgrade_type=security reboot=never|0|download_updates = False
+apply_updates=True download_updates=True upgrade_type=default reboot=when-needed|0|reboot = when-needed
+apply_updates=True download_updates=True upgrade_type=minimal reboot=never|0|upgrade_type = minimal
+|1|cannot load
+apply_updates=1 download_updates=True upgrade_type=default reboot=never|0|cannot load
+CASES
 }
 
 test_services_exclusions_are_additive() {
@@ -3627,11 +3667,24 @@ make_stock_kernel_host() {
 # run_preflight INSTANCE_COUNT -> scriptlet output on stdout, its exit code returned.
 # INSTANCE_COUNT is rpm's $1: 1 for a fresh install, 2 for an upgrade.
 run_preflight() {
-    local scriptlet_file="${TEST_ROOT_DIR}/prein.sh"
-    rpmspec -P --define "preflight_root ${TEST_ROOT_DIR}" "${SPEC_FILE}" 2>/dev/null \
-        | awk '/^%pre -p/ { in_pre = 1; next } /^%post$/ { in_pre = 0 } in_pre' \
-        > "${scriptlet_file}"
-    [[ -s "${scriptlet_file}" ]] || fail "could not extract %pre from the spec"
+    local scriptlet_file="${TEST_ROOT_DIR}/prein.sh" scriptlet_text
+    scriptlet_text=$(rpmspec -P --define "preflight_root ${TEST_ROOT_DIR}" "${SPEC_FILE}" 2>/dev/null \
+        | awk '/^%pre -p/ { in_pre = 1; next } /^%post$/ { in_pre = 0 } in_pre')
+    [[ -n "${scriptlet_text}" ]] || fail "could not extract %pre from the spec"
+    # dnf-automatic's config loader, run by its absolute path: a function of
+    # that name, defined ahead of the scriptlet, prints STUB_AUTOMATIC_SETTINGS
+    # (a prepared EL9 host by default), records its arguments and exits
+    # STUB_AUTOMATIC_QUERY_RC.  A path-named function cannot be exported.
+    {
+        printf '%s() {\n' "${TEST_ROOT_DIR}/usr/libexec/platform-python"
+        cat <<'STUB'
+    printf '%s\n' "$*" > "${TEST_ROOT_DIR}/platform-python.arguments"
+    printf '%s\n' "${STUB_AUTOMATIC_SETTINGS-apply_updates=True download_updates=True upgrade_type=default reboot=never}"
+    return "${STUB_AUTOMATIC_QUERY_RC:-0}"
+}
+STUB
+        printf '%s\n' "${scriptlet_text}"
+    } > "${scriptlet_file}"
     # Functions shadow the commands inside the child bash, as elsewhere.
     rpm() {
         local kernel_version
@@ -3854,35 +3907,58 @@ test_preflight_savedefault_only_warns() {
     assert_contains "${output}" "WARNING: GRUB_SAVEDEFAULT=true" "but it is reported"
 }
 
-test_preflight_refuses_apply_updates_off() {
-    make_preflight_host
-    # The stock dnf-automatic value: downloads, installs nothing, exits 0.
-    printf 'reboot = never\napply_updates = no\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
-    local output exit_code=0
-    output=$(run_preflight 1) || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "apply_updates = no refused"
-    assert_contains "${output}" "apply_updates = yes" "names the setting to change"
+test_preflight_refuses_what_dnf_automatic_would_not_do() {
+    local automatic_settings query_exit_code expected_text output exit_code
+    while IFS='|' read -r automatic_settings query_exit_code expected_text; do
+        make_preflight_host
+        export STUB_AUTOMATIC_SETTINGS="${automatic_settings}" STUB_AUTOMATIC_QUERY_RC="${query_exit_code}"
+        exit_code=0
+        output=$(run_preflight 1) || exit_code=$?
+        assert_exit_code 1 "${exit_code}" "refused: [${automatic_settings}] exit ${query_exit_code}"
+        assert_contains "${output}" "${expected_text}" "says why: [${automatic_settings}]"
+        assert_contains "${output}" "apply_updates = yes" "names the lines to set"
+    done <<'CASES'
+apply_updates=False download_updates=True upgrade_type=default reboot=never|0|apply_updates = False
+apply_updates=True download_updates=False upgrade_type=default reboot=never|0|download_updates = False
+apply_updates=True download_updates=True upgrade_type=default reboot=when-needed|0|reboot = when-needed
+|1|cannot load
+CASES
 }
 
-test_preflight_refuses_apply_updates_unset() {
-    make_preflight_host
-    # dnf-automatic defaults a missing apply_updates to false.
-    printf 'reboot = never\n' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
+test_preflight_el8_security_updates_pass() {
+    make_el8_host
+    # EL8's dnf-automatic has no reboot option and never reboots.
+    export STUB_AUTOMATIC_SETTINGS="apply_updates=True download_updates=True upgrade_type=security reboot=unread"
     local output exit_code=0
     output=$(run_preflight 1) || exit_code=$?
-    assert_exit_code 1 "${exit_code}" "missing apply_updates refused"
-    assert_contains "${output}" "apply_updates = <unset>" "says it is unset"
+    assert_exit_code 0 "${exit_code}" "security updates on EL8 pass: ${output}"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/platform-python.arguments")" "-I -c" \
+        "dnf-automatic's own loader is asked, in isolated mode"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/platform-python.arguments")" \
+        "${TEST_ROOT_DIR}/etc/dnf/automatic.conf" "about /etc/dnf/automatic.conf"
 }
 
-test_preflight_accepts_operator_automatic_conf() {
-    make_preflight_host
-    # An existing, hand-configured file as found on an OL9 host: checked as is.
-    printf '%s\n' '[commands]' 'upgrade_type = security' 'random_sleep = 0' \
-        'network_online_timeout = 60' 'download_updates = yes' 'apply_updates = True  # on' \
-        'reboot = never' > "${TEST_ROOT_DIR}/etc/dnf/automatic.conf"
-    local output exit_code=0
-    output=$(run_preflight 1) || exit_code=$?
-    assert_exit_code 0 "${exit_code}" "hand-configured automatic.conf passes: ${output}"
+# read_readonly_assignment NAME FILE -> the lines of `readonly NAME='...'`
+# in FILE, from its first line to the one that closes the quote.
+read_readonly_assignment() {
+    awk -v start="readonly $1='" '
+        index($0, start) == 1 { copying = 1 }
+        copying { print }
+        copying && /\047$/ { exit }
+    ' "$2"
+}
+
+test_preflight_asks_dnf_automatic_as_run_does() {
+    # %pre cannot source run.sh, so it carries a copy of the query and of the
+    # shape of its answer; a copy that drifted would let the install accept
+    # what every run refuses, or the reverse.
+    local copy_name run_copy spec_copy
+    for copy_name in AUTOMATIC_CONFIG_QUERY AUTOMATIC_CONFIG_SHAPE; do
+        run_copy=$(read_readonly_assignment "${copy_name}" "${REPO_ROOT}/scripts/run.sh")
+        spec_copy=$(read_readonly_assignment "${copy_name}" "${SPEC_FILE}")
+        [[ -n "${run_copy}" ]] || fail "run.sh defines ${copy_name}"
+        assert_equals "${run_copy}" "${spec_copy}" "%pre carries the ${copy_name} of run.sh"
+    done
 }
 
 test_preflight_refuses_missing_dependencies() {
@@ -4043,8 +4119,9 @@ run_test "advisories: ignores non-advisory lines"         test_advisories_ignore
 run_test "advisories: disabled by config"                 test_advisories_disabled_by_config
 
 printf 'conflicts\n'
-run_test "conflicts: refuse apply_updates off"      test_conflicts_refuse_apply_updates_off
 run_test "conflicts: pass on prepared host"         test_conflicts_pass_on_prepared_host
+run_test "conflicts: pass el8 security updates"     test_conflicts_pass_el8_security_updates
+run_test "conflicts: refuse what dnf-automatic would not do" test_conflicts_refuse_what_dnf_automatic_would_not_do
 
 printf 'services\n'
 run_test "services: exclusions are additive"         test_services_exclusions_are_additive
@@ -4196,9 +4273,9 @@ run_test "preflight: refuses stock kernel with wrong DEFAULTKERNEL" test_preflig
 run_test "preflight: refuses UEK without kernel default settings" test_preflight_refuses_uek_without_kernel_default_settings needs-rpmspec
 run_test "preflight: refuses default older than newest kernel" test_preflight_refuses_default_older_than_newest_kernel needs-rpmspec
 run_test "preflight: refuses unowned running kernel" test_preflight_refuses_unowned_running_kernel needs-rpmspec
-run_test "preflight: refuses apply_updates off"      test_preflight_refuses_apply_updates_off      needs-rpmspec
-run_test "preflight: refuses apply_updates unset"    test_preflight_refuses_apply_updates_unset    needs-rpmspec
-run_test "preflight: accepts operator automatic.conf" test_preflight_accepts_operator_automatic_conf needs-rpmspec
+run_test "preflight: refuses what dnf-automatic would not do" test_preflight_refuses_what_dnf_automatic_would_not_do needs-rpmspec
+run_test "preflight: el8 security updates pass"      test_preflight_el8_security_updates_pass      needs-rpmspec
+run_test "preflight: asks dnf-automatic as run does" test_preflight_asks_dnf_automatic_as_run_does
 run_test "preflight: GRUB_SAVEDEFAULT only warns"    test_preflight_savedefault_only_warns         needs-rpmspec
 run_test "preflight: refuses upgrade from pre-1.4"   test_preflight_refuses_upgrade_from_pre_1_4   needs-rpmspec
 run_test "preflight: allows upgrade from 1.4"        test_preflight_allows_upgrade_from_1_4        needs-rpmspec

@@ -55,6 +55,7 @@ readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
 readonly DNF_BIN="${TEST_ROOT}/usr/bin/dnf"
 readonly DNF_AUTOMATIC_BIN="${TEST_ROOT}/usr/bin/dnf-automatic"
+readonly PLATFORM_PYTHON_BIN="${TEST_ROOT}/usr/libexec/platform-python"
 # Its position before dnf-automatic starts goes into the state file: the
 # watchdog reads the run's transaction phase from the lines after it.
 readonly DNF_LOG_FILE="${TEST_ROOT}/var/log/dnf.log"
@@ -205,6 +206,25 @@ warn_on_concurrent_dnf() {
 }
 
 # ---------------------------------------------------------------------------
+# What dnf-automatic itself reads from /etc/dnf/automatic.conf, asked of its
+# own config loader rather than parsed here, so a comment after a value, a key
+# outside [commands] or a later [commands] section counts exactly as
+# dnf-automatic counts it.  The query prints one line of AUTOMATIC_CONFIG_SHAPE;
+# reboot is `unread` where dnf-automatic has no such option (EL8).  It fails
+# when the loader cannot parse the file, as dnf-automatic would.  %pre in the
+# spec runs a copy, which a test keeps identical.
+# ---------------------------------------------------------------------------
+readonly AUTOMATIC_CONFIG_QUERY='import sys
+from dnf.automatic.main import AutomaticConfig
+commands = AutomaticConfig(sys.argv[1]).commands
+print("apply_updates=" + str(commands.apply_updates)
+      + " download_updates=" + str(commands.download_updates)
+      + " upgrade_type=" + str(commands.upgrade_type)
+      + " reboot=" + str(getattr(commands, "reboot", "unread")))'
+readonly AUTOMATIC_CONFIG_SHAPE='^apply_updates=(True|False) download_updates=(True|False) upgrade_type=([a-z]+) reboot=([a-z-]+)$'
+readonly AUTOMATIC_CONFIG_REQUIRED_LINES="these lines under [commands], each on a line of its own with no comment after the value: upgrade_type = default (or security), download_updates = yes, apply_updates = yes, reboot = never"
+
+# ---------------------------------------------------------------------------
 # Pre-flight: abort if conflicting services would cause double-reboots, or if
 # dnf-automatic would not install anything.
 #
@@ -213,7 +233,8 @@ warn_on_concurrent_dnf() {
 # producing silent successes.  The file is the operator's and is only read.
 # ---------------------------------------------------------------------------
 check_conflicts() {
-    local conflict_found=0 conflicting_timer automatic_reboot_value apply_updates_value
+    local conflict_found=0 conflicting_timer automatic_settings=""
+    local apply_updates_value download_updates_value upgrade_type_value automatic_reboot_value
 
     for conflicting_timer in dnf-automatic.timer dnf-automatic-install.timer; do
         if systemctl is-enabled --quiet "${conflicting_timer}" 2>/dev/null || \
@@ -223,28 +244,32 @@ check_conflicts() {
         fi
     done
 
-    if [[ -f "${AUTOMATIC_CONFIG_FILE}" ]]; then
-        automatic_reboot_value=$(grep -E '^\s*reboot\s*=' "${AUTOMATIC_CONFIG_FILE}" 2>/dev/null \
-                                 | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
-                                 | tr -d '[:space:]') || true
-        if [[ -n "${automatic_reboot_value}" && "${automatic_reboot_value}" != "never" ]]; then
-            log_error "/etc/dnf/automatic.conf has reboot = ${automatic_reboot_value}; set 'reboot = never' to avoid double-reboot conflicts"
+    # dnf-automatic exits 0 having installed nothing while download_updates or
+    # apply_updates is off, and on EL9 reboots on its own unless reboot = never.
+    automatic_settings=$(timeout --kill-after="${KILL_GRACE_SECONDS}s" "${DNF_QUERY_TIMEOUT_SECONDS}s" \
+        "${PLATFORM_PYTHON_BIN}" -I -c "${AUTOMATIC_CONFIG_QUERY}" "${AUTOMATIC_CONFIG_FILE}" 2>/dev/null) \
+        || automatic_settings=""
+    if [[ ! "${automatic_settings}" =~ ${AUTOMATIC_CONFIG_SHAPE} ]]; then
+        log_error "dnf-automatic cannot load /etc/dnf/automatic.conf, so it would fail with it; the file needs ${AUTOMATIC_CONFIG_REQUIRED_LINES}"
+        conflict_found=1
+    else
+        apply_updates_value="${BASH_REMATCH[1]}"
+        download_updates_value="${BASH_REMATCH[2]}"
+        upgrade_type_value="${BASH_REMATCH[3]}"
+        automatic_reboot_value="${BASH_REMATCH[4]}"
+        if [[ "${apply_updates_value}" != "True" || "${download_updates_value}" != "True" ]]; then
+            log_error "dnf-automatic reads download_updates = ${download_updates_value} and apply_updates = ${apply_updates_value} from /etc/dnf/automatic.conf, so it would install nothing and report success; the file needs ${AUTOMATIC_CONFIG_REQUIRED_LINES}"
+            conflict_found=1
+        fi
+        if [[ "${upgrade_type_value}" != "default" && "${upgrade_type_value}" != "security" ]]; then
+            log_error "dnf-automatic reads upgrade_type = ${upgrade_type_value} from /etc/dnf/automatic.conf; this version knows default and security; the file needs ${AUTOMATIC_CONFIG_REQUIRED_LINES}"
+            conflict_found=1
+        fi
+        if [[ "${automatic_reboot_value}" != "never" && "${automatic_reboot_value}" != "unread" ]]; then
+            log_error "dnf-automatic reads reboot = ${automatic_reboot_value} from /etc/dnf/automatic.conf and would reboot on its own; the file needs ${AUTOMATIC_CONFIG_REQUIRED_LINES}"
             conflict_found=1
         fi
     fi
-
-    # dnf-automatic defaults apply_updates to false and then exits 0 after
-    # downloading.  True values are those libdnf's OptionBool accepts.
-    apply_updates_value=$(grep -E '^\s*apply_updates\s*=' "${AUTOMATIC_CONFIG_FILE}" 2>/dev/null \
-                          | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
-                          | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]') || true
-    case "${apply_updates_value}" in
-        yes|true|1|on) ;;
-        *)
-            log_error "/etc/dnf/automatic.conf has apply_updates = ${apply_updates_value:-<unset>}; dnf-automatic would download updates without installing them; set 'apply_updates = yes'"
-            conflict_found=1
-            ;;
-    esac
 
     if [[ "${conflict_found}" -ne 0 ]]; then
         log_error "Aborting: resolve the conflicts above, then restart the service"

@@ -44,17 +44,24 @@ Enterprise Linux 8. The file comes from a CI run of this repository or from
 [Building from source](#building-from-source).
 
 The first two commands install `dnf-automatic` and open its settings file,
-in which two lines must read:
+in which the `[commands]` section must set:
 
 ```ini
+[commands]
+upgrade_type = default
+download_updates = yes
 apply_updates = yes
 reboot = never
 ```
 
-`apply_updates = yes` makes `dnf-automatic` install updates, not only
-download them; `reboot = never` leaves the restart decision to this package.
-If `dnf-automatic` is already set up, keep your other settings as they are.
-This package reads the file and does not change it.
+`upgrade_type = security` installs security updates only; both work.
+`download_updates` and `apply_updates` make `dnf-automatic` download and
+install updates, not only report them; `reboot = never` leaves the restart
+decision to this package. Put any comment on a line of its own:
+`dnf-automatic` reads `apply_updates = yes # install` as an invalid value and
+installs nothing. If `dnf-automatic` is already set up, keep your other
+settings as they are. This package asks `dnf-automatic` what it reads from
+the file, and does not change it.
 
 The third command installs this package. It first checks that the system
 is one it can restart safely; if not, it stops before installing any files
@@ -144,13 +151,14 @@ files. Fix each one and run `sudo dnf install dnf-automatic-reboot` again.
 | `the GRUB default is ..., not the newest installed` | If the newest kernel should run, run the `grubby --set-default` command the message shows, with `sudo`. The installer does not change the default itself, since that changes which kernel the next boot runs. |
 | `upgrading from a version before 1.4.0` | See [Upgrading from an earlier version](#upgrading-from-an-earlier-version). |
 | `dnf-automatic.timer is still enabled` | `sudo systemctl disable --now dnf-automatic.timer dnf-automatic-install.timer` |
-| `/etc/dnf/automatic.conf has 'reboot = ...'` | Set `reboot = never` in `/etc/dnf/automatic.conf`; this package decides when to restart. |
-| `/etc/dnf/automatic.conf has 'apply_updates = ...'` | Set `apply_updates = yes` in `/etc/dnf/automatic.conf`. |
+| `dnf-automatic reads ... from /etc/dnf/automatic.conf` | Set the four lines shown in [Quick start](#quick-start) under `[commands]` in `/etc/dnf/automatic.conf`, each on a line of its own with no comment after the value. The message names the value `dnf-automatic` reads now. |
+| `dnf-automatic cannot load /etc/dnf/automatic.conf` | `dnf-automatic` itself cannot parse the file, for example a line without `=`. Fix the file, then set the four lines shown in [Quick start](#quick-start). |
 
-The nightly run checks the `reboot` and `apply_updates` lines again each
-time it starts. When either one no longer reads as in
-[Quick start](#quick-start), the run stops, logged-in users get a message,
-and the log names the line to fix.
+The nightly run asks `dnf-automatic` again each time it starts. When the
+file no longer reads as in [Quick start](#quick-start), the run stops,
+logged-in users get a message, and the log names what to set. On EL8,
+`dnf-automatic` has no `reboot` setting and never restarts the host, so
+`reboot` is not checked there.
 
 A `WARNING` about `GRUB_SAVEDEFAULT=true` does not stop the install. It means
 that choosing an older kernel from the boot menu once makes it the default;
