@@ -45,12 +45,15 @@ CLAUDE.md                       This file
 dnf-automatic-reboot.spec       RPM spec
 Makefile                        check / install / dist / clean targets
 conf/automatic-reboot.conf      Runtime config installed to /etc/dnf/
+conf/needs-restarting.d/automatic-reboot.conf   Package names added to the plugin's reboot list
 scripts/run.sh                  Main orchestration (inhibitor + dnf + reboot)
-scripts/watchdog.sh             Independent watchdog (soft/hard timeout)
+scripts/watchdog.sh             Independent watchdog: stops a stalled run, never reboots
 scripts/needs-reboot.sh         Reboot decision + false-positive filtering
 scripts/notify-failure.sh       OnFailure= notifier (wall + log)
 scripts/cancel-reboot.sh        Cancels a pending reboot and allows update runs again
 scripts/reboot-if-pending.sh    The scheduled reboot's command: reboots only while one is pending
+scripts/check-config.sh         Validates /etc/dnf/automatic-reboot.conf and names how it differs from the shipped one; never edits it
+scripts/config.sh               The one config parser and its schema, sourced by every script that reads the config
 scripts/reboot-request.sh       Reboot request/cancel protocol, sourced by the scripts that request, run or cancel reboots
 scripts/run-state.sh            State file protocol (atomic publish, snapshot, checked removal), sourced by run and watchdog
 units/dnf-automatic-reboot.service    Oneshot service wrapping run.sh
@@ -81,9 +84,11 @@ Files installed verbatim onto hosts (config, units, drop-ins) take no header; th
 ```
 /usr/libexec/dnf-automatic-reboot/     scripts/
 /etc/dnf/automatic-reboot.conf         config (%config noreplace)
+/usr/share/dnf-automatic-reboot/automatic-reboot.conf   the config as shipped, for check-config.sh
 /usr/lib/systemd/system/               unit files
 /usr/lib/tmpfiles.d/dnf-automatic-reboot.conf   log + state path creation
 /etc/logrotate.d/dnf-automatic-reboot  log rotation (%config noreplace)
+/etc/dnf/plugins/needs-restarting.d/automatic-reboot.conf   reboot list addition (%config noreplace)
 /usr/share/doc/dnf-automatic-reboot/   doc/README
 /var/log/dnf-automatic-reboot.log      runtime log (%ghost in RPM)
 /var/lib/dnf-automatic-reboot/restart-state            learning state (%ghost)
@@ -113,13 +118,10 @@ log()         { printf '<6>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: %s\n'
 log_warning() { printf '<4>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: WARNING: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
 log_error()   { printf '<3>%s: %s\n' "${SCRIPT_NAME}" "$*"; printf '%s %s: ERROR: %s\n'   "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true; }
 
-# Config reader: get_config_value KEY DEFAULT_VALUE
-get_config_value() {
-    local config_key="$1" default_value="$2" config_value
-    config_value=$(grep -E "^\s*${config_key}\s*=" "${CONFIG_FILE}" 2>/dev/null \
-                   | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//') || true
-    printf '%s' "${config_value:-${default_value}}"
-}
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
+load_config "${CONFIG_FILE}" || true        # main refuses to act while CONFIG_ERRORS is set
+RESTART_SERVICES=$(config_value restart_services)
 ```
 
 **Naming.** Identifiers are long and descriptive — full words, no abbreviations
@@ -127,7 +129,11 @@ beyond established domain terms (`evr`, `pid`, `uid`, `id`). `needs_restarting_e
 not `nr_exit`. `running_build_id`, not `run_bid`. `flagged_package_names`, not `flagged`.
 Script-scope constants and globals are `UPPER_SNAKE_CASE`; function locals are
 `lower_snake_case`. Function names are verb-first and equally explicit:
-`newest_installed_kernel_version`, `grub_default_is_newest_kernel`.
+`read_unit_snapshot`, `classify_running_kernel_family`, `publish_run_phase`.
+A function that reads state into its output starts with `read_`; one that
+succeeds or fails on a condition may read as the condition
+(`grub_default_is_kernel_release`). Time values carry their unit in full:
+`_seconds`, `_minutes`.
 
 - `readonly` for all constants; `local` for all function variables
 - `[[ ]]` not `[ ]`
@@ -135,8 +141,6 @@ Script-scope constants and globals are `UPPER_SNAKE_CASE`; function locals are
 - Save/restore `IFS` around comma-split loops: `PREVIOUS_IFS="${IFS}"; IFS=','; ...; IFS="${PREVIOUS_IFS}"`
 - `|| true` on commands that are allowed to fail
 - Never `return` at top level; use `exit`
-- `get_config_integer` for any value that reaches an arithmetic test — a typo in the
-  config must not abort the run inside `[[ ... -gt ... ]]`
 - A function whose value is captured with `$(...)` must not log to stdout. Log
   helpers write to stdout for the journal, so inside a value-returning function
   they need `>&2` or the message ends up inside the returned value.
@@ -193,10 +197,44 @@ watchdog path that could reboot a host mid-transaction — not on line coverage.
 
 ### Config file parsing
 
-All tunables live in `conf/automatic-reboot.conf`. Scripts never have hardcoded
-policy values — always `get_config_value key default`. This keeps scripts testable without
-installing the config. `get_config_value` is section-blind: it matches `^\s*KEY\s*=` anywhere
-in the file, so every key name must be unique across all sections.
+`scripts/config.sh` is the only reader of `/etc/dnf/automatic-reboot.conf`: `run.sh`,
+`needs-reboot.sh` and `check-config.sh` source it. `CONFIG_SCHEMA` there is the registry of every key, its
+type, default and range; the file header states the grammar. A test checks that the
+shipped file sets every key to its schema default, and another that every key a script
+reads is in the schema and every schema key is read.
+
+`load_config` parses the whole file once per process and never exits. Every doubt about
+the file is an error, collected in `CONFIG_ERRORS`, and no doubt resolves to a default: a
+line of another shape, a key this version does not read, a key set twice, an empty
+value, a boolean outside `yes true on 1` / `no false off 0`, an integer outside its
+range, a file that cannot be read. A key left out takes its default. `CONFIG_VALUES` holds well-formed
+values either way, so a sourced script works; a caller must not act on them:
+
+| Caller | With `CONFIG_ERRORS` set |
+|---|---|
+| `run.sh` | first in `main`: logs each error, walls, exits 1 before refreshing, installing or rebooting |
+| `needs-reboot.sh` | exits 2 |
+| `check-config.sh` | prints the errors and the commands that replace the file from `.rpmnew` or the shipped copy, keeping a backup; exit 2 |
+| `watchdog.sh`, `notify-failure.sh`, `cancel-reboot.sh`, `reboot-if-pending.sh` | do not read the config: supervising a run, a failure notice, a cancellation and an accepted reboot do not depend on it |
+
+There are no aliases for keys of earlier versions and none are to be added: an edited
+copy of an earlier file is invalid, and every run fails until an operator replaces it.
+
+A setting exists only where an operator has a reason to change it — services restarted
+by hand, a slow link, a deliberate unsigned repository or versionlock, a clock not kept by
+chronyd — and its range keeps every value safe. Every other limit is a constant, because a
+value outside it breaks a guard: the reboot delay (`REBOOT_DELAY_SECONDS`, 300) and the
+blocked-reboot retry window (`REBOOT_RETRY_TIMEOUT_SECONDS`, 1800) in `run.sh`;
+`KERNEL_REBOOT_ATTEMPT_LIMIT` (3) in `needs-reboot.sh`; the watchdog's stall windows and
+`KILL_CONFIRMATION_TIMEOUT_SECONDS` (300) in `watchdog.sh`; the request lock wait
+(`REBOOT_REQUEST_LOCK_TIMEOUT_SECONDS`, 300) in `reboot-request.sh`; the SIGTERM-to-SIGKILL
+grace of every `timeout(1)` (`KILL_GRACE_SECONDS`, 300) in `config.sh`. The metadata refresh,
+restart-state learning and `chrony-wait.service` are always on. So are the safety sets an
+operator may add to but not shorten: `BUILT_IN_EXCLUDED_UNIT_PATTERNS` (`run.sh`) and
+`BUILD_ID_VERIFIED_PACKAGES` (`needs-reboot.sh`). The ranges need no rule between keys:
+`dnf_query_timeout_seconds` and `service_restart_timeout_seconds` stop at 900, so a query or
+a restart, with its kill grace, ends within the watchdog's shortest stall window.
+`doc/README` lists the constants for operators.
 
 ### Parsing external tool output
 
@@ -209,8 +247,8 @@ mapfile -t FLAGGED_PACKAGE_NAMES < <(printf '%s\n' "${needs_restarting_output}" 
 ```
 
 Every string the plugin prints passes through gettext, and it writes warnings to
-stderr for entries in `/etc/dnf/plugins/needs-restarting.d/` that name uninstalled
-packages. Under a blocklist parse, a translated header or a stray stderr line reads
+stderr for entries in `/etc/dnf/plugins/needs-restarting.d/*.conf` that name
+uninstalled packages. Under a blocklist parse, a translated header or a stray stderr line reads
 as a package name and reboots the host on every run. Hence: `LC_ALL=C`, stderr
 captured to a separate file and logged rather than parsed, and the allowlist above.
 
@@ -227,11 +265,14 @@ its flag is spurious. Every "cannot tell" outcome keeps the package:
 | Owned process gone from `/proc`, a zombie, or running another binary when its build-id could not be read | Ignore that process |
 | Owned process still in `/proc` with an unreadable executable link | Keep |
 | `eu-readelf` missing | Keep affected packages; kernel and learning paths still run |
-| Running kernel == newest installed | False positive, drop |
-| Anything else about the kernel | Keep |
+| Running kernel == newest installed of its family | False positive, drop |
+| Newer kernel of the family, GRUB default on it or unreadable, attempt limit not reached | Keep |
+| GRUB default on another kernel, attempt limit reached, no owner of the running `vmlinuz`, no readable release, or a flagged kernel package of another family | Withhold every reboot: exit 2 |
 
 An unverifiable state costs one reboot. The inverse — skipping a needed reboot —
-leaves a host running known-vulnerable code, so it is never the default.
+leaves a host running known-vulnerable code, so it is never the default. A kernel the
+reboot would not boot is the exception: that reboot comes back on the same kernel and
+repeats on every run, so it is withheld, with every other reboot, until an operator acts.
 
 ### Exit codes (needs-reboot.sh)
 
@@ -239,17 +280,31 @@ leaves a host running known-vulnerable code, so it is never the default.
 |------|---------|
 | 0 | No reboot needed |
 | 1 | Reboot needed |
-| 2 | Undecidable: tool error, a genuine kernel update that rebooting would not apply, or a kernel reboot attempt that could not be recorded (this one vetoes the reboot even when another package needs one) |
+| 2 | Undecidable: an invalid config, a tool error, or a kernel withheld as in [Fail-closed verification](#fail-closed-verification), including a kernel reboot attempt that could not be recorded. A kernel case vetoes the reboot even when another package needs one |
+| 3 | No flagged package needs a reboot, but the running kernel is not the newest installed one of its family and is not flagged. No reboot is requested for it and none is withheld; `run.sh` fails the run |
 
 `needs-restarting -r` exits 1 both for "reboot required" and for any error dnf
 handles, such as a missing cache. Only exit 1 with at least one `  * <name>` line is a
 reboot requirement; exit 1 without one is retried once with a metadata refresh, then
 reported as code 2.
 
-Code 2 does not reboot, to avoid a loop. `run.sh` and `watchdog.sh` escalate it to a
-non-zero exit so `OnFailure=` fires and the fail-open is never silent. Any status other
-than 0, 1 and 2, such as 127 from a missing helper, is handled as code 2: only 0 means
-"no reboot needed".
+Code 2 does not reboot, to avoid a loop. `run.sh` escalates it to a non-zero exit so `OnFailure=` fires and the fail-open is never silent. Any status other
+than 0, 1, 2 and 3, such as 127 from a missing helper, is handled as code 2: only 0 means
+"no reboot needed". After a 0 or a 3, `run.sh` requests a reboot in one case only: a daemon
+that cannot be restarted maps a file an update replaced (see
+[What `needs-restarting -r` does not cover](#what-needs-restarting--r-does-not-cover)).
+Codes 1 and 2 are final.
+
+`needs-restarting` flags a kernel only while it was installed in the current boot. A host
+that booted an older kernel than the newest installed one, through a stale GRUB default or a
+choice at the boot menu, is flagged for nothing. `running_kernel_is_behind_newest` therefore
+compares the two at every check that would end 0 or 1 without a flagged kernel. Code 3 fails
+the run and names the repair: a reboot when the GRUB default is on the newest kernel,
+`grubby --set-default` first when it is not, or removing the newer kernel to keep the running
+one. A reboot another package needs (code 1) goes ahead with the error logged: it happens
+once, where a reboot for a flagged kernel the host would not boot repeats, which is what
+code 2 withholds. A running kernel no package owns, or a family with no readable release, is
+not judged here.
 
 ### State file `/run/dnf-automatic-reboot.state`
 
@@ -273,13 +328,16 @@ phase=updating|checking
 start=<unix timestamp>
 start_uptime=<whole seconds of /proc/uptime>
 pid=<PID of run.sh>
+dnf_log_inode=<inode of /var/log/dnf.log before dnf-automatic, or none>
+dnf_log_offset=<its size then, or 0>
 ```
 
-The watchdog measures elapsed time from `start_uptime` (`CLOCK_BOOTTIME`);
-`watchdog.sh` does not read `start`. With no RTC, a run that starts before chrony synchronises sees the wall
-clock step forward by however long the host was off; timed by wall clock, that
-could trip the hard timeout and stop an rpm transaction minutes after it began. `/run`
-does not survive a reboot, so a recorded uptime always belongs to the current boot.
+The watchdog measures time on `CLOCK_BOOTTIME` (`/proc/uptime`, recorded in
+`start_uptime` and in its progress record); `watchdog.sh` does not read `start`. With no
+RTC, a run that starts before chrony synchronises sees the wall clock step forward by
+however long the host was off; timed by wall clock, that step would read as a long
+stall. `/run` does not survive a reboot, so a recorded uptime always belongs to the
+current boot.
 A state file without a numeric `start_uptime` is malformed and removed; `start` is
 for operators and is never used for timing. No pre-1.4 `run.sh` can write one
 while this watchdog is installed: `%pre` refuses to install over any version
@@ -294,23 +352,31 @@ the unit's `MainPID` (`systemctl show --property=MainPID`; `run.sh` is the unit'
 `ExecStart`). A live PID that differs was reused after the run died, and is handled
 as a dead run: the state file is removed, and the watchdog does not kill any process
 or reboot. A live PID with no numeric `MainPID` from `systemctl` is of unknown
-identity: the watchdog does not act on it, and past the soft timeout it fails its unit.
+identity: the watchdog does not act on it, and once the run has stalled it fails its unit.
 
 Right before any kill, `kill_service_cgroup` re-reads the state file and `MainPID`.
-The independent check takes minutes, in which the stuck run can end and the next run
-start updating; a kill on the old decision would stop that run mid-transaction and
-reboot. A changed `phase`, `start_uptime` or `pid`, or a `pid` that is no longer
+Between the stall verdict and the kill the stuck run can end and the next run start
+updating; a kill on the old verdict would stop that run mid-transaction. A changed `phase`, `start_uptime` or `pid`, or a `pid` that is no longer
 `MainPID`, abandons the recovery and leaves the state file alone (exit 0); a live `pid`
 with no numeric `MainPID` abandons it with exit 1.
 
+The stall is re-checked there too (`stall_still_holds`): the progress signature must be the
+one the stall was measured on, and dnf's phase, read again, must still allow a kill after
+that long. A run that wrote again, or reached its transaction, since the start of the cycle
+is left alone (exit 0); a signature that cannot be read again abandons the recovery with
+exit 1. This narrows the time between verdict and kill to that of two `systemctl` calls and
+does not close it, so the report after the kill reads the phase once more, from a log
+nothing writes any longer: a run that reached `Running transaction` in that instant is
+reported as a possibly incomplete transaction, never as having installed nothing.
+
 `systemctl kill` names the unit, not one invocation of it, so the re-check alone would
-leave a moment in which a new run could start and be killed, have its state file
-removed, and be rebooted under. The watchdog therefore creates
+leave a moment in which a new run could start and be killed and have its state file
+removed. The watchdog therefore creates
 `/run/dnf-automatic-reboot.recovery` before the re-check, and
 `dnf-automatic-reboot.service` carries
 `ConditionPathExists=!/run/dnf-automatic-reboot.recovery`: no run starts while the file
 exists, and a run that started before it shows in the re-check. The file covers the
-kill, the state-file removal and the reboot decision, and never outlives the watchdog:
+kill and the state-file removal, and never outlives the watchdog:
 the EXIT trap removes it on every exit, and the watchdog unit's `ExecStopPost=` removes it
 unconditionally, covering a watchdog stopped by `TimeoutStartSec=`. A timer start
 skipped by the condition waits for the next `OnCalendar=`.
@@ -320,7 +386,7 @@ removers:
 
 | Marker | Lifetime | Removed by |
 |--------|----------|------------|
-| `/run/dnf-automatic-reboot.recovery` | identity re-check, kill, state cleanup, reboot decision | the watchdog's EXIT trap; `ExecStopPost=` |
+| `/run/dnf-automatic-reboot.recovery` | identity re-check, kill, state cleanup | the watchdog's EXIT trap; `ExecStopPost=` |
 | `/run/dnf-automatic-reboot.reboot-pending` | from before a reboot request until the reboot | the reboot (emptying `/run`); `cancel-reboot.sh`; a request that submitted nothing, for the file it created |
 
 `dnf-automatic-reboot.service` carries `ConditionPathExists=!` for both. No timeout or
@@ -328,12 +394,13 @@ further condition is to be added to either marker.
 
 ### Reboot requests (`scripts/reboot-request.sh`)
 
-`run.sh`, `watchdog.sh`, `cancel-reboot.sh` and `reboot-if-pending.sh` source one library for
-the request and cancellation protocol; it is installed 0640 and never executed.
+`run.sh`, `cancel-reboot.sh` and `reboot-if-pending.sh` source one library for the request
+and cancellation protocol, and `watchdog.sh` sources it for its readers; it is installed
+0640 and never executed.
 
-**The invariant.** No script calls `systemctl reboot` directly. Every reboot is the transient
-`dnf-automatic-reboot-scheduled-reboot.service` running `reboot-if-pending.sh`, after
-`reboot_delay_sec` through its timer, or at once for the watchdog's hard timeout. Holding the
+**The invariant.** No script calls `systemctl reboot` directly, and only `run.sh` requests a
+reboot. Every reboot is the transient `dnf-automatic-reboot-scheduled-reboot.service` running
+`reboot-if-pending.sh`, `REBOOT_DELAY_SECONDS` after the decision through its timer. Holding the
 request lock, `reboot-if-pending.sh` reboots only while `.reboot-pending` exists, and writes
 `/run/dnf-automatic-reboot.reboot-dispatched` before it calls `systemctl reboot`. Holding the
 same lock, `cancel-reboot.sh` refuses when the dispatched file exists, and otherwise removes
@@ -344,8 +411,9 @@ on reading every systemd state exactly.
 
 **Lock.** `/run/dnf-automatic-reboot.reboot-request.lock` (`flock`). `request_reboot` holds it
 from before it creates `.reboot-pending` until the dispatch's outcome is known, waiting up to
-`reboot_request_lock_wait_sec`; `reboot-if-pending.sh` holds it from its marker check until
-`systemctl reboot` returns, waiting the same time (passed on its command line).
+`REBOOT_REQUEST_LOCK_TIMEOUT_SECONDS` (300); `reboot-if-pending.sh` holds it from its marker
+check until `systemctl reboot` returns, waiting the same time (passed on its command line, so
+a timer submitted by an earlier run keeps its arguments).
 `cancel-reboot.sh` takes it without waiting and refuses when it is held. `flock(2)` grants an
 exclusive lock through a read-only descriptor, so any user who can open the file can block
 every request: tmpfiles.d creates it `0600 root`, and `acquire_reboot_request_lock` creates
@@ -359,14 +427,14 @@ and unknown otherwise, because a request may still be on its way to systemd. Acc
 unknown keep `.reboot-pending`; rejected removes the one this request created. Unknown, and a
 process stopped mid-request (its EXIT trap), log the check and recovery commands and fail the
 unit; a late reboot still happens, because the marker is there. A run killed by SIGKILL
-mid-request has no trap: when the watchdog then decides no reboot is needed, it fails its
+mid-request has no trap: when the watchdog has stopped a run in its reboot check, it fails its
 unit if `.reboot-pending` exists with no reboot waiting or under way.
 
 **Reboot outcomes.** Holding the lock, `reboot-if-pending.sh` reads logind's `BlockInhibited`
 before each attempt (`read_shutdown_block_state`): `blocked` while a block-mode inhibitor names
 `shutdown`, as a package transaction's does, `unknown` for any answer not shaped `s "a:b"`.
 Only `free` reaches plain `systemctl reboot`. The check is the package's own: logind lets root
-override a block inhibitor, and `systemctl` run by root outside a terminal checks none.
+override a block inhibitor, and `systemctl` run by root checks none, at a terminal or not.
 `--check-inhibitors=yes` would check too, but it also refuses while any other user has a
 session, so one open SSH login would hold every reboot and, through the marker, every update
 run. An inhibitor taken between the read and the call is not honoured, as with `systemctl`'s
@@ -374,7 +442,7 @@ own check. The script exits 0 when the reboot is accepted, and when no reboot is
 the call fails it reads the shutdown state first: `yes` (logind accepted, perhaps delaying for
 an inhibitor) is success and is never requested again; `unknown` fails with the dispatched
 file kept; `no` removes it. Blocked, unreadable and `no` release the lock and try again every
-30 seconds until `reboot_inhibited_wait_sec` (default 1800) has passed, then fail, naming the
+30 seconds until `REBOOT_RETRY_TIMEOUT_SECONDS` (1800) has passed, then fail, naming the
 reason and the block inhibitors logind lists. Between attempts the reboot can be cancelled.
 Nothing in the package uses `--force`: the watchdog's kill ends the stuck run's own inhibitor,
 and any other inhibitor belongs to somebody else. Its `OnFailure=` notice says whether update
@@ -429,28 +497,29 @@ library's own readers, with transient probe units that run `/bin/true` or `sleep
 
 `PreparingForShutdown` under a delay inhibitor needs a real shutdown, and is read from the
 systemd 239 and 252 sources only. So are logind letting root override a block inhibitor and
-`systemctl reboot` by root outside a terminal checking neither inhibitors nor sessions. The
+`systemctl reboot` by root checking neither inhibitors nor sessions. The
 probe holds a block-mode shutdown inhibitor and checks that `read_shutdown_block_state` reports
 it.
 
-After the kill, the watchdog waits up to `watchdog_kill_confirm_sec` for systemd to report
+After the kill, the watchdog waits up to `KILL_CONFIRMATION_TIMEOUT_SECONDS` (300) for systemd to report
 the unit `inactive` or `failed`. A failed `systemctl kill`, or a unit still active then,
-is a failed recovery: the state file stays, the watchdog does not reboot, and it fails its
-unit. `kill_recorded_run` signals the cgroup only, not the recorded PID: by then that
+is a failed recovery: the state file stays, and the watchdog fails its unit. `kill_service_cgroup` signals the cgroup only, not the recorded PID: by then that
 number may belong to another process.
 
-Watchdog decisions by phase:
+The watchdog judges a run by progress alone, never by its age, and never reboots: the next
+run makes every reboot decision, with its delay and the kernel veto. `stall_window_minutes`
+picks the window from the recorded phase:
 
-| Phase | Soft timeout + dnf idle | Hard timeout |
-|-------|------------------------|--------------|
-| `updating` | Leave for hard timeout (unknown completion) | Kill cgroup + alert; reboot only if `force_reboot_on_hard_timeout=yes` |
-| `checking` | Run independent needs-reboot check, kill cgroup | Kill cgroup + reboot (dnf already returned cleanly) |
+| Phase | dnf phase | Killed after this long without progress | Then |
+|-------|-----------|------------------------------------------|------|
+| `updating` | `download`, `checked` | `PRE_TRANSACTION_STALL_TIMEOUT_MINUTES` (60) | alert: nothing installed, the next run retries |
+| `updating` | `transaction`, `unknown` | `TRANSACTION_STALL_TIMEOUT_MINUTES` (180) | alert naming `dnf history info last; dnf check` |
+| `checking` | not read | `REBOOT_CHECK_STALL_TIMEOUT_MINUTES` (60) | alert: the next run decides the reboot; a `.reboot-pending` left without a reboot fails the unit |
 
-The independent check can hang like the one it replaces, so it runs under `timeout`
-at three times `needs_restarting_timeout_sec` and counts as undecidable (code 2) when
-it does not finish. `dnf-automatic-watchdog.service` sets `TimeoutStartSec=15min`: a
-oneshot has no start timeout by default, and a watchdog that does not exit keeps the
-timer from starting the next cycle.
+A run of any other phase gets the longest window. `dnf-automatic-watchdog.service` sets
+`TimeoutStartSec=15min`: a oneshot has no start timeout by default, and a watchdog that does
+not exit keeps the timer from starting the next cycle. Its slowest path is the kill and up to
+`KILL_CONFIRMATION_TIMEOUT_SECONDS` to confirm it.
 
 Killing always targets the whole service cgroup via `systemctl kill --kill-whom=all`
 (`--kill-who=all` on systemd older than 252, the release that renamed it; systemd 239
@@ -458,15 +527,60 @@ accepts only the old spelling, 252 accepts either; `systemctl_kill_target_option
 it from
 `systemctl --version`). On RHEL 8.10 (systemd 239), `--kill-who=all --signal=SIGKILL`
 on a transient unit killed an orphaned grandchild left in its cgroup, which is the case
-this kill exists for. `dnf-automatic` runs behind `systemd-inhibit` and
-`timeout(1)`, so signalling the recorded PID and its direct children leaves the rpm
-transaction running while the caller proceeds to reboot.
+this kill exists for. `dnf-automatic` runs behind `systemd-inhibit`, so signalling the
+recorded PID and its direct children leaves the rpm transaction running.
 
-At hard timeout in `phase=updating` an rpm transaction may be half-applied. That is
-the same uncertainty for which the dead-PID path already refuses to reboot, so the
-default is to kill and alert. The reboot never uses `--force`, which remounts filesystems
-read-only under running processes, risks the rootfs on a flash-backed host, and overrides
-other users' inhibitors.
+A run is never stopped while it works: a download over a slow link can take days, and an
+upgrade to the next minor EL release on a Raspberry Pi takes hours. dnf-automatic runs with no
+deadline; there is no setting for one, since a deadline stops dnf mid-transaction as readily
+as mid-download. Every watchdog cycle of a run, in either phase, records its progress
+signature in `/run/dnf-automatic-reboot.progress`: the
+processes in the unit's cgroup (`ControlGroup`, read from `cgroup.procs` under
+`/sys/fs/cgroup`, the systemd v1 hierarchy, or `unified`) and the sum of their `rchar` and
+`wchar` from `/proc/PID/io`. librepo writes each downloaded chunk to its file as it arrives,
+and rpm and its scriptlets read and write files, so both show; any change counts, a process
+starting or exiting included. dnf's cache and logs are not read for progress: every dnf command,
+`dnf-makecache.timer`'s included (every one to two hours on the surveyed hosts), writes its
+start line to `dnf.log` and `dnf.rpm.log`, so counting them would keep a hung run's window open
+indefinitely. The
+record carries the run's `pid` and `start_uptime`; a cycle that finds another run's record, or
+none, counts as progress now. Counters that cannot be read, or a record that cannot be written,
+kill nothing and fail the watchdog. dnf's own `minrate`, `timeout` and `retries` are left
+alone.
+
+How long a stall is tolerated depends on whether rpm has started changing the system, which
+`read_dnf_run_phase` reads from the run's part of `dnf.log`. dnf 4 writes each line as
+`<timestamp> <LEVEL> <message>`; its logging setup writes `--- logging initialized ---` at
+start, and `base.py` writes, at `INFO`, `Running transaction check`, `Transaction check
+succeeded.`, `Running transaction test`, `Transaction test succeeded.` and, right before rpm's
+transaction, `Running transaction`. Only those whole messages count (allowlist). `run.sh` records
+the log's inode and size in the state file before dnf-automatic starts; the watchdog reads from
+there, through one rotation to `dnf.log.1`. A run whose start line the parser has not
+recognised is `unknown`, as is a log it cannot follow (no position, a second rotation,
+`log_compress`): a log format other than the expected one never reads as "before the
+transaction". Another dnf command during the run can only add a `Running transaction`, which
+is the cautious direction.
+
+- `download` or `checked`: nothing installed; the next run finds the downloads in the cache.
+- `transaction` or `unknown`: a scriptlet rebuilding SELinux policy or an initramfs can run
+  long without a log line, hence the longer window.
+
+The windows are constants, and no setting turns them off: a window of 0 would kill a run
+whatever it does, mid-transaction included. `tools/verify-el-prerequisites.sh` checks the
+messages, the line format and the log settings. On the surveyed OL 9.8 (dnf 4.14) and RHEL
+8.10 (dnf 4.7) hosts it found all six messages in the source and in `dnf.log` as
+`<timestamp> INFO <message>`, in this order for every transaction, with `log_size` 1 MB,
+`log_rotate` 4 and `log_compress` off.
+
+A run's length does not depend on the timer: a timer elapse during a run requests a start of
+an activating oneshot, which joins the running start job, so that elapse is skipped, never
+overlapped. This is systemd's job model; the probe checks it.
+
+A run stopped in `phase=updating` may leave an rpm transaction half-applied. That is the same
+uncertainty for which the dead-PID path already refuses to reboot, so the watchdog alerts,
+naming `dnf history info last; dnf check`. No reboot in this package uses `--force`, which
+remounts filesystems read-only under running processes, risks the rootfs on a flash-backed
+host, and overrides other users' inhibitors.
 
 ### State files under `/var/lib/dnf-automatic-reboot/`
 
@@ -507,9 +621,12 @@ for pkg in installed.filter(name=NEED_REBOOT):
 
 `NEED_REBOOT` is a fixed list — `kernel`, `kernel-core`, `kernel-rt`, `glibc`,
 `linux-firmware`, `systemd`, `dbus`, `dbus-broker`, `dbus-daemon`, `microcode_ctl` —
-extended by `*.conf` drop-ins in `/etc/dnf/plugins/needs-restarting.d/` (this is how
-`kernel-uek` enters the list on OL9). **There is no version comparison anywhere in
-the plugin.**
+extended by `*.conf` files in `/etc/dnf/plugins/needs-restarting.d/`, which the plugin on
+both surveyed hosts reads. Oracle's OL9 build
+(`python3-dnf-plugins-core-4.3.0-*.0.1.el9`) adds `kernel-uek` and `kernel-uek-core` to the
+list itself; the surveyed OL 9.8 host has no `needs-restarting.d` directory of its own. The
+package ships `automatic-reboot.conf` there, naming `audit`.
+**There is no version comparison anywhere in the plugin.**
 
 The code quoted in this section is the EL9 plugin (dnf-plugins-core 4.3). The EL8
 plugin (4.0.21) has the same per-package test and `NEED_REBOOT` list, but does not read
@@ -524,8 +641,8 @@ without RTC"; it is simply not the one it uses.
 
 Consequences for this repo:
 
-- Fitting an RTC (DS3231 on i2c) removes the cause outright and makes
-  `filter_packages` and restart-state learning dead weight. Everything below is a
+- Fitting an RTC (DS3231 on i2c) removes the cause outright and makes the build-id
+  check and restart-state learning dead weight. Everything below is a
   workaround for a host that has none.
 - `chrony-wait.service` narrows but does not close the window: it gates
   `time-sync.target`, not the earlier moment at which systemd records
@@ -533,22 +650,35 @@ Consequences for this repo:
 
 ## Known false positives (needs-reboot.sh handles automatically)
 
-### Kernel packages (aarch64 and x86_64)
+### Kernel packages: the running family
 
-`uname -r` and rpm's `%{VERSION}-%{RELEASE}.%{ARCH}` are the same string on both UEK
-and stock EL kernels, so the cross-check is an equality test, not a substring
-search. The arch-stripped form is accepted as well, for kernels whose release string
-carries no arch suffix. Equal = the running kernel already is the newest installed
-one = false positive. Different = genuine. Covers `kernel-uek`/`kernel-uek-core`
-(aarch64 UEK) and `kernel`/`kernel-core` (x86_64 RHEL 8/9) with the same code path.
-Packages not installed on the running system are treated as genuine, not skipped.
+`needs-reboot.sh` decides once for the family of the running kernel: the package that
+owns `/lib/modules/$(uname -r)/vmlinuz` (`kernel-uek-core`, `kernel-core`) and its meta
+package, the same name without `-core` (`kernel-uek`, `kernel`), which owns no files on
+either surveyed host. Every flagged name of the family gets the same verdict, and the
+attempt is counted once, under the `-core` package's name.
+
+The family's installed releases are the `/lib/modules/<release>/vmlinuz` paths
+`rpm -ql` lists for the `-core` package. A module directory name is what `uname -r`
+prints for that kernel, `+rt` and `+64k` suffixes included, which rpm's
+`%{VERSION}-%{RELEASE}.%{ARCH}` does not carry; so the check is an equality test
+whatever the release string holds. Running == newest = false positive. Different =
+genuine.
 
 Before a genuine kernel reboot is scheduled, `grubby --default-kernel` must already
-point at `/boot/vmlinuz-<newest installed>`. If it does not, rebooting would return
-to the same kernel and be requested again on the next run — an unbounded reboot loop
-on a host whose `saved_entry` never advances. The reboot is withheld and logged at
-error level. `kernel_reboot_attempt_limit` is the backstop for every other cause of
-a kernel that never becomes the running one.
+point at `/boot/vmlinuz-<newest release>`. If it does not, rebooting would return to the
+same kernel and be requested again on the next run — an unbounded reboot loop on a host
+whose `saved_entry` never advances. `KERNEL_REBOOT_ATTEMPT_LIMIT` (3) is the backstop for
+every other cause of a kernel that never becomes the running one; a `grubby` answer that
+is not a kernel path is not read as stale, and the limit still counts that reboot.
+
+A stale default, the attempt limit reached, a running `vmlinuz` no package owns, a
+family with no readable release, and a flagged `kernel*` package of another family
+(RHCK updated on a UEK host) each set `REBOOT_WITHHELD`, and `main` exits 2 whatever else
+is flagged: a glibc or systemd reboot does not carry the host onto the kernel it
+already runs. The error names the repair (`grubby --set-default`, the
+`GRUB_UPDATE_DEFAULT_KERNEL` and `DEFAULTKERNEL` lines, or the attempt file to remove).
+The kernel check is always on; there is no setting that turns it or the GRUB check off.
 
 ### systemd (all)
 
@@ -565,8 +695,8 @@ Requires `elfutils` (hard RPM dependency).
 
 ### Any non-kernel package (self-learning)
 
-Packages outside `filter_packages` (e.g. `glibc`) have no build-id-verifiable owned
-daemon binary, so `verify_build_id`'s `/proc/*/exe`-ownership check does not apply to
+Packages other than the kernel family and `BUILD_ID_VERIFIED_PACKAGES` (`systemd`), such
+as `glibc`, have no build-id-verifiable owned daemon binary, so `verify_build_id`'s `/proc/*/exe`-ownership check does not apply to
 them. `needs-reboot.sh` instead learns their restart-state by observation, recorded in
 [`restart-state`](#state-files-under-varlibdnf-automatic-reboot): a package/EVR pair
 reaches `confirmed` (skipped, no reboot) only once it is still flagged by
@@ -576,11 +706,11 @@ The first observation of a given package/EVR pair always triggers one reboot —
 reboot is what proves the flag spurious or genuine. A new EVR on an
 already-`confirmed` package starts a fresh, unverified cycle, so a real future update
 is never masked by an old confirmation. `kernel*` packages are exempt; the
-version-string check above remains their sole authority. Packages in `filter_packages` are
+version-string check above remains their sole authority. `BUILD_ID_VERIFIED_PACKAGES` are
 exempt too: a build-id mismatch, or a build-id that cannot be verified, keeps the package, and
 no recorded `confirmed` row can overrule it. Only packages that reach the learning branch of
-`classify_flagged_packages` (`LEARNABLE_PACKAGE_NAMES`) are learned. Controlled by
-`learn_false_positives` in `automatic-reboot.conf`.
+`classify_flagged_packages` (`LEARNABLE_PACKAGE_NAMES`) are learned. Learning is always on:
+without it, a host with no RTC reboots for glibc at every run.
 
 ## What `needs-restarting -r` does not cover
 
@@ -591,18 +721,71 @@ with no reboot flag raised.
 
 `run.sh` closes this with a `needs-restarting -s` pass, which walks `/proc/*/smaps`
 and names the affected systemd units. Units are restarted with `systemctl try-restart`
-so a unit that is not running is left alone, each under `restart_service_timeout_sec`,
-and the pass is skipped entirely when a reboot is already scheduled. `restart_services_exclude` holds the units that must
-never be restarted from underneath a running system — `dbus`/`dbus-broker` break every
-client holding a bus connection, `systemd-logind` drops session tracking, and the two
-units of this package would kill the run. Extend that list, never shorten it.
+so a unit that is not running is left alone, each under `service_restart_timeout_seconds`,
+and the pass is skipped entirely when a reboot is already scheduled. Every flagged unit is
+judged before any is restarted.
+`BUILT_IN_EXCLUDED_UNIT_PATTERNS` in `run.sh` holds the units that must never be restarted
+from underneath a running system — `dbus`/`dbus-broker` break every client holding a bus
+connection, `systemd-logind` drops session tracking, `user@`, `getty@` and `autovt@` end
+sessions, and this package's units would kill the run. systemd refuses to restart
+`auditd.service` (`RefuseManualStop=yes`); it runs the updated version after the next reboot,
+which an update to the `audit` package requests through the shipped `needs-restarting.d`
+drop-in. `needs-reboot.sh` handles `audit` as any flagged non-kernel package.
+`restart_services_excluded_patterns` adds to it and cannot remove from it. Extend that
+list, never shorten it.
 
-A restart that fails, one still unfinished at `restart_service_timeout_sec`, and a
+`needs-restarting` flags a unit when a process of it maps a file of a package installed after
+the start it computes for that process, and it takes the start from `/proc/PID/stat` split
+on spaces. A process name holding a space, such as spamd's `spamd child`, shifts the fields:
+the start reads as 0, the process as old as the boot, and its unit is flagged at every run
+once it maps a file installed since boot. `run.sh` therefore reads its own evidence for every
+flagged unit, from the processes in the unit's cgroup (`read_unit_code_state`):
+
+| State | Evidence | Restartable unit | Never-restart unit |
+|-------|----------|------------------|--------------------|
+| `stale` | a process maps a deleted file of a package installed after that process started: an update replaced it | restart | reboot if in `REBOOT_REQUIRING_UNIT_NAMES`, else reported |
+| `current` | no process maps a deleted file a package owns, and every process started after the newest rpm `INSTALLTIME` | left running, named `flagged but on current code` | the same |
+| `unknown` | anything else: a deleted package file with no later install, an older process, no process found, an unreadable `maps`, `stat`, `btime` or `CLK_TCK`, an rpm query that failed | restart | reported as `excluded from restart, still on pre-update code` |
+
+Both halves of `current` are needed. A worker forked after an update keeps the mappings of
+its older parent, so a recent start alone proves nothing; code read at start, as an
+interpreter's is, shows in no mapping, so the start has to be recent too. The start is
+counted from the last `)` of the stat line and added to `btime`.
+
+A deleted mapping is judged by its owner (`rpm -qf`), after dropping the `;<hex>` suffix rpm
+gives a file it replaces, as the plugin does; on the surveyed RHEL 8.10 host a replaced
+library reads `<path> (deleted)`, without the suffix. One no package owns, such as a memfd or a
+temporary file, is not evidence. One a package owns is `stale` only when that package was
+installed after the process started: an application rewriting its own package-owned data file
+is deleted and owned too, and a reboot for it would come back at every rewrite. A query that
+fails is neither "owned" nor "not owned".
+
+`REBOOT_REQUIRING_UNIT_NAMES` holds the never-restart daemons whose pre-update code only a
+reboot replaces: `dbus`, `dbus-broker`, `systemd-logind` and `auditd`. A getty or a user
+manager is replaced when its session ends, an operator's own exclusion by the operator. The
+four are judged at every pass, listed by `needs-restarting -s` or not. When one is `stale`
+and `needs-reboot.sh` exited 0, `run.sh` restarts nothing and requests the reboot through
+`request_reboot`, as for a flagged package. Only `stale` requests it, never `unknown`: after
+the reboot no process maps a file replaced since it started until another update replaces
+one, so the request cannot repeat. A reboot `needs-reboot.sh` withheld (exit 2) is not
+requested for a daemon either, and `restart_services = no` turns off the whole pass, this
+reboot included.
+
+A restart that fails, one still unfinished at `service_restart_timeout_seconds`, and a
 `needs-restarting -s` that cannot list the units each leave pre-update code running, so
-each fails the run. An excluded unit does not: it is left running by design. The run
+each fails the run. An excluded unit does not: it is left running by design, or the host
+reboots for it. The run
 ends with one line naming the update, reboot and restart outcome, for example
 `Updates installed (packages: 3); no reboot needed; restart still pending for sshd.service. Check:
 systemctl status sshd.service`, logged and sent through `wall`.
+
+The inhibitor `run.sh` takes, and rpm's own, hold a reboot asked for by an unprivileged user
+at a terminal and the package's scheduled reboot. They do not hold one typed by root:
+`systemctl` skips its inhibitor check for root, and logind lets root override a block. systemd
+then stops the unit like any other, SIGTERM and after `DefaultTimeoutStopSec` SIGKILL, and a
+transaction still installing is cut off. The `wall` message at the start of every run, and the
+completion line at its end, are what tell a logged-in root not to reboot in between; both are
+always sent.
 
 ## `dnf-automatic` on EL8
 
@@ -613,9 +796,10 @@ and a run that installed a newer kernel logged no reboot attempt. A `reboot` or
 update waits for a manual reboot unless this package performs it. On Oracle Linux 9.8,
 `/usr/lib/python3.9/site-packages/dnf/automatic/main.py` defines both options and reboots
 when `reboot` is `when-changed`, or `when-needed` and `base.reboot_needed()` is true; it runs
-`reboot_command` through `os.system` and raises an error on a non-zero exit code. `%pre` and `check_conflicts`
-still require `reboot = never` on EL8: the key is inert there and is honoured on EL9, and one
-rule for both keeps the file's meaning the same across platforms.
+`reboot_command` through `os.system` and raises an error on a non-zero exit code. `%pre` and
+`check_conflicts` judge the file by what dnf-automatic's loader reads, and EL8's has no
+`reboot` option, so on EL8 the key is not checked. After an upgrade to EL9 the key takes
+effect, and `check_conflicts` refuses the first run if it is not `never`.
 
 With a correct clock, `needs-restarting -r` flagging a kernel means a kernel package was
 installed during this boot, which under unattended updates is a newer kernel awaiting a
@@ -647,7 +831,8 @@ an unsigned repository is a code path nobody is watching, so it must at least be
 loud.
 
 The check reads `/etc/yum.repos.d/*.repo` and `/etc/dnf/dnf.conf` and reports
-only an explicit `gpgcheck=0` in a section that is not explicitly disabled. dnf's
+only an explicit `gpgcheck=0` in a section that is not explicitly disabled, `enabled=`
+taking libdnf's false values (`0`, `no`, `false`, `off`, in any case). dnf's
 own default is deliberately not modelled: a check that reports repositories which
 are in fact fine becomes a check operators learn to ignore. It reports and
 continues rather than aborting — a local unsigned repository is somebody's
@@ -657,30 +842,37 @@ deliberate choice, and refusing to patch the host is the worse outcome.
 is filtered to existing paths first. Passing an unexpanded glob would have the
 same effect.
 
-## Advisories dnf will not apply
+## Advisories an update did not install
 
-`run.sh` reports, after each update, any security advisory that applies to this
-host but that dnf refuses to install.
+`run.sh` reports, after each update, every security advisory that applies to this
+host but that the update did not install.
 
-`dnf updateinfo` reads the whole package sack; the depsolver does not. A
-repository `priority=`, an `excludepkgs=`, a disabled channel or a versionlock
-can leave an advisory permanently visible-but-unappliable, and the update run
+A repository `priority=`, an `excludepkgs=`, a versionlock or a dependency dnf cannot
+satisfy can keep an advisory's update off the host for good, and the update run
 reports success either way. The host simply never receives the fix, and nothing
 says so — the same class of silent failure this package exists to prevent, one
 layer further down.
 
-The check compares what dnf itself reports as applicable
-(`updateinfo list --updates --security`) against whether a security transaction
-resolves to anything (`check-update --security`, exit 100 = yes, 0 = none). That
-catches any cause without enumerating causes. It runs *after* `dnf-automatic`,
-where anything still outstanding is genuinely stuck rather than merely pending.
+The check runs only after `dnf-automatic` has exited 0, set by the gate to download and
+install every update of its `upgrade_type`. That run is the transaction check: an
+advisory still listed by `--disableexcludes=all updateinfo list --updates --security`
+afterwards is one dnf did not install, whatever kept it out, so no cause is
+enumerated and no second transaction is resolved. `check-update` would not do: it
+lists updates without resolving a transaction, and its exit 100 means any one is
+listed. `--updates` lists only packages the sack offers, and `excludepkgs=` takes
+packages out of the sack, hence `--disableexcludes=all`; versionlock filters only
+while dnf resolves a transaction, which `updateinfo` does not. An older kernel kept
+beside a newer one is not listed: on RHEL 8.10 (three kernels installed) and OL 9.8
+(two), with over a hundred security advisories on the installed kernels, the listing
+named no kernel row. Every package row is
+reported, as `ID (PACKAGE, PACKAGE)`: one advisory can cover several packages and only
+some be kept out. It is one query under `dnf_query_timeout_seconds`; a listing that
+fails is logged as an incomplete report, not read as "nothing outstanding".
 Advisory IDs are matched by shape (`PREFIX-YEAR-NUMBER` as Oracle's `ELSA-2026-26533`,
 `PREFIX-YEAR:NUMBER` as Red Hat's `RHSA-2020:3011`, either with an optional `-REVISION`
 as Oracle's `ELSA-2026-60226-0`; EPEL's `FEDORA-EPEL-2024-bf31852fe0` has a dash-joined
-prefix and a hexadecimal number), so a line of any other shape in
-the output is not reported as an advisory. Known gap: `check-update --security`
-exits 100 when any security update is installable, so a stuck advisory next to an
-installable one is logged as outstanding at warning level, not at error level.
+prefix and a hexadecimal number), so a line of any other shape in the output is not
+reported as an advisory; a package field of another shape reports the advisory with `?`.
 
 **Repository priority is the trap to know.** `dnf.conf(5)`: *"If there is more
 than one candidate package for a particular operation, the one from a repo with
@@ -693,10 +885,9 @@ and `kernel*` are distinct package names and never compete, so UEK needs no
 priority.
 
 ```bash
-# Does anything apply that dnf will not install?
-dnf updateinfo list --updates --security      # what dnf says applies
-dnf check-update --security; echo "rc=$?"     # 100 = actionable, 0 = nothing
-dnf --assumeno --setopt='*.priority=99' update --security   # levels priorities
+# What applies that the last run did not install, and what keeps it out
+dnf --disableexcludes=all updateinfo list --updates --security
+dnf --assumeno --disableexcludes=all --setopt='*.priority=99' update --security
 ```
 
 ## Repository metadata is refreshed before every update
@@ -709,11 +900,10 @@ records which a run had, one line per repository: `using cache for` or `has expi
 will be refreshed`.
 
 `run.sh` runs `dnf -q makecache --refresh` after the clock check and before the state file,
-under `timeout` at `metadata_refresh_timeout_sec` (default 900). A refresh that fails or
+under `timeout` at `metadata_refresh_timeout_seconds` (default 1800, for a slow link). A refresh that fails or
 runs out of time warns, the run continues from the cache as `dnf-automatic` alone would, and
 the completion line adds `(metadata refresh failed, cached metadata used)`: "No updates
-installed" then describes the cache, not the repositories. `refresh_metadata = no` turns
-the step off.
+installed" then describes the cache, not the repositories. The step is always on.
 
 `dnf-makecache.timer` is dnf's, enabled by the distribution preset, and the package neither
 requires, checks nor disables it. After a run's refresh, `dnf makecache --timer`
@@ -721,7 +911,7 @@ requires, checks nor disables it. After a run's refresh, `dnf makecache --timer`
 rebuilds the sack from the cache, and logs `will expire after N seconds`; `--refresh` does
 not touch `last_makecache`, so the timer keeps its own cadence. It still serves every other
 reader of the cache: interactive `dnf`, anything running `dnf -C`, and `needs-reboot.sh`
-outside `run.sh`. With `refresh_metadata = no` the run depends on it again.
+outside `run.sh`.
 
 ## UEK GRUB BLS default (kernel not booted after update)
 
@@ -749,8 +939,8 @@ Setting `boot_success=1` at every boot would disarm that rollback, so this packa
 never touches `grubenv` flags.
 
 The running kernel's package is the one `rpm -qf /lib/modules/$(uname -r)/vmlinuz`
-names. `verify_grub_default` in `needs-reboot.sh` is the runtime check that the
-default still advances — see [Kernel packages](#kernel-packages-aarch64-and-x86_64).
+names. `grub_default_is_kernel_release` in `needs-reboot.sh` is the runtime check that
+the default still advances — see [Kernel packages](#kernel-packages-the-running-family).
 
 ## Time synchronisation gate
 
@@ -761,15 +951,15 @@ ordered `Before=time-sync.target`, so that dependency is satisfied trivially and
 means nothing on its own.
 
 `chrony` ships `chrony-wait.service` — `chronyc waitsync`, ordered
-`Before=time-sync.target` — disabled by default. `%post` enables it when
-`[time] enable_chrony_wait = yes`. It is never disabled on erase: a synchronised
+`Before=time-sync.target` — disabled by default. `%post` enables it whenever the unit
+exists. It is never disabled on erase: a synchronised
 clock is not this package's to take away. `%post` does not start it for the current boot.
 
 The unit ordering does not require a successful synchronisation: `time-sync.target` is
 reached even when `chrony-wait.service` fails (systemd issue 4880). `run.sh` therefore
 checks the clock itself before installing anything: `wait_for_clock_sync` runs
 `chronyc waitsync` (every 10 s, remaining correction below 0.1 s) for at most
-`clock_sync_wait_sec` (default 600) under `timeout`, since each request adds its own time to
+`clock_sync_timeout_seconds` (default 600) under `timeout`, since each request adds its own time to
 the polling interval and the run is not yet supervised by the watchdog; a run whose clock
 chronyd has not confirmed by then installs nothing and fails. The waiting query's output is
 discarded, since a client stopped by `timeout` can lose what it buffered; the error carries the
@@ -804,7 +994,18 @@ compares ELF notes and does not read the clock, so skew does not affect it.
 ## RPM packaging rules
 
 - `%config(noreplace)` on the config file and the logrotate drop-in — local edits
-  survive upgrades.
+  survive upgrades. rpm replaces an unedited config and keeps an edited one, writing the new
+  file beside it as `.rpmnew`. An edited copy with a key this version does not read is
+  invalid: every run fails, naming the line, until an operator replaces it, and
+  `OnFailure=` reports it, since an unattended upgrade shows `%posttrans` output to nobody.
+  `%posttrans` runs `check-config.sh`, which validates the file, names every error and the
+  commands that keep a backup and install `.rpmnew` or the shipped copy in
+  `/usr/share/dnf-automatic-reboot/` (not `%doc`, which `--excludedocs` drops), or lists
+  the values that differ. Neither edits
+  the file.
+- `%dir` on `/etc/dnf/plugins/needs-restarting.d` and `%config(noreplace)` on the drop-in in
+  it. The plugin reads every line of it as a package name, so the Makefile and `%install`
+  remove the repository file's `#` header.
 - `%ghost` on the log file and both state files — RPM owns the path and SELinux label
   without owning content. `systemd-tmpfiles --create` in `%post` materialises them.
 - `%dir` on `/var/lib/dnf-automatic-reboot/` and on `%{_libexecdir}/%{name}` — both are
@@ -823,9 +1024,21 @@ compares ELF notes and does not read the clock, so skew does not affect it.
   the ESP copy, on EL9 EFI the ESP copy is a `configfile` stub), unable to advance
   the default on a kernel update (`GRUB_UPDATE_DEFAULT_KERNEL`, plus `DEFAULTKERNEL`
   on EL9, and the default already on the newest installed kernel), running a pre-1.4
-  version, or with `/etc/dnf/automatic.conf` not set
-  to `reboot = never` and `apply_updates = yes` (dnf-automatic defaults a missing
-  `apply_updates` to false and then exits 0 after only downloading).
+  version, or with an `/etc/dnf/automatic.conf` from which dnf-automatic would not
+  download and install every update and leave the reboot to this package. The file is
+  not parsed here: `AUTOMATIC_CONFIG_QUERY` in `run.sh` asks dnf-automatic's own
+  loader (`dnf.automatic.main.AutomaticConfig`, run by `/usr/libexec/platform-python -I`)
+  what it reads. The interpreter needs no `Requires`: EL8's `platform-python` runs dnf
+  itself, and on OL 9.8 `python3` owns it, the package behind `/usr/bin/python3`, under
+  which dnf-automatic runs. The gate requires `apply_updates` and `download_updates` true (with
+  either off, dnf-automatic exits 0 having installed nothing), `upgrade_type` `default` or
+  `security`, and `reboot` `never`, or absent from the loader, as on EL8. A file the loader
+  cannot parse, or an answer of another shape, is refused. A comment after a value, a key
+  outside `[commands]` or a later `[commands]` section, indented or not, therefore counts
+  exactly as dnf-automatic counts it: `apply_updates = yes # comment` read as `False` on
+  RHEL 8.10 (dnf 4.7) and OL 9.8 (dnf 4.14). The refusal names the four lines to set.
+  `%pre` carries a copy of the query and of its answer's shape, and a test keeps them
+  identical.
   `Requires(pre): dnf-automatic` puts that file in place before `%pre` reads it, and
   `run.sh` `check_conflicts` repeats the `automatic.conf` and stock-timer checks at
   every start, failing the run through `OnFailure=`. `GRUB_SAVEDEFAULT=true` only
@@ -839,6 +1052,11 @@ compares ELF notes and does not read the clock, so skew does not affect it.
 - `Requires: chrony` — `run.sh` runs `chronyc waitsync` before every update; `%pre` checks
   it too, for `--nodeps`. Installed does not mean running or synchronised, so the runtime
   check stays.
+- `Requires: rpm-plugin-systemd-inhibit` — rpm's plugin holds a block-mode shutdown inhibitor
+  for every transaction, one started by hand included, and `reboot-if-pending.sh` waits while
+  one is held. dnf 4 takes none of its own. `%pre` checks it for `--nodeps`. On both surveyed
+  hosts it is installed and loaded (`%{__transaction_systemd_inhibit}`), from AppStream on
+  OL 9.8 and BaseOS on RHEL 8.10.
 - `Requires: systemd >= 239` — EL8's systemd. Every unit directive and systemctl
   option the package uses exists there; the one renamed option is chosen at runtime
   (see the state file section).
@@ -856,9 +1074,9 @@ compares ELF notes and does not read the clock, so skew does not affect it.
 
 ## Known limitations
 
-`newest_installed_kernel_version` sorts with `sort -V` over
-`%{VERSION}-%{RELEASE}.%{ARCH}`, which is not rpm's comparison algorithm and
-ignores epoch. It orders real UEK and EL release strings correctly (`4.10` above
+`newest_installed_kernel_release` sorts the module directory names with `sort -V`,
+which is not rpm's comparison algorithm and ignores epoch. It orders real UEK and EL
+release strings correctly (`4.10` above
 `4.4` above `4.3.1`, covered by a test) and kernel packages do not carry an
 epoch, so this is accurate in practice. Anything that gives kernels an epoch, or
 a release string using rpm's `~`/`^` operators, needs `rpmdev-vercmp` instead.
@@ -867,7 +1085,7 @@ a release string using rpm's `~`/`^` operators, needs `rpmdev-vercmp` instead.
 
 1. **No RTC on the RPi4.** See [Root cause](#root-cause-of-every-false-positive-a-wrong-clock-at-boot).
    Fitting a DS3231 (or DS1307) on i2c removes the entire false-positive problem
-   class and makes `filter_packages` and restart-state learning unnecessary. The
+   class and makes the build-id check and restart-state learning unnecessary. The
    overlay goes in `/boot/efi/config.txt` (`dtoverlay=i2c-rtc,ds3231`); run
    `hwclock --systohc` after the first NTP sync, and disable any fake-hwclock
    service that conflicts.
@@ -926,9 +1144,13 @@ systemd-inhibit --list
 systemctl list-dependencies time-sync.target --reverse
 systemctl is-enabled chrony-wait.service
 
-# Kernel default must match the newest installed kernel
+# Kernel default must match the newest installed kernel of the running family
 grubby --default-kernel
-rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' kernel-uek-core | sort -V | tail -1
+rpm -ql "$(rpm -qf "/lib/modules/$(uname -r)/vmlinuz" --qf '%{NAME}\n')" \
+  | sed -n 's#^/lib/modules/\([^/]*\)/vmlinuz$#\1#p' | sort -V | tail -1
+
+# Validate the config; list what differs from the shipped one
+/usr/libexec/dnf-automatic-reboot/check-config.sh
 
 # Learned state
 column -t /var/lib/dnf-automatic-reboot/restart-state
@@ -946,7 +1168,9 @@ tail -f /var/log/dnf-automatic-reboot.log
 ## What not to do
 
 - Do not add `setenforce 0` or `permissive` as a workaround for any SELinux denial.
-- Do not hardcode policy (timeouts, package names) in scripts — use `get_config_value`.
+- Do not hardcode policy (timeouts, package names) in scripts — add the key to
+  `CONFIG_SCHEMA` and the shipped config, and read it with `config_value`. Do not parse
+  the config anywhere else, and do not let a doubtful value fall back to a default.
 - Do not parse tool output with a blocklist of known-uninteresting lines, and do not
   fold stderr into a parsed stream. Match the shape you want and discard the rest.
 - Do not treat an unverifiable state as a false positive. "Cannot tell" keeps the
@@ -955,8 +1179,15 @@ tail -f /var/log/dnf-automatic-reboot.log
   except the two documented enablement cases.
 - Do not downgrade `Requires: elfutils` to `Recommends` — `eu-readelf` is required for
   the build-id path.
-- Do not filter a package in `filter_packages` without confirming the false positive
-  with the build-id or version cross-check first.
+- Do not add a package to `BUILD_ID_VERIFIED_PACKAGES` unless all of its code runs in
+  binaries it owns: a library such as glibc runs inside other packages' processes, which
+  the build-id check does not cover.
+- Do not add a setting that turns off the kernel version check, the GRUB default check
+  or a stall window, or accept compatibility aliases for keys of earlier versions. A new
+  setting needs a reason an operator would change it and a range in which every value
+  is safe; otherwise it is a constant.
+- Do not let the watchdog reboot, or stop a run for its age: it stops a run that has
+  stalled, and the next run decides the reboot.
 - Do not key restart-state entries on package name alone — always name + EVR, so a
   genuine future update is never masked by an old confirmation.
 - Do not match state-file rows with `grep` — use `awk -F'\t' '$1 == name'`, or
@@ -964,7 +1195,7 @@ tail -f /var/log/dnf-automatic-reboot.log
 - Do not extend restart-state learning to `kernel*` packages — the version-string
   check is their sole, more authoritative, source of truth.
 - Do not kill the run by PID — `systemctl kill` the whole unit, or
-  `dnf-automatic` survives behind `timeout(1)`.
+  `dnf-automatic` survives behind `systemd-inhibit`.
 - Do not use `systemctl reboot --force`, nor `--check-inhibitors=yes`, which also refuses
   while another user is logged in. Reboot only through `reboot-if-pending.sh`, after
   `read_shutdown_block_state` reports `free`.

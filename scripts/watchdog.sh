@@ -6,32 +6,38 @@
 # Runs every 5 minutes via dnf-automatic-watchdog.timer, completely
 # independent of the main run.sh service unit.
 #
-# Handles four scenarios:
+# It judges a run by progress alone, never by its age: a run whose processes
+# keep reading or writing is left to finish, however long it takes.  It never
+# reboots; the next run makes every reboot decision.
 #
 #  1. No state file     - Nothing is running; exit immediately.
 #
 #  2. Dead PID          - run.sh crashed uncleanly.  State is unknown.
 #                         Clean up lock files, emit a wall warning.
-#                         Do NOT reboot: updates may be partial.
 #
-#  3. PID alive, hard   - run.sh has been running longer than
-#     timeout exceeded    watchdog_hard_timeout_min.  Kill the service
-#                         cgroup.  Reboot only when the recorded phase
-#                         proves dnf already returned cleanly, or when
-#                         force_reboot_on_hard_timeout says otherwise.
+#  3. Stalled run       - The run's processes have read and written nothing
+#                         for the window of the phase it is in, so its
+#                         service cgroup is killed:
+#                           PRE_TRANSACTION_STALL_TIMEOUT_MINUTES while it
+#                             updates and dnf.log shows rpm's transaction not
+#                             yet started: nothing was installed
+#                           TRANSACTION_STALL_TIMEOUT_MINUTES while it updates
+#                             otherwise: packages may be half-installed, and
+#                             the alert names the commands that show what to
+#                             repair
+#                           REBOOT_CHECK_STALL_TIMEOUT_MINUTES in its reboot
+#                             check or service restarts: the updates are in
+#                             place, and the next run decides the reboot
 #
-#  4. PID alive, soft   - Past watchdog_soft_timeout_min.  If dnf is no
-#     timeout exceeded    longer active AND phase=checking, run an
-#                         independent needs-reboot check and act on it.
-#                         If dnf is still active, leave it to the hard
-#                         timeout.
+#  4. Progressing run   - Left alone.
 #
-# Killing always targets the whole service cgroup, never the run.sh PID
-# alone: dnf-automatic runs behind systemd-inhibit and timeout(1), so
-# signalling direct children leaves the rpm transaction running.
+# The watchdog reads no settings, so it supervises a run whatever
+# /etc/dnf/automatic-reboot.conf holds.  Killing always targets the whole
+# service cgroup, never the run.sh PID alone: dnf-automatic runs behind
+# systemd-inhibit, so signalling direct children leaves the rpm transaction
+# running.
 #
-# Configuration: /etc/dnf/automatic-reboot.conf
-# Log:           /var/log/dnf-automatic-reboot.log
+# Log: /var/log/dnf-automatic-reboot.log
 # ---------------------------------------------------------------------------
 set -euo pipefail
 IFS=$'\n\t'
@@ -42,7 +48,6 @@ export LC_ALL=C
 # temporary tree so every path and helper binary below resolves inside it.
 readonly TEST_ROOT="${DNF_AUTOMATIC_REBOOT_TEST_ROOT:-}"
 
-readonly CONFIG_FILE="${TEST_ROOT}/etc/dnf/automatic-reboot.conf"
 # shellcheck disable=SC2034  # read by run-state.sh
 readonly STATE_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.state"
 readonly LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.lock"
@@ -50,14 +55,24 @@ readonly LOCK_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.lock"
 readonly RECOVERY_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.recovery"
 readonly UPTIME_FILE="${TEST_ROOT}/proc/uptime"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
-readonly LIBRARY_DIRECTORY="${TEST_ROOT}/usr/libexec/dnf-automatic-reboot"
-# shellcheck disable=SC2034  # read by reboot-request.sh
-readonly SYSTEMD_RUN_BIN="${TEST_ROOT}/usr/bin/systemd-run"
 readonly SYSTEMCTL_BIN="${TEST_ROOT}/usr/bin/systemctl"
 readonly MAIN_SERVICE_UNIT=dnf-automatic-reboot.service
 readonly SCRIPT_NAME=watchdog
+# Where the run's processes and their I/O counters are read.
+readonly CGROUP_ROOT="${TEST_ROOT}/sys/fs/cgroup"
+readonly PROC_DIRECTORY="${TEST_ROOT}/proc"
+readonly DNF_LOG_FILE="${TEST_ROOT}/var/log/dnf.log"
+# dnf renames dnf.log to this at log_size (1 MB by default).
+readonly DNF_ROTATED_LOG_FILE="${DNF_LOG_FILE}.1"
+# The last dnf progress seen for the supervised run; written by the watchdog
+# only, replaced when a different run is supervised, emptied by a reboot.
+readonly PROGRESS_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.progress"
+# What an operator runs after a kill that may have cut an rpm transaction
+# short: the interrupted transaction, and the duplicate or broken packages it
+# left.
+readonly INTERRUPTED_TRANSACTION_CHECK="Check: dnf history info last; dnf check"
 
-# REBOOT_PENDING_FILE, the request lock, and request_reboot.
+# REBOOT_PENDING_FILE, read_scheduled_reboot_status and CANCEL_REBOOT_COMMAND.
 # shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/reboot-request.sh"
 # read_run_state, run_state_field and remove_run_state_if_unchanged.
@@ -80,87 +95,212 @@ log_error() {
     printf '%s %s: ERROR: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
-wall_msg() {
-    local wall_messages_enabled
-    wall_messages_enabled=$(get_config_value wall_messages yes)
-    wall_messages_enabled="${wall_messages_enabled//[[:space:]]/}"
-    [[ "${wall_messages_enabled:-yes}" == "no" ]] && return 0
+# send_wall_message TEXT... - broadcasts to logged-in users.
+send_wall_message() {
     wall "$*" 2>/dev/null || true
 }
 
+# Minutes without progress after which a run is killed, by phase.  Fixed, not
+# settings: every wait inside a run that reads and writes nothing, a dnf query
+# or a service restart with its kill grace, ends within 20 minutes, after
+# which the run starts its next process, which counts as progress.
+#   Before rpm's transaction, nothing is installed; the next run finds the
+#   downloads in the cache.
+readonly PRE_TRANSACTION_STALL_TIMEOUT_MINUTES=60
+#   A scriptlet rebuilding SELinux policy, or an initramfs on an SD card, can
+#   be quiet for a long time.
+readonly TRANSACTION_STALL_TIMEOUT_MINUTES=180
+#   The reboot check and the service restarts after it.
+readonly REBOOT_CHECK_STALL_TIMEOUT_MINUTES=60
+
+# Seconds the watchdog waits, after killing a stuck run, for systemd to report
+# the unit inactive or failed; well inside the unit's TimeoutStartSec.
+# Not readonly: tests/run-tests.sh shortens it.
+KILL_CONFIRMATION_TIMEOUT_SECONDS=300
+
 # ---------------------------------------------------------------------------
-# Config helpers
+# dnf progress.  A run is stopped only once its own processes have stopped
+# reading and writing.  Every other dnf command, dnf-makecache.timer's
+# included, writes to dnf's cache and logs too, so neither is a signal of
+# this run's progress: the processes in the unit's cgroup are.  librepo writes
+# each downloaded chunk to its file as it arrives, and rpm and its scriptlets
+# read and write files, so both show in the counters.
 # ---------------------------------------------------------------------------
-get_config_value() {
-    local config_key="$1" default_value="$2" config_value
-    config_value=$(grep -E "^\s*${config_key}\s*=" "${CONFIG_FILE}" 2>/dev/null \
-                   | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//') || true
-    printf '%s' "${config_value:-${default_value}}"
+
+# read_unit_control_group -> the service unit's ControlGroup, empty when systemctl
+# does not answer.
+read_unit_control_group() {
+    "${SYSTEMCTL_BIN}" show --property=ControlGroup --value "${MAIN_SERVICE_UNIT}" 2>/dev/null || true
 }
 
-# get_config_integer KEY DEFAULT_VALUE [MINIMUM [MAXIMUM]] -> the value as a
-# decimal integer.  Leading zeros are dropped: bash arithmetic reads 08 as an
-# invalid octal number.  A value that is not 1 to 9 digits, or lies outside
-# MINIMUM..MAXIMUM (default 0..999999999), is reported and DEFAULT_VALUE used.
-get_config_integer() {
-    local config_key="$1" default_value="$2" minimum_value="${3:-0}" maximum_value="${4:-999999999}"
-    local config_value
-    config_value=$(get_config_value "${config_key}" "${default_value}")
-    config_value="${config_value//[[:space:]]/}"
-    if [[ ! "${config_value}" =~ ^[0-9]{1,9}$ ]]; then
-        log_warning "${config_key}='${config_value}' is not a non-negative integer - using default ${default_value}" >&2
-        printf '%s' "${default_value}"
-        return 0
-    fi
-    config_value=$(( 10#${config_value} ))
-    if (( config_value < minimum_value || config_value > maximum_value )); then
-        log_warning "${config_key}=${config_value} is outside ${minimum_value}..${maximum_value} - using default ${default_value}" >&2
-        config_value="${default_value}"
-    fi
-    printf '%s' "${config_value}"
+# unit_cgroup_directory -> the unit's cgroup directory in the hierarchy that
+# lists its processes: the unified one (cgroup v2), else systemd's named
+# hierarchy (cgroup v1), else the unified one of a hybrid mount.  Returns 1
+# when none of them has a readable cgroup.procs.
+unit_cgroup_directory() {
+    local control_group cgroup_directory
+    control_group=$(read_unit_control_group)
+    [[ "${control_group}" == /?* ]] || return 1
+    for cgroup_directory in "${CGROUP_ROOT}${control_group}" "${CGROUP_ROOT}/systemd${control_group}" \
+                            "${CGROUP_ROOT}/unified${control_group}"; do
+        if [[ -r "${cgroup_directory}/cgroup.procs" ]]; then
+            printf '%s' "${cgroup_directory}"
+            return 0
+        fi
+    done
+    return 1
 }
 
-SOFT_TIMEOUT_MIN=$(get_config_integer watchdog_soft_timeout_min 60)
-HARD_TIMEOUT_MIN=$(get_config_integer watchdog_hard_timeout_min 180)
-REBOOT_DELAY_SEC=$(get_config_integer reboot_delay_sec 300 1 86400)
-FORCE_REBOOT_ON_HARD_TIMEOUT=$(get_config_value force_reboot_on_hard_timeout no)
-KILL_CONFIRM_SEC=$(get_config_integer watchdog_kill_confirm_sec 30)
-NEEDS_RESTARTING_TIMEOUT_SEC=$(get_config_integer needs_restarting_timeout_sec 120)
-REBOOT_REQUEST_LOCK_WAIT_SEC=$(get_config_integer reboot_request_lock_wait_sec 60 1 600)
-REBOOT_INHIBITED_WAIT_SEC=$(get_config_integer reboot_inhibited_wait_sec 1800 0 86400)
+# read_dnf_progress_signature -> "processes=N read=BYTES written=BYTES": the
+# processes in the unit's cgroup and its child cgroups, and the sum of their
+# rchar and wchar from /proc/PID/io.  Any difference between two cycles is
+# progress, a process starting or exiting included.  A process that exits
+# between the listing and the read is left out.  Returns 1 when the cgroup
+# cannot be read or lists no process whose counters can be read.
+read_dnf_progress_signature() {
+    local cgroup_directory process_ids process_id io_counters
+    local process_count=0 read_total=0 written_total=0
+    cgroup_directory=$(unit_cgroup_directory) || return 1
+    process_ids=$(find "${cgroup_directory}" -name cgroup.procs -exec cat {} + 2>/dev/null) || return 1
+    while IFS= read -r process_id; do
+        [[ "${process_id}" =~ ^[0-9]+$ ]] || continue
+        io_counters=$(cat "${PROC_DIRECTORY}/${process_id}/io" 2>/dev/null) || continue
+        [[ "${io_counters}" =~ (^|$'\n')rchar:\ ([0-9]+) ]] || continue
+        read_total=$(( read_total + BASH_REMATCH[2] ))
+        [[ "${io_counters}" =~ (^|$'\n')wchar:\ ([0-9]+) ]] || continue
+        written_total=$(( written_total + BASH_REMATCH[2] ))
+        process_count=$(( process_count + 1 ))
+    done <<< "${process_ids}"
+    (( process_count > 0 )) || return 1
+    printf 'processes=%d read=%d written=%d' "${process_count}" "${read_total}" "${written_total}"
+}
+
+# write_dnf_progress_record RUN_IDENTITY SIGNATURE CHANGED_UPTIME_SECONDS
+# Publishes PROGRESS_FILE by rename, so a reader never sees half of it.
+write_dnf_progress_record() {
+    local temporary_record
+    temporary_record=$(mktemp "${PROGRESS_FILE}.XXXXXX" 2>/dev/null) || return 1
+    if ! printf 'run=%s\nsignature=%s\nchanged_uptime=%s\n' "$1" "$2" "$3" \
+            > "${temporary_record}" 2>/dev/null \
+       || ! mv -f -T "${temporary_record}" "${PROGRESS_FILE}" 2>/dev/null; then
+        rm -f "${temporary_record}"
+        return 1
+    fi
+}
+
+# update_dnf_progress_record RUN_IDENTITY CURRENT_UPTIME_SECONDS
+# Compares the run's progress signature with PROGRESS_FILE and sets
+#   DNF_PROGRESS_SIGNATURE  the signature now
+#   DNF_STALLED_MINUTES     whole minutes since it last changed
+#   DNF_PROGRESS_FAILURE    why the record was not updated, on return 1
+# RUN_IDENTITY, "PID START_UPTIME", ties the record to one run: the first
+# cycle that sees a run, and every change of signature, counts as progress
+# now.  Returns 1 when the signature cannot be read or the record cannot be
+# written, since a stall then cannot be told from progress.
+update_dnf_progress_record() {
+    local run_identity="$1" current_uptime_seconds="$2" record_line
+    local recorded_identity="" recorded_signature="" changed_uptime_seconds=""
+    if ! DNF_PROGRESS_SIGNATURE=$(read_dnf_progress_signature); then
+        DNF_PROGRESS_FAILURE="the I/O counters of ${MAIN_SERVICE_UNIT}'s processes cannot be read"
+        return 1
+    fi
+    if [[ -f "${PROGRESS_FILE}" ]]; then
+        while IFS= read -r record_line; do
+            case "${record_line}" in
+                run=*)            recorded_identity="${record_line#run=}" ;;
+                signature=*)      recorded_signature="${record_line#signature=}" ;;
+                changed_uptime=*) changed_uptime_seconds="${record_line#changed_uptime=}" ;;
+            esac
+        done < "${PROGRESS_FILE}"
+    fi
+    if [[ "${recorded_identity}" != "${run_identity}" || "${recorded_signature}" != "${DNF_PROGRESS_SIGNATURE}" \
+          || ! "${changed_uptime_seconds}" =~ ^[0-9]+$ ]]; then
+        changed_uptime_seconds="${current_uptime_seconds}"
+        if ! write_dnf_progress_record "${run_identity}" "${DNF_PROGRESS_SIGNATURE}" \
+                "${changed_uptime_seconds}"; then
+            DNF_PROGRESS_FAILURE="${PROGRESS_FILE} cannot be written"
+            return 1
+        fi
+    fi
+    DNF_STALLED_MINUTES=$(( (current_uptime_seconds - changed_uptime_seconds) / 60 ))
+}
 
 # ---------------------------------------------------------------------------
-# Independent reboot check, bounded.
+# dnf's phase within the run, read from dnf.log.  dnf 4's logging setup
+# writes "--- logging initialized ---" when dnf-automatic starts; base.py
+# writes "Running transaction check", "Transaction check succeeded.",
+# "Running transaction test" and "Transaction test succeeded." while rpm only
+# checks, and "Running transaction" right before rpm starts changing the
+# system.  Each is one line "<timestamp> INFO <message>".  Only those whole
+# messages count; every other line is ignored.
 #
-# needs-reboot.sh runs needs-restarting at most twice, each run bounded by
-# needs_restarting_timeout_sec; a third share of the budget covers its rpm and
-# build-id queries.  A check that hangs anyway is killed at the bound and
-# reported as undecidable, so the watchdog exits and a later cycle still
-# reaches the hard timeout.  A timeout of 0, which leaves needs-restarting
-# unbounded, gives the check the default budget.
-#
-# Returns needs-reboot.sh's exit code, or 2 when it did not finish in time.
+# run.sh records dnf.log's inode and size before dnf-automatic starts, so
+# lines from earlier dnf commands do not count.  Other dnf commands during the
+# run add lines too, but rpm's lock keeps their transactions out of the run's,
+# and a "Running transaction" of theirs only makes the phase more cautious.
 # ---------------------------------------------------------------------------
-run_independent_reboot_check() {
-    local check_timeout_seconds=$(( 3 * NEEDS_RESTARTING_TIMEOUT_SEC )) exit_code=0
-    [[ "${check_timeout_seconds}" -gt 0 ]] || check_timeout_seconds=360
-    timeout --kill-after=10s "${check_timeout_seconds}s" "${LIBRARY_DIRECTORY}/needs-reboot.sh" \
-        || exit_code=$?
-    # 124: timed out; 137: still running at the timeout and killed after it.
-    if [[ "${exit_code}" -eq 124 || "${exit_code}" -eq 137 ]]; then
-        log_error "independent reboot check did not finish within ${check_timeout_seconds}s - treating the reboot state as undecidable"
-        return 2
+
+# read_run_dnf_log INODE OFFSET -> what the dnf.log with INODE gained after
+# OFFSET, followed across one rotation.  Returns 1 when that cannot be read:
+# no recorded position, the file gone (a second rotation, or log_compress),
+# or shorter than OFFSET.
+read_run_dnf_log() {
+    local recorded_inode="$1" recorded_offset="$2" inode_and_size
+    [[ "${recorded_inode}" =~ ^[0-9]+$ && "${recorded_offset}" =~ ^[0-9]+$ ]] || return 1
+    inode_and_size=$(stat -c '%i %s' "${DNF_LOG_FILE}" 2>/dev/null) || return 1
+    if [[ "${inode_and_size%% *}" == "${recorded_inode}" ]]; then
+        (( ${inode_and_size##* } >= recorded_offset )) || return 1
+        tail -c "+$(( recorded_offset + 1 ))" "${DNF_LOG_FILE}"
+        return
     fi
-    return "${exit_code}"
+    inode_and_size=$(stat -c '%i %s' "${DNF_ROTATED_LOG_FILE}" 2>/dev/null) || return 1
+    [[ "${inode_and_size%% *}" == "${recorded_inode}" ]] || return 1
+    (( ${inode_and_size##* } >= recorded_offset )) || return 1
+    tail -c "+$(( recorded_offset + 1 ))" "${DNF_ROTATED_LOG_FILE}"
+    cat "${DNF_LOG_FILE}"
+}
+
+# read_dnf_run_phase INODE OFFSET -> one of
+#   download     dnf-automatic started, no transaction check yet
+#   checked      rpm checked the transaction, has not started it
+#   transaction  rpm's transaction has started
+#   unknown      the log cannot be read, or shows no start of dnf-automatic
+#                in a format this parser knows
+# Only download and checked prove nothing has been installed; unknown is
+# handled as transaction.
+read_dnf_run_phase() {
+    local run_phase_found=""
+    run_phase_found=$(read_run_dnf_log "$1" "$2" | awk '
+        {
+            message = $0
+            if (sub(/^[^ ]+ INFO /, "", message) == 0) next
+            if (message == "--- logging initialized ---") started = 1
+            else if (message == "Running transaction") transaction = 1
+            else if (message == "Running transaction check" || message == "Transaction check succeeded." \
+                     || message == "Running transaction test" || message == "Transaction test succeeded.") checked = 1
+        }
+        END {
+            if (transaction) print "transaction"
+            else if (!started) print "unknown"
+            else if (checked) print "checked"
+            else print "download"
+        }') || run_phase_found="unknown"
+    printf '%s' "${run_phase_found:-unknown}"
+}
+
+# dnf_phase_is_before_transaction PHASE - 0 when PHASE proves rpm has not
+# started changing the system.
+dnf_phase_is_before_transaction() {
+    [[ "$1" == "download" || "$1" == "checked" ]]
 }
 
 # ---------------------------------------------------------------------------
 # Kill the entire service cgroup.
 #
 # systemd owns the cgroup, so `systemctl kill --kill-whom=all` reaches
-# dnf-automatic, the timeout(1) wrapper and the inhibitor helper together.
+# dnf-automatic, the inhibitor helper and every process they started.
 # Signalling only the recorded PID (or only its direct children) leaves the
-# rpm transaction alive while the caller proceeds to reboot.
+# rpm transaction alive.
 # ---------------------------------------------------------------------------
 
 # systemctl_kill_target_option SYSTEMD_VERSION -> the option that makes
@@ -183,14 +323,14 @@ unit_main_pid() {
     "${SYSTEMCTL_BIN}" show --property=MainPID --value "${MAIN_SERVICE_UNIT}" 2>/dev/null || true
 }
 
-# recorded_pid_identity PID
+# check_recorded_pid_identity PID
 # Returns: 0 = PID is alive and is the unit's MainPID: the run
 #          1 = PID is dead, or MainPID is another process: not the run
 #          2 = PID is alive but systemctl show does not print a numeric
 #              MainPID: unknown
 # run.sh is the unit's ExecStart, so its PID is MainPID while it runs; a live
 # PID that differs was reused by an unrelated process after the run died.
-recorded_pid_identity() {
+check_recorded_pid_identity() {
     local recorded_pid="$1" main_pid
     kill -0 "${recorded_pid}" 2>/dev/null || return 1
     main_pid=$(unit_main_pid)
@@ -210,7 +350,7 @@ recorded_run_is_unchanged() {
     local expected_snapshot="$1" expected_pid="$2" current_snapshot
     current_snapshot=$(read_run_state) || return 1
     [[ "${current_snapshot}" == "${expected_snapshot}" ]] || return 1
-    recorded_pid_identity "${expected_pid}"
+    check_recorded_pid_identity "${expected_pid}"
 }
 
 # remove_inspected_run_state SNAPSHOT - removes the state and lock files of
@@ -244,15 +384,10 @@ signal_unit_processes() {
 # The main unit's ConditionPathExists=! refuses to start while it exists.
 # RECOVERY_FILE exists from before the identity re-check until recovery ends:
 # no new run can start between the re-check and the kill, while the state file
-# is removed, or during the reboot decision; a run started before the file
-# existed shows in the re-check.  The EXIT trap removes it on every exit, and
-# the unit's ExecStopPost= removes it when the watchdog is killed.  A reboot
-# the watchdog requests is held by REBOOT_PENDING_FILE (reboot-request.sh),
-# which outlives the watchdog.
+# is removed; a run started before the file existed shows in the re-check.
+# The EXIT trap removes it on every exit, and the unit's ExecStopPost=
+# removes it when the watchdog is killed.
 # ---------------------------------------------------------------------------
-# Set by schedule_reboot.
-SCHEDULED_REBOOT_SUMMARY=""
-
 # begin_recovery - creates RECOVERY_FILE, or exits 1 when it cannot.
 begin_recovery() {
     if ! : > "${RECOVERY_FILE}" 2>/dev/null; then
@@ -262,17 +397,15 @@ begin_recovery() {
     trap end_recovery EXIT
 }
 
-# end_recovery - the EXIT trap: reports a reboot request cut short, and
-# removes RECOVERY_FILE.
+# end_recovery - the EXIT trap: removes RECOVERY_FILE.
 end_recovery() {
-    report_interrupted_reboot_request
     rm -f "${RECOVERY_FILE}"
 }
 
 # report_reboot_pending_without_reboot
 # Returns 0 when no reboot is pending, or when a scheduled reboot is waiting or
 # under way; 1 after logging an error when REBOOT_PENDING_FILE exists without
-# one.  Called when the watchdog itself does not reboot: a run killed while it
+# one.  Called after killing a run in its reboot check: a run killed while it
 # requested a reboot leaves the file, and nothing else reports it.
 report_reboot_pending_without_reboot() {
     local scheduled_reboot_status
@@ -288,19 +421,45 @@ report_reboot_pending_without_reboot() {
     return 1
 }
 
+# stall_still_holds SNAPSHOT
+# Re-reads, right before the kill, what the stall was measured on: the run's
+# progress signature and, while it updates, dnf's phase.  The verdict is from
+# the start of the cycle, and a run can resume in between.
+# Returns: 0 = the signature is unchanged and the phase read now still allows
+#              a kill after DNF_STALLED_MINUTES
+#          1 = the run made progress, or reached a phase with a longer window
+#          2 = the signature cannot be read
+# This narrows the time between the verdict and the kill to that of two
+# systemctl calls; it does not close it.
+stall_still_holds() {
+    local recorded_snapshot="$1" run_phase current_signature current_dnf_phase=""
+    current_signature=$(read_dnf_progress_signature) || return 2
+    [[ "${current_signature}" == "${DNF_PROGRESS_SIGNATURE}" ]] || return 1
+    run_phase=$(run_state_field "${recorded_snapshot}" phase)
+    if [[ "${run_phase}" == "updating" ]]; then
+        current_dnf_phase=$(read_dnf_run_phase "$(run_state_field "${recorded_snapshot}" dnf_log_inode)" \
+                                               "$(run_state_field "${recorded_snapshot}" dnf_log_offset)")
+    fi
+    [[ "${DNF_STALLED_MINUTES}" -ge "$(stall_window_minutes "${run_phase}" "${current_dnf_phase}")" ]] || return 1
+    return 0
+}
+
 # kill_service_cgroup SNAPSHOT PID
 # Returns: 0 = the recorded run was killed and systemd reports the unit
 #              inactive or failed
-#          1 = the run ended or was replaced; no process signalled
-#          2 = the run's identity cannot be established; no process signalled
+#          1 = the run ended, was replaced, or is no longer stalled; no
+#              process signalled
+#          2 = the run's identity or progress cannot be established; no
+#              process signalled
 #          3 = the kill failed, or the unit was still active
-#              KILL_CONFIRM_SEC seconds after it: recovery failed
+#              KILL_CONFIRMATION_TIMEOUT_SECONDS seconds after it: recovery failed
 # Called between begin_recovery and the end of recovery.  The kill targets the
 # unit's cgroup only; the recorded PID is never signalled on its own, since by
 # then its number may belong to another process.
 kill_service_cgroup() {
     local recorded_snapshot="$1" recorded_pid="$2"
-    local systemd_version kill_target_option run_check_result=0 active_state="" waited_seconds=0
+    local systemd_version kill_target_option run_check_result=0 stall_check_result=0
+    local active_state="" waited_seconds=0
     recorded_run_is_unchanged "${recorded_snapshot}" "${recorded_pid}" \
         || run_check_result=$?
     if [[ "${run_check_result}" -eq 1 ]]; then
@@ -308,6 +467,14 @@ kill_service_cgroup() {
         return 1
     elif [[ "${run_check_result}" -ne 0 ]]; then
         log_error "the identity of PID ${recorded_pid} cannot be established - killing nothing, recovery abandoned"
+        return 2
+    fi
+    stall_still_holds "${recorded_snapshot}" || stall_check_result=$?
+    if [[ "${stall_check_result}" -eq 1 ]]; then
+        log "the run made progress, or reached a phase with a longer window, since the stall was measured - killing nothing, recovery abandoned"
+        return 1
+    elif [[ "${stall_check_result}" -ne 0 ]]; then
+        log_error "the progress of PID ${recorded_pid} cannot be read again - killing nothing, recovery abandoned"
         return 2
     fi
     systemd_version=$("${SYSTEMCTL_BIN}" --version 2>/dev/null \
@@ -322,8 +489,8 @@ kill_service_cgroup() {
     while true; do
         active_state=$(unit_active_state)
         [[ "${active_state}" == "inactive" || "${active_state}" == "failed" ]] && break
-        if [[ "${waited_seconds}" -ge "${KILL_CONFIRM_SEC}" ]]; then
-            log_error "${MAIN_SERVICE_UNIT} is still '${active_state:-unknown}' ${KILL_CONFIRM_SEC}s after SIGKILL - recovery failed"
+        if [[ "${waited_seconds}" -ge "${KILL_CONFIRMATION_TIMEOUT_SECONDS}" ]]; then
+            log_error "${MAIN_SERVICE_UNIT} is still '${active_state:-unknown}' ${KILL_CONFIRMATION_TIMEOUT_SECONDS}s after SIGKILL - recovery failed"
             return 3
         fi
         sleep 1
@@ -333,58 +500,59 @@ kill_service_cgroup() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# schedule_reboot - the watchdog's delayed reboot, a dispatch function for
-# request_reboot.  Returns 0 accepted, 1 rejected, 2 unknown, and sets
-# SCHEDULED_REBOOT_SUMMARY.
-# ---------------------------------------------------------------------------
-schedule_reboot() {
-    local reboot_time submit_result=0
-    reboot_time=$(date -d "@$(( $(date +%s) + REBOOT_DELAY_SEC ))" '+%F %T %Z')
-    log "Watchdog scheduling reboot in ${REBOOT_DELAY_SEC}s"
-    submit_reboot "${REBOOT_DELAY_SEC}" "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "${REBOOT_INHIBITED_WAIT_SEC}" \
-        "dnf-automatic-reboot watchdog reboot" \
-        || submit_result=$?
-    case "${submit_result}" in
-        0)
-            if [[ "${SCHEDULED_REBOOT_ALREADY_PRESENT}" -eq 1 ]]; then
-                SCHEDULED_REBOOT_SUMMARY="reboot already scheduled; update runs held until then; cancel with: ${CANCEL_REBOOT_COMMAND}"
-                return 0
-            fi
-            SCHEDULED_REBOOT_SUMMARY="reboot scheduled for ${reboot_time}; update runs held until then; cancel with: ${CANCEL_REBOOT_COMMAND}"
-            log "Reboot dispatch confirmed: ${SCHEDULED_REBOOT_UNIT}.timer fires at ${reboot_time}"
-            wall_msg "dnf-automatic-reboot: Watchdog detected stuck check. System will reboot at ${reboot_time}." \
-                     "Cancel with: ${CANCEL_REBOOT_COMMAND}"
-            return 0
-            ;;
-        1)
-            log_error "Reboot dispatch FAILED - system will NOT reboot"
-            wall_msg "dnf-automatic-reboot: ERROR - watchdog failed to schedule reboot." \
-                     "Manual reboot required."
-            return 1
-            ;;
-    esac
-    wall_msg "dnf-automatic-reboot: ERROR - watchdog cannot tell whether its reboot was scheduled." \
-             "Update runs stay held. Check: systemctl list-timers ${SCHEDULED_REBOOT_UNIT}.timer"
-    return 2
+# stall_window_minutes RUN_PHASE DNF_PHASE -> the minutes without progress
+# after which a run in that phase is killed.  An unknown phase gets the
+# longest window.
+stall_window_minutes() {
+    if [[ "$1" == "checking" ]]; then
+        printf '%s' "${REBOOT_CHECK_STALL_TIMEOUT_MINUTES}"
+    elif [[ "$1" == "updating" ]] && dnf_phase_is_before_transaction "$2"; then
+        printf '%s' "${PRE_TRANSACTION_STALL_TIMEOUT_MINUTES}"
+    else
+        printf '%s' "${TRANSACTION_STALL_TIMEOUT_MINUTES}"
+    fi
+}
+
+# report_stopped_run RUN_PHASE DNF_PHASE - logs and broadcasts what a killed
+# run leaves behind.  Returns 1 when a reboot request it left needs an
+# operator.
+report_stopped_run() {
+    local run_phase="$1" dnf_phase="$2"
+    if [[ "${run_phase}" == "updating" ]] && dnf_phase_is_before_transaction "${dnf_phase}"; then
+        log_error "stopped a run that made no progress for ${DNF_STALLED_MINUTES}min before installing anything (dnf phase: ${dnf_phase}); the next run tries again"
+        send_wall_message "dnf-automatic-reboot: the update made no progress for ${DNF_STALLED_MINUTES}min before installing anything and was stopped." \
+                          "Nothing was installed; the next run tries again."
+        return 0
+    fi
+    if [[ "${run_phase}" == "checking" ]]; then
+        log_error "stopped a run whose reboot check or service restarts made no progress for ${DNF_STALLED_MINUTES}min; its updates are installed, and the next run decides whether to reboot"
+        send_wall_message "dnf-automatic-reboot: the reboot check made no progress for ${DNF_STALLED_MINUTES}min and was stopped." \
+                          "Updates are installed; the next run decides whether to reboot."
+        report_reboot_pending_without_reboot
+        return
+    fi
+    log_error "stopped a run that made no progress for ${DNF_STALLED_MINUTES}min in phase=${run_phase} (dnf phase: ${dnf_phase}) - an rpm transaction may be incomplete, not rebooting. ${INTERRUPTED_TRANSACTION_CHECK}"
+    send_wall_message "dnf-automatic-reboot: the update made no progress for ${DNF_STALLED_MINUTES}min and was stopped." \
+                      "Updates may be incomplete; before rebooting:" \
+                      "${INTERRUPTED_TRANSACTION_CHECK}"
+    return 0
 }
 
 # Sourcing defines this file's functions without running the checks, so
 # tests/run-tests.sh can exercise them directly.
 main() {
+    local state_snapshot="" run_phase start_uptime_seconds service_pid current_uptime_seconds
+    local elapsed_minutes recorded_pid_identity_result=0 dnf_phase="" window_minutes kill_result=0
+
     # ---------------------------------------------------------------------------
     # Scenario 1: no state file
     # ---------------------------------------------------------------------------
     # One read: every decision below is about this snapshot, and every
     # removal checks that the file still holds it.
-    state_snapshot=""
     if ! state_snapshot=$(read_run_state); then
         exit 0
     fi
 
-    # ---------------------------------------------------------------------------
-    # Parse state file
-    # ---------------------------------------------------------------------------
     run_phase=$(run_state_field "${state_snapshot}" phase)
     start_uptime_seconds=$(run_state_field "${state_snapshot}" start_uptime)
     service_pid=$(run_state_field "${state_snapshot}" pid)
@@ -395,11 +563,10 @@ main() {
         exit 0
     fi
 
-    # Elapsed time is measured on CLOCK_BOOTTIME.  With no RTC, a run started
-    # before chrony synchronises sees the wall clock step forward by however long
-    # the host was off, which read as wall-clock time would trip the hard timeout
-    # and kill an rpm transaction minutes after it began.  /run does not survive
-    # a reboot, so a recorded uptime always belongs to the current boot.
+    # Time is measured on CLOCK_BOOTTIME.  With no RTC, the wall clock steps
+    # forward by however long the host was off once chrony synchronises; read
+    # as wall-clock time, that step would look like an hour-long stall.  /run
+    # does not survive a reboot, so a recorded uptime belongs to this boot.
     current_uptime_seconds=""
     read -r current_uptime_seconds _ < "${UPTIME_FILE}" 2>/dev/null || true
     current_uptime_seconds="${current_uptime_seconds%%.*}"
@@ -407,132 +574,68 @@ main() {
         log_error "cannot read ${UPTIME_FILE} - run not supervised this cycle"
         exit 1
     fi
-    elapsed_min=$(( (current_uptime_seconds - start_uptime_seconds) / 60 ))
-
-    log "phase=${run_phase} elapsed=${elapsed_min}min pid=${service_pid}"
+    elapsed_minutes=$(( (current_uptime_seconds - start_uptime_seconds) / 60 ))
+    log "phase=${run_phase} elapsed=${elapsed_minutes}min pid=${service_pid}"
 
     # ---------------------------------------------------------------------------
     # Scenario 2: dead PID with state file present
     # ---------------------------------------------------------------------------
-    recorded_pid_identity_result=0
-    recorded_pid_identity "${service_pid}" || recorded_pid_identity_result=$?
-    # Unknown identity blocks every action.  Before the soft timeout there is
-    # no action to take, so it is only a warning there.
-    if [[ "${recorded_pid_identity_result}" -eq 2 ]]; then
-        if [[ "${elapsed_min}" -lt "${SOFT_TIMEOUT_MIN}" ]]; then
-            log_warning "systemctl reports no MainPID for ${MAIN_SERVICE_UNIT} - PID ${service_pid} not verified this cycle"
-            exit 0
-        fi
-        log_error "PID ${service_pid} is alive but systemctl reports no MainPID for ${MAIN_SERVICE_UNIT} - cannot tell whether it is the run, not acting this cycle"
-        exit 1
-    fi
+    check_recorded_pid_identity "${service_pid}" || recorded_pid_identity_result=$?
     if [[ "${recorded_pid_identity_result}" -eq 1 ]]; then
         log_warning "service PID ${service_pid} is dead or not the unit's main process but state file exists - updates may be incomplete, NOT rebooting"
-        wall_msg "dnf-automatic-reboot: WARNING - update process (PID ${service_pid})" \
-                 "died unexpectedly in phase=${run_phase}." \
-                 "Manual inspection required before rebooting."
+        send_wall_message "dnf-automatic-reboot: WARNING - update process (PID ${service_pid})" \
+                          "died unexpectedly in phase=${run_phase}." \
+                          "Manual inspection required before rebooting."
         remove_inspected_run_state "${state_snapshot}"
         exit 0
     fi
 
     # ---------------------------------------------------------------------------
-    # Scenario 3: hard timeout - PID still alive after HARD_TIMEOUT_MIN
-    #
-    # phase=checking means dnf-automatic already returned cleanly, so the rpm
-    # transaction is complete and rebooting is safe.  phase=updating means it did
-    # not, so an rpm transaction may be half-applied - the same uncertainty for
-    # which scenario 2 already refuses to reboot.  Rebooting there is opt-in.
+    # Progress.  Every cycle records the run's progress signature, so the
+    # history is there when a stall comes.  A stall that cannot be confirmed
+    # kills nothing and fails the unit.
     # ---------------------------------------------------------------------------
-    if [[ "${elapsed_min}" -ge "${HARD_TIMEOUT_MIN}" ]]; then
-        log_error "hard timeout ${HARD_TIMEOUT_MIN}min exceeded - PID ${service_pid} still alive in phase=${run_phase}"
-        begin_recovery
-        kill_result=0
-        kill_service_cgroup "${state_snapshot}" "${service_pid}" || kill_result=$?
-        [[ "${kill_result}" -eq 1 ]] && exit 0
-        [[ "${kill_result}" -eq 0 ]] || exit 1
-        remove_inspected_run_state "${state_snapshot}"
+    if [[ "${run_phase}" == "updating" ]]; then
+        dnf_phase=$(read_dnf_run_phase "$(run_state_field "${state_snapshot}" dnf_log_inode)" \
+                                       "$(run_state_field "${state_snapshot}" dnf_log_offset)")
+    fi
+    if ! update_dnf_progress_record "${service_pid} ${start_uptime_seconds}" "${current_uptime_seconds}"; then
+        log_error "${DNF_PROGRESS_FAILURE} - a stall cannot be told from progress, not acting this cycle"
+        exit 1
+    fi
+    window_minutes=$(stall_window_minutes "${run_phase}" "${dnf_phase}")
+    log "progress: ${DNF_PROGRESS_SIGNATURE} (unchanged for ${DNF_STALLED_MINUTES}min of ${window_minutes}min)${dnf_phase:+, dnf phase: ${dnf_phase}}"
 
-        if [[ "${run_phase}" == "checking" || "${FORCE_REBOOT_ON_HARD_TIMEOUT}" == "yes" ]]; then
-            wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded." \
-                     "Killed the stuck run and rebooting now."
-            # At once (delay 0) through reboot-if-pending.sh.  The kill ended
-            # the run's own inhibitor; any other one is respected.
-            if ! request_reboot "${REBOOT_REQUEST_LOCK_WAIT_SEC}" submit_reboot \
-                    0 "${REBOOT_REQUEST_LOCK_WAIT_SEC}" "${REBOOT_INHIBITED_WAIT_SEC}" \
-                    "dnf-automatic-reboot watchdog reboot"; then
-                log_error "reboot request failed - the host was not rebooted"
-                exit 1
-            fi
-        else
-            log_error "phase=${run_phase} at hard timeout - an rpm transaction may be incomplete, NOT rebooting; set force_reboot_on_hard_timeout=yes to override"
-            wall_msg "dnf-automatic-reboot: HARD TIMEOUT ${HARD_TIMEOUT_MIN}min exceeded in phase=${run_phase}." \
-                     "Killed the stuck run. Updates may be incomplete - inspect with 'dnf history' before rebooting."
+    # ---------------------------------------------------------------------------
+    # Scenario 4: progressing run - left alone, whatever its age
+    # ---------------------------------------------------------------------------
+    if [[ "${DNF_STALLED_MINUTES}" -lt "${window_minutes}" ]]; then
+        if [[ "${recorded_pid_identity_result}" -eq 2 ]]; then
+            log_warning "systemctl reports no MainPID for ${MAIN_SERVICE_UNIT} - PID ${service_pid} not verified this cycle"
         fi
         exit 0
     fi
 
     # ---------------------------------------------------------------------------
-    # Scenario 4: soft timeout - PID alive, past SOFT_TIMEOUT_MIN
+    # Scenario 3: stalled run - kill the service cgroup
     # ---------------------------------------------------------------------------
-    if [[ "${elapsed_min}" -ge "${SOFT_TIMEOUT_MIN}" ]]; then
-
-        # Is dnf still doing anything?
-        dnf_active=0
-        pgrep -x dnf           > /dev/null 2>&1 && dnf_active=1
-        pgrep -x dnf-3         > /dev/null 2>&1 && dnf_active=1
-        pgrep -x dnf-automatic > /dev/null 2>&1 && dnf_active=1
-        # Active network connection owned by any dnf process
-        ss -tp 2>/dev/null | grep -qE '\bdnf\b'  && dnf_active=1
-
-        if [[ "${dnf_active}" -eq 1 ]]; then
-            log "Soft timeout reached but dnf still active - waiting for hard timeout"
-            exit 0
-        fi
-
-        log "Soft timeout reached and dnf idle (phase=${run_phase})"
-
-        if [[ "${run_phase}" == "checking" ]]; then
-            # needs-reboot.sh appears to be hung - run independently
-            log "Phase=checking with idle dnf - running independent reboot check"
-            needs_reboot_exit_code=0
-            run_independent_reboot_check || needs_reboot_exit_code=$?
-
-            # Kill the stuck run so it cannot hold the inhibitor lock past the
-            # reboot.  The check took time: when the run it was made for has
-            # ended, or another run has started, its decision is not acted on.
-            begin_recovery
-            kill_result=0
-            kill_service_cgroup "${state_snapshot}" "${service_pid}" || kill_result=$?
-            [[ "${kill_result}" -eq 1 ]] && exit 0
-            [[ "${kill_result}" -eq 0 ]] || exit 1
-            remove_inspected_run_state "${state_snapshot}"
-
-            case "${needs_reboot_exit_code}" in
-                0)
-                    log "Watchdog: no reboot needed - stuck run killed"
-                    report_reboot_pending_without_reboot || exit 1
-                    ;;
-                1)
-                    request_reboot "${REBOOT_REQUEST_LOCK_WAIT_SEC}" schedule_reboot || exit 1
-                    log "Watchdog: stuck run killed; ${SCHEDULED_REBOOT_SUMMARY}"
-                    ;;
-                *)
-                    log_error "Watchdog: needs-reboot.sh exited ${needs_reboot_exit_code}: reboot state could not be established - killed the stuck run, not rebooting"
-                    wall_msg "dnf-automatic-reboot: Watchdog killed a stuck check but could not" \
-                             "determine whether a reboot is needed. Manual inspection required."
-                    exit 1
-                    ;;
-            esac
-
-        else
-            # phase=updating but dnf is idle: dnf finished but the script is hung
-            # between dnf-automatic and needs-reboot.  Leave for hard timeout;
-            # we do not know if updates completed cleanly.
-            log "Phase=${run_phase} with idle dnf at soft timeout - leaving for hard timeout"
-        fi
+    if [[ "${recorded_pid_identity_result}" -eq 2 ]]; then
+        log_error "the run stalled for ${DNF_STALLED_MINUTES}min, but PID ${service_pid} is alive and systemctl reports no MainPID for ${MAIN_SERVICE_UNIT} - cannot tell whether it is the run, not acting this cycle"
+        exit 1
     fi
-
-    # Not yet at soft timeout - nothing to do
+    begin_recovery
+    kill_service_cgroup "${state_snapshot}" "${service_pid}" || kill_result=$?
+    [[ "${kill_result}" -eq 1 ]] && exit 0
+    [[ "${kill_result}" -eq 0 ]] || exit 1
+    # The phase is read again now that nothing writes the log: a run that
+    # reached its transaction in the instant before the kill is not reported
+    # as having installed nothing.
+    if [[ "${run_phase}" == "updating" ]]; then
+        dnf_phase=$(read_dnf_run_phase "$(run_state_field "${state_snapshot}" dnf_log_inode)" \
+                                       "$(run_state_field "${state_snapshot}" dnf_log_offset)")
+    fi
+    remove_inspected_run_state "${state_snapshot}"
+    report_stopped_run "${run_phase}" "${dnf_phase}" || exit 1
     exit 0
 }
 

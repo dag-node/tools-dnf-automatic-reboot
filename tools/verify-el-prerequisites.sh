@@ -24,7 +24,7 @@ IFS=$'\n\t'
 
 export LC_ALL=C
 
-readonly COMMAND_TIMEOUT_SEC=120
+readonly COMMAND_TIMEOUT_SECONDS=120
 readonly PROBE_UNIT=dnf-automatic-reboot-prerequisite-probe.service
 # The advisory-id shape run.sh matches in warn_on_unapplied_security_advisories.
 readonly ADVISORY_ID_PATTERN='^[A-Za-z]+(-[A-Za-z]+)*-[0-9]+[-:][0-9A-Za-z]+(-[0-9]+)?$'
@@ -201,18 +201,27 @@ printf '== needs-restarting\n'
 needs_restarting_plugin_file=$(first_file /usr/lib/python3*/site-packages/dnf-plugins/needs_restarting.py)
 if [[ -n "${needs_restarting_plugin_file}" ]]; then
     report_info needs-reboot.sh "plugin: ${needs_restarting_plugin_file}"
-    grep -nE "'  \* %s'|\"  \* %s\"|NEED_REBOOT = |needs-restarting.d|UnitsLoadStartTimestamp|btime|raise dnf.exceptions.Error|--services|--reboothint" \
+    grep -nE "'  \* %s'|\"  \* %s\"|NEED_REBOOT|needs-restarting.d|options\.add|stat_file\.read|stats\[|UnitsLoadStartTimestamp|btime|raise dnf.exceptions.Error|--services|--reboothint" \
         "${needs_restarting_plugin_file}" | report_lines needs-reboot.sh "plugin" || true
+    # The whole fixed list, which spans several lines; Oracle's build adds
+    # kernel-uek and kernel-uek-core to it.
+    sed -n '/^NEED_REBOOT = \[/,/\]/p' "${needs_restarting_plugin_file}" \
+        | report_lines needs-reboot.sh "NEED_REBOOT" || true
     if grep -qE "'  \* %s'|\"  \* %s\"" "${needs_restarting_plugin_file}"; then
         report_pass needs-reboot.sh "-r prints flagged packages as '  * <name>'"
     else
         report_fail needs-reboot.sh "no '  * %s' line format in the plugin; the allowlist parser would read nothing"
     fi
+    if grep -q 'needs-restarting\.d' "${needs_restarting_plugin_file}"; then
+        report_pass needs-reboot.sh "the plugin reads needs-restarting.d, where the package lists audit"
+    else
+        report_fail needs-reboot.sh "the plugin does not read needs-restarting.d; an audit update would not reboot"
+    fi
 else
     report_fail needs-reboot.sh "needs_restarting.py not found"
 fi
 
-needs_restarting_help=$(timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C needs-restarting --help 2>&1) || true
+needs_restarting_help=$(timeout "${COMMAND_TIMEOUT_SECONDS}" dnf -q -C needs-restarting --help 2>&1) || true
 for needs_restarting_option in -r -s; do
     if grep -qE -- "(^|[[:space:],])${needs_restarting_option}([[:space:],]|$)" <<< "${needs_restarting_help}"; then
         report_pass needs-reboot.sh "needs-restarting ${needs_restarting_option}"
@@ -223,7 +232,7 @@ done
 
 needs_restarting_stderr_file=$(mktemp)
 needs_restarting_exit_code=0
-needs_restarting_output=$(timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C needs-restarting -r \
+needs_restarting_output=$(timeout "${COMMAND_TIMEOUT_SECONDS}" dnf -q -C needs-restarting -r \
                           2>"${needs_restarting_stderr_file}") || needs_restarting_exit_code=$?
 report_info needs-reboot.sh "dnf -q -C needs-restarting -r exited ${needs_restarting_exit_code}"
 printf '%s\n' "${needs_restarting_output}" | report_lines needs-reboot.sh "-r stdout" || true
@@ -238,14 +247,24 @@ fi
 rm -f "${needs_restarting_stderr_file}"
 
 stale_services_exit_code=0
-stale_services_output=$(timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C needs-restarting -s 2>&1) || stale_services_exit_code=$?
+stale_services_output=$(timeout "${COMMAND_TIMEOUT_SECONDS}" dnf -q -C needs-restarting -s 2>&1) || stale_services_exit_code=$?
 report_info run.sh "dnf -q -C needs-restarting -s exited ${stale_services_exit_code}"
 printf '%s\n' "${stale_services_output}" | head -n 15 | report_lines run.sh "-s" || true
+
+# run.sh never restarts auditd.service: systemd refuses the request.
+auditd_refusal_properties=$(systemctl show --property=RefuseManualStart --property=RefuseManualStop \
+                            auditd.service 2>&1) || true
+if grep -qx 'RefuseManualStop=yes' <<< "${auditd_refusal_properties}"; then
+    report_pass run.sh "auditd.service refuses a manual stop"
+else
+    report_info run.sh "auditd.service does not report RefuseManualStop=yes"
+fi
+printf '%s\n' "${auditd_refusal_properties}" | report_lines run.sh "auditd.service" || true
 
 # ---------------------------------------------------------------------------
 printf '== security advisories\n'
 # ---------------------------------------------------------------------------
-updateinfo_help=$(timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C updateinfo --help 2>&1) || true
+updateinfo_help=$(timeout "${COMMAND_TIMEOUT_SECONDS}" dnf -q -C updateinfo --help 2>&1) || true
 for updateinfo_option in --updates --security; do
     if grep -q -- "${updateinfo_option}" <<< "${updateinfo_help}"; then
         report_pass run.sh "dnf updateinfo ${updateinfo_option}"
@@ -253,7 +272,7 @@ for updateinfo_option in --updates --security; do
         report_fail run.sh "dnf updateinfo has no ${updateinfo_option}"
     fi
 done
-advisory_output=$(timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C updateinfo list --updates --security 2>&1) || true
+advisory_output=$(timeout "${COMMAND_TIMEOUT_SECONDS}" dnf -q -C updateinfo list --updates --security 2>&1) || true
 printf '%s\n' "${advisory_output}" | head -n 5 | report_lines run.sh "updateinfo" || true
 advisory_line_count=$(awk 'NF >= 3' <<< "${advisory_output}" | wc -l)
 matching_advisory_count=$(awk -v pattern="${ADVISORY_ID_PATTERN}" 'NF >= 3 && $1 ~ pattern' <<< "${advisory_output}" | wc -l)
@@ -265,8 +284,97 @@ else
     report_pass run.sh "${matching_advisory_count} of ${advisory_line_count} advisory lines match ${ADVISORY_ID_PATTERN}"
 fi
 check_update_exit_code=0
-timeout "${COMMAND_TIMEOUT_SEC}" dnf -q -C check-update --security >/dev/null 2>&1 || check_update_exit_code=$?
+timeout "${COMMAND_TIMEOUT_SECONDS}" dnf -q -C check-update --security >/dev/null 2>&1 || check_update_exit_code=$?
 report_info run.sh "dnf -q -C check-update --security exited ${check_update_exit_code} (0 none, 100 available)"
+
+# ---------------------------------------------------------------------------
+printf '== run progress\n'
+# ---------------------------------------------------------------------------
+# watchdog.sh dnf_progress_signature counts the processes in the run's cgroup
+# and their rchar and wchar.  Read here for systemd-journald.service, which
+# always runs, through the same hierarchies in the same order.
+report_info watchdog.sh "/sys/fs/cgroup is $(stat -f -c %T /sys/fs/cgroup 2>&1)"
+probe_control_group=$(systemctl show --property=ControlGroup --value systemd-journald.service 2>/dev/null) || true
+probe_cgroup_directory=""
+for probe_candidate in "/sys/fs/cgroup${probe_control_group}" "/sys/fs/cgroup/systemd${probe_control_group}" \
+                       "/sys/fs/cgroup/unified${probe_control_group}"; do
+    if [[ "${probe_control_group}" == /?* && -r "${probe_candidate}/cgroup.procs" ]]; then
+        probe_cgroup_directory="${probe_candidate}"
+        break
+    fi
+done
+if [[ -z "${probe_cgroup_directory}" ]]; then
+    report_fail watchdog.sh "no readable cgroup.procs for ControlGroup '${probe_control_group}'; the stall check cannot measure a run"
+else
+    report_pass watchdog.sh "cgroup.procs read from ${probe_cgroup_directory}"
+    probe_process_id=$(head -n 1 "${probe_cgroup_directory}/cgroup.procs" 2>/dev/null) || true
+    probe_io=$(grep -E '^(rchar|wchar): [0-9]+$' "/proc/${probe_process_id}/io" 2>/dev/null | paste -sd ' ' -) || true
+    if [[ "${probe_io}" =~ ^rchar:\ [0-9]+\ wchar:\ [0-9]+$ ]]; then
+        report_pass watchdog.sh "/proc/${probe_process_id}/io reads ${probe_io}"
+    else
+        report_fail watchdog.sh "/proc/${probe_process_id:-?}/io gave '${probe_io}'; the stall check cannot measure a run"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+printf '== dnf.log phase lines\n'
+# ---------------------------------------------------------------------------
+# watchdog.sh dnf_run_phase reads these whole messages from dnf.log, each as
+# "<timestamp> INFO <message>".  It stops a stalled run early only once it has
+# recognised dnf-automatic's start line and no "Running transaction".
+dnf_base_file=$(first_file /usr/lib/python3*/site-packages/dnf/base.py)
+dnf_logging_file=$(first_file /usr/lib/python3*/site-packages/dnf/logging.py)
+dnf_const_file=$(first_file /usr/lib/python3*/site-packages/dnf/const.py)
+for dnf_phase_message in 'Running transaction check' 'Transaction check succeeded.' \
+                         'Running transaction test' 'Transaction test succeeded.' 'Running transaction'; do
+    if grep -qF "logger.info(_('${dnf_phase_message}'))" "${dnf_base_file:-/dev/null}" 2>/dev/null; then
+        report_pass watchdog.sh "base.py logs '${dnf_phase_message}' at INFO"
+    else
+        report_fail watchdog.sh "base.py does not log '${dnf_phase_message}' at INFO; dnf_run_phase never sees it"
+    fi
+done
+if grep -qF "LOG_MARKER='--- logging initialized ---'" "${dnf_const_file:-/dev/null}" 2>/dev/null; then
+    report_pass watchdog.sh "const.py LOG_MARKER is '--- logging initialized ---'"
+else
+    report_fail watchdog.sh "no LOG_MARKER '--- logging initialized ---' in const.py; every run reads as phase unknown"
+fi
+if grep -qF '"%(asctime)s %(levelname)s %(message)s"' "${dnf_logging_file:-/dev/null}" 2>/dev/null; then
+    report_pass watchdog.sh "dnf.log lines are '<asctime> <levelname> <message>'"
+else
+    report_fail watchdog.sh "dnf.log format differs from '<asctime> <levelname> <message>'; every run reads as phase unknown"
+fi
+dnf_main_config=$(timeout "${COMMAND_TIMEOUT_SECONDS}" dnf -q -C config-manager --dump 2>/dev/null) || true
+grep -E '^(logdir|log_size|log_rotate|log_compress|logfilelevel) = ' <<< "${dnf_main_config}" \
+    | report_lines watchdog.sh "dnf.conf" || true
+# The lines the parser recognises in the log as it is now: how many of each,
+# and the last ones with their timestamps.
+if [[ -r /var/log/dnf.log ]]; then
+    for dnf_phase_message in '--- logging initialized ---' 'Running transaction check' 'Transaction check succeeded.' \
+                             'Running transaction test' 'Transaction test succeeded.' 'Running transaction'; do
+        report_info watchdog.sh "dnf.log lines '<time> INFO ${dnf_phase_message}': $(awk -v message="${dnf_phase_message}" \
+            '{ line = $0 } sub(/^[^ ]+ INFO /, "", line) && line == message { count++ } END { print count + 0 }' /var/log/dnf.log)"
+    done
+    grep -nE '^[^ ]+ INFO (Running transaction( check| test)?|Transaction (check|test) succeeded\.)$' /var/log/dnf.log \
+        | tail -n 10 | report_lines watchdog.sh "dnf.log" || true
+else
+    report_fail watchdog.sh "/var/log/dnf.log is not readable"
+fi
+
+# ---------------------------------------------------------------------------
+printf '== rpm systemd_inhibit plugin\n'
+# ---------------------------------------------------------------------------
+# Requires: rpm-plugin-systemd-inhibit.  The scheduled reboot waits while a
+# block inhibitor is held; with the plugin, every rpm transaction holds one.
+report_info spec "$(rpm -q rpm-plugin-systemd-inhibit 2>&1)"
+timeout "${COMMAND_TIMEOUT_SECONDS}" dnf -q -C repoquery --qf '%{name}-%{evr}.%{arch} %{repoid}' rpm-plugin-systemd-inhibit 2>&1 \
+    | report_lines spec "available" || true
+if rpm -q rpm-plugin-systemd-inhibit >/dev/null 2>&1 \
+   || [[ -n "$(timeout "${COMMAND_TIMEOUT_SECONDS}" dnf -q -C repoquery rpm-plugin-systemd-inhibit 2>/dev/null)" ]]; then
+    report_pass spec "rpm-plugin-systemd-inhibit is installed or available; Requires: can be met"
+else
+    report_fail spec "rpm-plugin-systemd-inhibit is neither installed nor available from an enabled repository"
+fi
+report_info reboot-if-pending.sh "rpm --eval %{__transaction_systemd_inhibit}: $(rpm --eval '%{?__transaction_systemd_inhibit}' 2>&1)"
 
 # ---------------------------------------------------------------------------
 printf '== boot loader\n'
@@ -338,13 +446,24 @@ else
 fi
 
 running_kernel_package=$(rpm -qf "/lib/modules/$(uname -r)/vmlinuz" --qf '%{NAME}\n' 2>/dev/null | head -n 1) || true
-running_kernel_package_version=$(rpm -qf "/lib/modules/$(uname -r)/vmlinuz" --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | head -n 1) || true
 report_info "%pre gate" "running kernel package: ${running_kernel_package:-none}"
-if [[ "$(uname -r)" == "${running_kernel_package_version}" || "$(uname -r)" == "${running_kernel_package_version%".$(uname -m)"}" ]]; then
-    report_pass needs-reboot.sh "uname -r equals the running kernel package's VERSION-RELEASE.ARCH"
-else
-    report_fail needs-reboot.sh "uname -r '$(uname -r)' differs from '${running_kernel_package_version}'; running_kernel_is_newest compares them"
+# needs-reboot.sh reads the family's releases from the vmlinuz files its
+# package owns, and compares them with uname -r.
+installed_kernel_releases=""
+if [[ -n "${running_kernel_package}" ]]; then
+    installed_kernel_releases=$(rpm -ql "${running_kernel_package}" 2>/dev/null \
+        | sed -n 's#^/lib/modules/\([^/]*\)/vmlinuz$#\1#p' | sort -V) || true
+    printf '%s\n' "${installed_kernel_releases}" | report_lines needs-reboot.sh "${running_kernel_package} releases" || true
+    report_info needs-reboot.sh "meta package ${running_kernel_package%-core} owns $(rpm -ql "${running_kernel_package%-core}" 2>/dev/null | grep -vc 'contains no files') files"
 fi
+if printf '%s\n' "${installed_kernel_releases}" | grep -qxF "$(uname -r)"; then
+    report_pass needs-reboot.sh "uname -r is one of the releases the running kernel package owns"
+else
+    report_fail needs-reboot.sh "uname -r '$(uname -r)' is not a /lib/modules/<release>/vmlinuz of '${running_kernel_package}'"
+fi
+other_kernel_packages=$(rpm -qa --qf '%{NAME}\n' 'kernel*' 2>/dev/null | sort -u \
+    | grep -vxF -e "${running_kernel_package}" -e "${running_kernel_package%-core}" | paste -sd' ' -) || true
+report_info needs-reboot.sh "other kernel* packages (a flag on one withholds every reboot if on NEED_REBOOT): ${other_kernel_packages:-none}"
 if grep -Eq '^GRUB_DEFAULT="?saved"?[[:space:]]*$' /etc/default/grub 2>/dev/null; then
     report_pass "%pre gate" "GRUB_DEFAULT=saved"
 else
@@ -364,12 +483,12 @@ else
     report_fail "%pre gate" "DEFAULTKERNEL='${configured_default_kernel}', the running kernel package is '${running_kernel_package}'"
 fi
 if [[ -n "${running_kernel_package}" ]]; then
-    newest_kernel_version=$(rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' "${running_kernel_package}" | sort -V | tail -n 1) || true
-    report_info needs-reboot.sh "newest installed ${running_kernel_package}: ${newest_kernel_version}"
-    if [[ "${grub_default_kernel}" == "/boot/vmlinuz-${newest_kernel_version}" ]]; then
+    newest_kernel_release=$(printf '%s\n' "${installed_kernel_releases}" | tail -n 1)
+    report_info needs-reboot.sh "newest installed ${running_kernel_package}: ${newest_kernel_release}"
+    if [[ "${grub_default_kernel}" == "/boot/vmlinuz-${newest_kernel_release}" ]]; then
         report_pass "%pre gate" "the GRUB default is the newest installed ${running_kernel_package}"
     else
-        report_fail "%pre gate" "the GRUB default '${grub_default_kernel}' is not /boot/vmlinuz-${newest_kernel_version}"
+        report_fail "%pre gate" "the GRUB default '${grub_default_kernel}' is not /boot/vmlinuz-${newest_kernel_release}"
     fi
 fi
 

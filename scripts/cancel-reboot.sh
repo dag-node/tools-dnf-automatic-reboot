@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # cancel-reboot.sh
 # ---------------------------------------------------------------------------
-# Cancels a reboot that run.sh or the watchdog requested, and allows update
-# runs again.
+# Cancels a reboot that run.sh requested, and allows update runs again.
 #
 # Holding the reboot request lock, it removes
 # /run/dnf-automatic-reboot.reboot-pending and stops

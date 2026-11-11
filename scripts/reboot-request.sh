@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # reboot-request.sh
 # ---------------------------------------------------------------------------
-# Reboot request and cancellation protocol, sourced by run.sh, watchdog.sh,
-# cancel-reboot.sh and reboot-if-pending.sh so all four follow one
-# implementation.
+# Reboot request and cancellation protocol, sourced by run.sh,
+# cancel-reboot.sh and reboot-if-pending.sh so they follow one
+# implementation; watchdog.sh sources it for its readers.
 #
 # REBOOT_PENDING_FILE holds every update run from before a reboot is
 # requested until the reboot; dnf-automatic-reboot.service carries
@@ -33,6 +33,10 @@ readonly BUSCTL_BIN="${TEST_ROOT}/usr/bin/busctl"
 # Transient timer and service that carry a requested reboot.
 readonly SCHEDULED_REBOOT_UNIT=dnf-automatic-reboot-scheduled-reboot
 readonly CANCEL_REBOOT_COMMAND=/usr/libexec/dnf-automatic-reboot/cancel-reboot.sh
+# Seconds run.sh and reboot-if-pending.sh wait for the request lock, which a
+# cancellation or another request holds only briefly.
+# shellcheck disable=SC2034  # read by run.sh and reboot-if-pending.sh
+readonly REBOOT_REQUEST_LOCK_TIMEOUT_SECONDS=300
 
 # 1 from the moment REBOOT_PENDING_FILE may have been created until the
 # request's outcome is known; the sourcing script's EXIT trap reads it.
