@@ -93,9 +93,9 @@ log_error() {
 }
 
 # send_wall_message TEXT... - broadcasts to logged-in users.  Always on: it
-# carries the reboot warning with its cancel command.  Only for what a
-# logged-in user has to know or act on: a reboot, a warning, a failure.  A
-# run that starts and ends without one is logged, not broadcast.
+# carries the reboot warning with its cancel command, and the start and end
+# of every run, which are all that tells a logged-in root not to reboot in
+# between: systemd holds no reboot of root's for an inhibitor.
 send_wall_message() {
     wall "$*" 2>/dev/null || true
 }
@@ -1050,6 +1050,8 @@ main() {
         exit 1
     fi
 
+    send_wall_message "dnf-automatic-reboot: Installing updates. Do not reboot or shut down until the next message:" \
+                      "a reboot by root is not held back and would cut the installation off."
     log "Running dnf-automatic under the inhibitor lock (no deadline; the watchdog stops it only once dnf stalls)"
     update_started_epoch=$(date +%s)
     run_dnf_automatic_under_inhibitor || dnf_automatic_exit_code=$?
@@ -1108,14 +1110,16 @@ main() {
 }
 
 # report_completion REBOOT_OUTCOME FAILED
-# Logs one line naming the update, reboot and service-restart outcome of the
-# run, with the command to inspect what is incomplete.  A non-zero FAILED logs
-# it at error level, broadcasts it and exits 1, so OnFailure= reports it.
+# Logs and broadcasts one line naming the update, reboot and service-restart
+# outcome of the run, with the command to inspect what is incomplete.  A
+# non-zero FAILED logs it at error level and exits 1, so OnFailure= reports
+# it.
 report_completion() {
     local reboot_outcome="$1" run_failed="$2" completion_summary inspected_unit_names=()
     completion_summary="${UPDATE_SUMMARY}; ${reboot_outcome}; ${SERVICE_RESTART_SUMMARY}"
     if [[ "${run_failed}" -eq 0 ]]; then
         log "${completion_summary}"
+        send_wall_message "dnf-automatic-reboot: ${completion_summary}."
         return 0
     fi
     inspected_unit_names=("${FAILED_SERVICE_NAMES[@]}" "${PENDING_SERVICE_NAMES[@]}")

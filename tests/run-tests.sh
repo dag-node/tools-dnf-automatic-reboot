@@ -1370,7 +1370,7 @@ nginx.service"
         "a failed run is broadcast"
 }
 
-test_run_without_reboot_or_failure_broadcasts_nothing() {
+test_run_start_and_end_are_broadcast() {
     load_run_library
     stub_run_main
     stub_service_restarts
@@ -1378,8 +1378,13 @@ test_run_without_reboot_or_failure_broadcasts_nothing() {
     local exit_code=0 output
     output=$( main 2>&1 ) || exit_code=$?
     assert_exit_code 0 "${exit_code}" "the run succeeds"
-    assert_contains "${output}" "no reboot needed; restarted sshd.service" "the outcome is logged"
-    assert_not_contains "$(cat "${STUB_LOG}")" "wall " "nothing is written to logged-in users' terminals"
+    # systemd holds no reboot of root's for the inhibitor: these two messages
+    # are what tell a logged-in root when not to reboot.
+    assert_contains "$(cat "${STUB_LOG}")" "wall dnf-automatic-reboot: Installing updates. Do not reboot or shut down until the next message" \
+        "the start is announced before dnf-automatic runs"
+    assert_contains "$(cat "${STUB_LOG}")" "wall dnf-automatic-reboot: Updates installed (packages: 2); no reboot needed; restarted sshd.service." \
+        "and so is the end"
+    assert_not_contains "$(cat "${STUB_LOG}")" "Reboot is inhibited" "no promise the inhibitor does not keep for root"
 }
 
 test_run_completion_summary_names_every_outcome() {
@@ -4599,7 +4604,7 @@ run_test "run: failed schedule removes its marker"   test_run_failed_schedule_re
 run_test "run: interrupted request keeps its marker" test_run_interrupted_request_keeps_its_marker
 run_test "run: pending restart fails the run"       test_run_pending_restart_fails_the_run
 run_test "run: failed restart fails the run"        test_run_failed_restart_fails_the_run
-run_test "run: no reboot or failure broadcasts nothing" test_run_without_reboot_or_failure_broadcasts_nothing
+run_test "run: start and end are broadcast"          test_run_start_and_end_are_broadcast
 run_test "run: completion summary names every outcome" test_run_completion_summary_names_every_outcome
 run_test "run: auditd is excluded and does not fail the run" test_run_auditd_is_excluded_and_does_not_fail_the_run
 run_test "run: reboot is scheduled on a named unit"  test_reboot_is_scheduled_on_a_named_unit needs-exec

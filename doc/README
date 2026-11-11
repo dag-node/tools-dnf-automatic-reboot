@@ -6,9 +6,12 @@ Companion to dnf-automatic.  Handles the cases dnf-automatic does not:
 
   - Refreshes the repository metadata before each update, so dnf-automatic
     sees today's advisories rather than the cache's.
-  - Runs dnf-automatic under a systemd shutdown inhibitor, so an accidental
-    reboot does not corrupt a partial update; when logind refuses the lock,
-    no update runs and the run fails.
+  - Runs dnf-automatic under a systemd shutdown inhibitor, which holds a
+    reboot asked for by an unprivileged user and this package's own; when
+    logind refuses the lock, no update runs and the run fails.  A reboot
+    typed by root is not held and cuts the update off: systemctl checks no
+    inhibitor for root.  Each run says on every terminal when it starts
+    installing and when it has ended.
   - Filters false-positive reboot triggers on positive evidence only: the
     running kernel already being the newest installed one, or matching ELF
     build-ids between a running daemon and its on-disk binary.  Anything

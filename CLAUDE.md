@@ -434,7 +434,7 @@ unit if `.reboot-pending` exists with no reboot waiting or under way.
 before each attempt (`read_shutdown_block_state`): `blocked` while a block-mode inhibitor names
 `shutdown`, as a package transaction's does, `unknown` for any answer not shaped `s "a:b"`.
 Only `free` reaches plain `systemctl reboot`. The check is the package's own: logind lets root
-override a block inhibitor, and `systemctl` run by root outside a terminal checks none.
+override a block inhibitor, and `systemctl` run by root checks none, at a terminal or not.
 `--check-inhibitors=yes` would check too, but it also refuses while any other user has a
 session, so one open SSH login would hold every reboot and, through the marker, every update
 run. An inhibitor taken between the read and the call is not honoured, as with `systemctl`'s
@@ -497,7 +497,7 @@ library's own readers, with transient probe units that run `/bin/true` or `sleep
 
 `PreparingForShutdown` under a delay inhibitor needs a real shutdown, and is read from the
 systemd 239 and 252 sources only. So are logind letting root override a block inhibitor and
-`systemctl reboot` by root outside a terminal checking neither inhibitors nor sessions. The
+`systemctl reboot` by root checking neither inhibitors nor sessions. The
 probe holds a block-mode shutdown inhibitor and checks that `read_shutdown_block_state` reports
 it.
 
@@ -777,9 +777,15 @@ each fails the run. An excluded unit does not: it is left running by design, or 
 reboots for it. The run
 ends with one line naming the update, reboot and restart outcome, for example
 `Updates installed (packages: 3); no reboot needed; restart still pending for sshd.service. Check:
-systemctl status sshd.service`, logged, and sent through `wall` when the run failed. `wall`
-carries only what a logged-in user has to know or act on: a scheduled reboot, a warning, a
-failure. A run that starts and ends without one writes to the log alone.
+systemctl status sshd.service`, logged and sent through `wall`.
+
+The inhibitor `run.sh` takes, and rpm's own, hold a reboot asked for by an unprivileged user
+at a terminal and the package's scheduled reboot. They do not hold one typed by root:
+`systemctl` skips its inhibitor check for root, and logind lets root override a block. systemd
+then stops the unit like any other, SIGTERM and after `DefaultTimeoutStopSec` SIGKILL, and a
+transaction still installing is cut off. The `wall` message at the start of every run, and the
+completion line at its end, are what tell a logged-in root not to reboot in between; both are
+always sent.
 
 ## `dnf-automatic` on EL8
 

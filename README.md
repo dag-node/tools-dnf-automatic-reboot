@@ -93,7 +93,10 @@ Between 03:00 and 03:10 UTC the package:
 
 1. Fetches the current list of updates, so one published today is not missed
    because `dnf` still had yesterday's.
-2. Blocks shutdown and restart, so an update is never cut off halfway.
+2. Tells everyone logged in that updates are being installed, and blocks
+   shutdown and restart for ordinary users and for its own restart. A restart
+   typed by `root` or through `sudo` is not blocked and cuts the update off:
+   wait for the message that the run has ended.
 3. Installs the available updates with `dnf-automatic`.
 4. Checks whether any update needs a restart: a new kernel, or a core
    component such as `glibc` or `systemd`.
@@ -103,7 +106,7 @@ Between 03:00 and 03:10 UTC the package:
    `sudo /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh`.
    If none does, restarts only the background services whose programs were
    updated, and the system keeps running.
-6. Ends with one line in the log: updates
+6. Ends with one line in the log and on logged-in terminals: updates
    installed, whether a restart is scheduled, and which services were
    restarted, failed to restart, or are left on the old program. A failed
    service restart counts as a failed run.
