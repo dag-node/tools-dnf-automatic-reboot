@@ -281,6 +281,7 @@ repeats on every run, so it is withheld, with every other reboot, until an opera
 | 0 | No reboot needed |
 | 1 | Reboot needed |
 | 2 | Undecidable: an invalid config, a tool error, or a kernel withheld as in [Fail-closed verification](#fail-closed-verification), including a kernel reboot attempt that could not be recorded. A kernel case vetoes the reboot even when another package needs one |
+| 3 | No flagged package needs a reboot, but the running kernel is not the newest installed one of its family and is not flagged. No reboot is requested for it and none is withheld; `run.sh` fails the run |
 
 `needs-restarting -r` exits 1 both for "reboot required" and for any error dnf
 handles, such as a missing cache. Only exit 1 with at least one `  * <name>` line is a
@@ -288,11 +289,22 @@ reboot requirement; exit 1 without one is retried once with a metadata refresh, 
 reported as code 2.
 
 Code 2 does not reboot, to avoid a loop. `run.sh` escalates it to a non-zero exit so `OnFailure=` fires and the fail-open is never silent. Any status other
-than 0, 1 and 2, such as 127 from a missing helper, is handled as code 2: only 0 means
-"no reboot needed". After a 0, `run.sh` requests a reboot in one case only: a daemon that
-cannot be restarted maps a file an update replaced (see
+than 0, 1, 2 and 3, such as 127 from a missing helper, is handled as code 2: only 0 means
+"no reboot needed". After a 0 or a 3, `run.sh` requests a reboot in one case only: a daemon
+that cannot be restarted maps a file an update replaced (see
 [What `needs-restarting -r` does not cover](#what-needs-restarting--r-does-not-cover)).
 Codes 1 and 2 are final.
+
+`needs-restarting` flags a kernel only while it was installed in the current boot. A host
+that booted an older kernel than the newest installed one, through a stale GRUB default or a
+choice at the boot menu, is flagged for nothing. `running_kernel_is_behind_newest` therefore
+compares the two at every check that would end 0 or 1 without a flagged kernel. Code 3 fails
+the run and names the repair: a reboot when the GRUB default is on the newest kernel,
+`grubby --set-default` first when it is not, or removing the newer kernel to keep the running
+one. A reboot another package needs (code 1) goes ahead with the error logged: it happens
+once, where a reboot for a flagged kernel the host would not boot repeats, which is what
+code 2 withholds. A running kernel no package owns, or a family with no readable release, is
+not judged here.
 
 ### State file `/run/dnf-automatic-reboot.state`
 

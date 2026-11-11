@@ -39,12 +39,15 @@ Files installed
       Independent watchdog.  Called every 5 minutes by watchdog.timer.
 
   /usr/libexec/dnf-automatic-reboot/needs-reboot.sh
-      Isolated reboot-decision logic.  Called by both run.sh and watchdog.sh.
+      Isolated reboot-decision logic.  Called by run.sh, and by hand.
       Handles false-positive filtering.
       Exit codes: 0=no reboot needed, 1=reboot needed,
                   2=undecidable: an invalid configuration, a tool error, or
                     a kernel that needs an operator (no reboot for any
-                    package; the run is marked failed).
+                    package; the run is marked failed),
+                  3=no reboot needed for any update, but the running kernel
+                    is not the newest installed one (no reboot is requested
+                    for it; the run is marked failed).
 
   /usr/libexec/dnf-automatic-reboot/notify-failure.sh
       Failure notifier.  Started by OnFailure= from both service units and
@@ -376,6 +379,14 @@ Kernel reboot loop guard
   another family (RHCK updated on a UEK host) withholds every reboot, also
   one glibc or systemd needs.  Each run then fails, and its failure notice
   and the log name the kernel and the repair, until an operator acts.
+
+  needs-restarting flags a kernel only in the boot that installed it.  A
+  host that booted an older kernel than the newest installed one is not
+  flagged, so every run compares the two itself.  When they differ the run
+  fails and names the repair: a reboot, grubby --set-default first when the
+  GRUB default is stale, or removing the newer kernel to keep the running
+  one.  No reboot is requested for it, and a reboot another update needs
+  still happens.
 
   # Repair a stale GRUB default: point it at the newest installed kernel
   grubby --set-default "/boot/vmlinuz-$(rpm -ql kernel-uek-core \

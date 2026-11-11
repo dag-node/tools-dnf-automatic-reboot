@@ -16,6 +16,10 @@
 #      that could not be recorded).  A kernel case stops every reboot, also
 #      one another flagged package needs.  No reboot follows; run.sh fails
 #      its unit, so OnFailure= reports it.
+#   3  No flagged package needs a reboot, but the host does not run the newest
+#      installed kernel of its family, which needs-restarting does not flag
+#      once the host has booted past its installation.  run.sh requests no
+#      reboot for it and fails its unit, so OnFailure= reports it.
 #
 # Parsing contract: needs-restarting output is read with an allowlist - only
 # lines of the exact form "  * <name>" are taken as package names, and the
@@ -443,6 +447,33 @@ classify_running_kernel_family() {
     REBOOT_TRIGGER_PACKAGES+=("$@")
 }
 
+# running_kernel_is_behind_newest
+# Returns 0, after logging the repair, when the running kernel is not the
+# newest installed release of its family; 1 when it is, or when either cannot
+# be read.  needs-restarting flags a kernel only while it was installed in the
+# current boot, so a host that booted an older kernel than the newest
+# installed one is not flagged, and nothing else says so.  This check requests
+# no reboot and withholds none.
+running_kernel_is_behind_newest() {
+    local kernel_package running_kernel_release newest_kernel_release
+    local grub_default_check_result=0 repair
+    kernel_package=$(running_kernel_package)
+    [[ -n "${kernel_package}" ]] || return 1
+    running_kernel_release=$(uname -r)
+    newest_kernel_release=$(newest_installed_kernel_release "${kernel_package}")
+    [[ -n "${newest_kernel_release}" ]] || return 1
+    [[ "${running_kernel_release}" != "${newest_kernel_release}" ]] || return 1
+
+    grub_default_is_kernel_release "${newest_kernel_release}" || grub_default_check_result=$?
+    case "${grub_default_check_result}" in
+        0) repair="the GRUB default is on it, so a reboot runs it: systemctl reboot" ;;
+        1) repair="the GRUB default is $(grubby --default-kernel 2>/dev/null), so a reboot would not run it: grubby --set-default /boot/vmlinuz-${newest_kernel_release}; grep GRUB_UPDATE_DEFAULT_KERNEL /etc/default/grub; grep DEFAULTKERNEL /etc/sysconfig/kernel; systemctl reboot" ;;
+        *) repair="the GRUB default could not be read: grubby --default-kernel; grubby --set-default /boot/vmlinuz-${newest_kernel_release}; systemctl reboot" ;;
+    esac
+    log_error "${kernel_package}: the host runs ${running_kernel_release}, not the newest installed kernel ${newest_kernel_release}, which was installed before this boot and is not flagged - no reboot is requested for it; ${repair}. To keep the running kernel, remove the newer one"
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Run needs-restarting.
 #
@@ -657,7 +688,7 @@ apply_restart_state_learning() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
-    local needs_restarting_exit_code=0 config_error
+    local needs_restarting_exit_code=0 config_error trigger_package_name
 
     if [[ "${#CONFIG_ERRORS[@]}" -gt 0 ]]; then
         for config_error in "${CONFIG_ERRORS[@]}"; do
@@ -674,6 +705,9 @@ main() {
 
     if [[ "${needs_restarting_exit_code}" -eq 0 ]]; then
         log "needs-restarting: no reboot needed"
+        if running_kernel_is_behind_newest; then
+            exit 3
+        fi
         exit 0
     fi
 
@@ -708,10 +742,19 @@ main() {
 
     if [[ "${#REBOOT_TRIGGER_PACKAGES[@]}" -eq 0 ]]; then
         log "All triggers filtered as false positives - no reboot needed"
+        if running_kernel_is_behind_newest; then
+            exit 3
+        fi
         exit 0
     fi
 
     log "Reboot needed: $(printf '%s,' "${REBOOT_TRIGGER_PACKAGES[@]}" | sed 's/,$//')"
+    # The reboot another package needs goes ahead; a kernel it would not
+    # reach is named here and fails the first run after it.
+    for trigger_package_name in "${REBOOT_TRIGGER_PACKAGES[@]}"; do
+        [[ "${trigger_package_name}" != kernel* ]] || exit 1
+    done
+    running_kernel_is_behind_newest || true
     exit 1
 }
 

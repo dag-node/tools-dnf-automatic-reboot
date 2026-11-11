@@ -1121,6 +1121,50 @@ decide_with_flags() {
     printf '%s' "${exit_code}"
 }
 
+test_decision_unflagged_older_kernel_fails_without_a_reboot() {
+    load_needs_reboot_library
+    # needs-restarting flags a kernel only while it was installed in this
+    # boot.  A host that booted an older kernel than the newest installed one
+    # is flagged for nothing, and would run it without a word.
+    stub_genuine_uek_update
+    run_needs_restarting() { NEEDS_RESTARTING_OUTPUT=""; return 0; }
+    local exit_code=0 output
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 3 "${exit_code}" "not the newest installed kernel: no reboot, and not a clean result"
+    assert_contains "${output}" "runs 6.12.0-204.92.4.3.1.el9uek.aarch64, not the newest installed kernel 6.12.0-204.92.4.4.el9uek.aarch64" \
+        "both kernels are named"
+    assert_contains "${output}" "the GRUB default is on it, so a reboot runs it" "the repair for a default that is right"
+
+    export STUB_GRUBBY_DEFAULT="/boot/vmlinuz-6.12.0-204.92.4.3.1.el9uek.aarch64"
+    exit_code=0
+    output=$( ( main ) 2>&1 ) || exit_code=$?
+    assert_exit_code 3 "${exit_code}" "a stale default does not change the code"
+    assert_contains "${output}" "grubby --set-default /boot/vmlinuz-6.12.0-204.92.4.4.el9uek.aarch64" \
+        "the repair for a stale default"
+
+    export STUB_UNAME_R="6.12.0-204.92.4.4.el9uek.aarch64"
+    exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the newest installed kernel runs"
+
+    export STUB_RPM_KERNEL_OWNER=none
+    exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a kernel no package owns is not judged"
+}
+
+test_decision_unflagged_older_kernel_does_not_veto_another_reboot() {
+    load_needs_reboot_library
+    # Only a flagged kernel the host would not boot withholds every reboot:
+    # that reboot would repeat.  One for glibc happens once.
+    stub_genuine_uek_update
+    export STUB_GRUBBY_DEFAULT="/boot/vmlinuz-6.12.0-204.92.4.3.1.el9uek.aarch64" STUB_RPM_EVR="2.34-274"
+    assert_equals "1" "$(decide_with_flags glibc)" "the reboot glibc needs goes ahead"
+    assert_contains "$(cat "${TEST_ROOT_DIR}/decision.log")" "not the newest installed kernel" \
+        "the kernel it will not reach is named"
+    assert_equals "2" "$(decide_with_flags kernel-uek glibc)" "a flagged kernel with a stale default still withholds"
+}
+
 test_decision_stale_grub_default_vetoes_every_trigger() {
     load_needs_reboot_library
     stub_genuine_uek_update
@@ -2092,6 +2136,34 @@ getty@tty1.service"
     assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "no reboot is requested"
     assert_contains "${output}" "excluded from restart, still on pre-update code: dbus.service, getty@tty1.service" \
         "both are reported"
+}
+
+test_run_kernel_behind_newest_fails_the_run_without_a_reboot() {
+    load_run_library
+    stub_run_main
+    stub_service_restarts
+    stub_process_evidence
+    # needs-reboot.sh exits 3: nothing flagged needs a reboot, but the running
+    # kernel is not the newest installed one.
+    export STUB_NEEDS_REBOOT_RC=3
+    make_service_process 900 /system.slice/sshd.service "sshd" 3000
+    export STUB_STALE_SERVICES="sshd.service"
+    local exit_code=0 output
+    output=$( main 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "the run fails, so the repair is reported"
+    assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "no reboot is requested for the kernel"
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart sshd.service" "services are restarted as after a clean check"
+    assert_contains "${output}" "no reboot requested, but the running kernel is not the newest installed one; restarted sshd.service" \
+        "the completion line names it"
+
+    # A reboot something else needs is still requested.
+    : > "${STUB_LOG}"
+    make_service_process 918 /system.slice/dbus.service "dbus-daemon" 3000 \
+        "/usr/lib64/libmount.so.1.1.0 (deleted)"
+    exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a scheduled reboot is a successful run"
+    assert_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "the reboot a stale daemon needs goes ahead"
 }
 
 test_run_withheld_reboot_is_not_requested_for_a_stale_daemon() {
@@ -4442,6 +4514,8 @@ run_test "classify: repeated checks in one boot count once" test_classify_repeat
 run_test "classify: keeps package when verifier missing" test_classify_keeps_package_when_verifier_missing
 
 printf 'decision\n'
+run_test "decision: unflagged older kernel fails without a reboot" test_decision_unflagged_older_kernel_fails_without_a_reboot
+run_test "decision: unflagged older kernel does not veto another reboot" test_decision_unflagged_older_kernel_does_not_veto_another_reboot
 run_test "decision: dnf error does not reboot"       test_decision_dnf_error_does_not_reboot
 run_test "decision: cache miss retries with refresh" test_decision_cache_miss_retries_with_refresh
 run_test "decision: temporary file failure removes nothing" test_decision_temporary_file_failure_removes_nothing
@@ -4504,6 +4578,7 @@ run_test "services: stale unrestartable daemon requests a reboot" test_run_stale
 run_test "services: unrestartable daemon without a replaced file does not reboot" test_run_unrestartable_daemon_without_a_replaced_file_does_not_reboot
 run_test "services: daemon on a file no update replaced does not reboot" test_run_daemon_on_a_file_no_update_replaced_does_not_reboot
 run_test "services: withheld reboot is not requested for a stale daemon" test_run_withheld_reboot_is_not_requested_for_a_stale_daemon
+run_test "run: kernel behind newest fails the run without a reboot" test_run_kernel_behind_newest_fails_the_run_without_a_reboot
 run_test "services: disabled by config"              test_services_disabled_by_config
 run_test "services: restart is bounded"              test_services_restart_is_bounded
 run_test "services: template units excluded by glob" test_services_template_units_are_excluded_by_glob

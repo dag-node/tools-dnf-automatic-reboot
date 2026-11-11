@@ -588,6 +588,10 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   an update replaced. These are never restarted, so 1.5.0 left them on the pre-update
   library until a reboot for another reason. The reboot is requested once per update, with
   the usual warning and cancel command.
+- CHANGE: A run fails, naming the repair, while the host runs an older kernel than the newest
+  installed one of its family. needs-restarting flags a kernel only in the boot that
+  installed it, so such a host ran the older kernel with every run reporting success. No
+  reboot is requested for it, and a reboot another update needs still happens.
 - NEW: /usr/libexec/dnf-automatic-reboot/check-config.sh validates
   /etc/dnf/automatic-reboot.conf and lists every value that differs from the shipped one; the
   RPM runs it after every install and upgrade. The file is not edited.

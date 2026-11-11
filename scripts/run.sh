@@ -1069,21 +1069,27 @@ main() {
     publish_run_phase "checking" || log_warning "cannot publish phase=checking to ${STATE_FILE}; it still reads phase=updating"
 
     # Decide whether a reboot is required.  Exit 0 = no reboot, 1 = reboot
-    # needed; 2 = undecidable, and any other status is a helper failure.
-    # Neither reboots, and both fail the run so the condition is surfaced
-    # rather than silently ignored.
+    # needed, 3 = no reboot, but the running kernel is not the newest
+    # installed one; 2 = undecidable, and any other status is a helper
+    # failure.  Neither of those two reboots, and 2, 3 and a helper failure
+    # fail the run so the condition is surfaced rather than silently ignored.
     run_reboot_check || needs_reboot_exit_code=$?
 
     # The state file stays until cleanup at exit: restart_stale_services can
     # block, and the watchdog supervises the run only while the file exists.
     case "${needs_reboot_exit_code}" in
-        0)
+        0|3)
             log "No flagged package needs a reboot"
             restart_stale_services reboot-allowed || service_restart_exit_code=$?
             if [[ "${#REBOOT_REQUIRING_SERVICE_NAMES[@]}" -gt 0 ]]; then
                 log "Reboot needed: $(join_with ', ' "${REBOOT_REQUIRING_SERVICE_NAMES[@]}") map files an update replaced and cannot be restarted"
                 request_reboot "${REBOOT_REQUEST_LOCK_TIMEOUT_SECONDS}" schedule_reboot || exit 1
                 report_completion "${SCHEDULED_REBOOT_SUMMARY}" 0
+            elif [[ "${needs_reboot_exit_code}" -eq 3 ]]; then
+                # Code 3: nothing flagged needs a reboot, but the running
+                # kernel is not the newest installed one.  No reboot is
+                # requested for it; the run fails so the repair is reported.
+                report_completion "no reboot requested, but the running kernel is not the newest installed one" 1
             else
                 report_completion "no reboot needed" "${service_restart_exit_code}"
             fi
