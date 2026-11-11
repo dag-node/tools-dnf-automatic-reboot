@@ -3,6 +3,24 @@
 Installs system updates every night and restarts the computer only when an
 update needs a restart to take effect.
 
+> [!WARNING]
+> **Versions 1.5.0 and older can cut a long update off halfway.** They stop
+> `dnf-automatic` after 60 minutes (`dnf_timeout_min`) and kill whatever is
+> left after 180 (`watchdog_hard_timeout_min`), even while packages are being
+> installed. An upgrade to the next minor release of the distribution can take
+> longer than that on a slow device such as a Raspberry Pi, or over a slow
+> link, and is then stopped with packages half-installed. With
+> `force_reboot_on_hard_timeout = yes` the computer is restarted in that state.
+>
+> Upgrade to 1.6.0. It never stops an update that is still making progress,
+> and its settings file is rewritten to be safe by default: the time limits
+> and the forced restart are gone, and every remaining setting only accepts
+> safe values. An edited settings file from an older version has to be
+> replaced; see
+> [Upgrading from an earlier version](#upgrading-from-an-earlier-version).
+> Until then, set both limits above your longest update and keep
+> `force_reboot_on_hard_timeout = no`.
+
 ## Who this is for
 
 On most Enterprise Linux 9 systems, `dnf-automatic` restarts after updates
