@@ -2982,6 +2982,18 @@ test_lock_permissions_are_corrected_in_place() {
         "the inode a holder or waiter uses is kept"
 }
 
+test_reboot_list_installs_only_package_names() {
+    # The plugin reads every line as a package name, and each name reboots the
+    # host on its update: what is installed is the list, without the header.
+    local reboot_list_file="${REPO_ROOT}/conf/needs-restarting.d/automatic-reboot.conf"
+    assert_equals "audit" "$(sed '/^#/d' "${reboot_list_file}")" "the installed reboot list"
+    grep -qF "sed '/^#/d' \$(REBOOTLIST) | install" "${REPO_ROOT}/Makefile" \
+        || fail "make install must drop the header"
+    grep -qF "sed '/^#/d' conf/needs-restarting.d/automatic-reboot.conf | install" "${SPEC_FILE}" \
+        || fail "the spec must drop the header"
+    return 0
+}
+
 test_lock_is_shipped_owner_only() {
     grep -qx 'f /run/dnf-automatic-reboot.reboot-request.lock 0600 root root -' \
         "${REPO_ROOT}/tmpfiles/dnf-automatic-reboot.conf" \
@@ -4212,6 +4224,7 @@ printf 'services\n'
 run_test "services: exclusions are additive"         test_services_exclusions_are_additive
 run_test "services: excluded units are not restarted" test_services_excluded_units_are_not_restarted needs-exec
 run_test "services: failed restart logs the reason"  test_services_failed_restart_logs_the_reason
+run_test "services: reboot list installs only package names" test_reboot_list_installs_only_package_names
 run_test "services: disabled by config"              test_services_disabled_by_config
 run_test "services: restart is bounded"              test_services_restart_is_bounded
 run_test "services: template units excluded by glob" test_services_template_units_are_excluded_by_glob

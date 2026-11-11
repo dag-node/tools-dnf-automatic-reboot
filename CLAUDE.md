@@ -45,6 +45,7 @@ CLAUDE.md                       This file
 dnf-automatic-reboot.spec       RPM spec
 Makefile                        check / install / dist / clean targets
 conf/automatic-reboot.conf      Runtime config installed to /etc/dnf/
+conf/needs-restarting.d/automatic-reboot.conf   Package names added to the plugin's reboot list
 scripts/run.sh                  Main orchestration (inhibitor + dnf + reboot)
 scripts/watchdog.sh             Independent watchdog: stops a stalled run, never reboots
 scripts/needs-reboot.sh         Reboot decision + false-positive filtering
@@ -87,6 +88,7 @@ Files installed verbatim onto hosts (config, units, drop-ins) take no header; th
 /usr/lib/systemd/system/               unit files
 /usr/lib/tmpfiles.d/dnf-automatic-reboot.conf   log + state path creation
 /etc/logrotate.d/dnf-automatic-reboot  log rotation (%config noreplace)
+/etc/dnf/plugins/needs-restarting.d/automatic-reboot.conf   reboot list addition (%config noreplace)
 /usr/share/doc/dnf-automatic-reboot/   doc/README
 /var/log/dnf-automatic-reboot.log      runtime log (%ghost in RPM)
 /var/lib/dnf-automatic-reboot/restart-state            learning state (%ghost)
@@ -596,9 +598,11 @@ for pkg in installed.filter(name=NEED_REBOOT):
 
 `NEED_REBOOT` is a fixed list — `kernel`, `kernel-core`, `kernel-rt`, `glibc`,
 `linux-firmware`, `systemd`, `dbus`, `dbus-broker`, `dbus-daemon`, `microcode_ctl` —
-extended by `*.conf` files in `/etc/dnf/plugins/needs-restarting.d/`. Oracle's OL9 build
+extended by `*.conf` files in `/etc/dnf/plugins/needs-restarting.d/`, which the plugin on
+both surveyed hosts reads. Oracle's OL9 build
 (`python3-dnf-plugins-core-4.3.0-*.0.1.el9`) adds `kernel-uek` and `kernel-uek-core` to the
-list itself; the surveyed OL 9.8 host has no `needs-restarting.d` directory.
+list itself; the surveyed OL 9.8 host has no `needs-restarting.d` directory of its own. The
+package ships `automatic-reboot.conf` there, naming `audit`.
 **There is no version comparison anywhere in the plugin.**
 
 The code quoted in this section is the EL9 plugin (dnf-plugins-core 4.3). The EL8
@@ -700,7 +704,9 @@ and the pass is skipped entirely when a reboot is already scheduled.
 from underneath a running system — `dbus`/`dbus-broker` break every client holding a bus
 connection, `systemd-logind` drops session tracking, `user@`, `getty@` and `autovt@` end
 sessions, and this package's units would kill the run. systemd refuses to restart
-`auditd.service` (`RefuseManualStop=yes`); it runs the updated version after the next reboot.
+`auditd.service` (`RefuseManualStop=yes`); it runs the updated version after the next reboot,
+which an update to the `audit` package requests through the shipped `needs-restarting.d`
+drop-in. `needs-reboot.sh` handles `audit` as any flagged non-kernel package.
 `restart_services_excluded_patterns` adds to it and cannot remove from it. Extend that
 list, never shorten it.
 
@@ -927,6 +933,9 @@ compares ELF notes and does not read the clock, so skew does not affect it.
   `/usr/share/dnf-automatic-reboot/` (not `%doc`, which `--excludedocs` drops), or lists
   the values that differ. Neither edits
   the file.
+- `%dir` on `/etc/dnf/plugins/needs-restarting.d` and `%config(noreplace)` on the drop-in in
+  it. The plugin reads every line of it as a package name, so the Makefile and `%install`
+  remove the repository file's `#` header.
 - `%ghost` on the log file and both state files — RPM owns the path and SELinux label
   without owning content. `systemd-tmpfiles --create` in `%post` materialises them.
 - `%dir` on `/var/lib/dnf-automatic-reboot/` and on `%{_libexecdir}/%{name}` — both are

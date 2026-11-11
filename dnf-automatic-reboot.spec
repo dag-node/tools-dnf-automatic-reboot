@@ -130,6 +130,12 @@ install -m 0644 tmpfiles/%{name}.conf %{buildroot}%{_tmpfilesdir}/%{name}.conf
 install -d -m 0755 %{buildroot}%{_sysconfdir}/logrotate.d
 install -m 0644 logrotate/%{name} %{buildroot}%{_sysconfdir}/logrotate.d/%{name}
 
+# needs-restarting.d - package names the plugin adds to its reboot list.  It
+# reads every line as a name, so the file is installed without its # header.
+install -d -m 0755 %{buildroot}%{_sysconfdir}/dnf/plugins/needs-restarting.d
+sed '/^#/d' conf/needs-restarting.d/automatic-reboot.conf | install -m 0644 /dev/stdin \
+    %{buildroot}%{_sysconfdir}/dnf/plugins/needs-restarting.d/automatic-reboot.conf
+
 # Documentation
 install -d -m 0755 %{buildroot}%{_docdir}/%{name}
 install -m 0644 doc/README %{buildroot}%{_docdir}/%{name}/README
@@ -504,6 +510,11 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 # logrotate.d - admin-editable, so noreplace
 %config(noreplace) %{_sysconfdir}/logrotate.d/%{name}
 
+# needs-restarting.d - the directory is not there on every host, so it is
+# owned here.
+%dir %{_sysconfdir}/dnf/plugins/needs-restarting.d
+%config(noreplace) %{_sysconfdir}/dnf/plugins/needs-restarting.d/automatic-reboot.conf
+
 # Log file - created by systemd-tmpfiles, %%ghost so RPM owns the path and its
 # SELinux label without owning the content
 %ghost %attr(0640, root, root) %{_localstatedir}/log/%{name}.log
@@ -567,6 +578,10 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   only when an update actually requires it).
 - CHANGE: While the host would not boot its newest kernel, no reboot is requested for any
   update, and each run's alert names the repair. Real-time and 64k kernels are recognised.
+- CHANGE: An update to the audit package reboots the host. systemd refuses to restart auditd,
+  so the updated version runs only after a reboot.
+  /etc/dnf/plugins/needs-restarting.d/automatic-reboot.conf adds audit to the packages
+  needs-restarting -r checks.
 - NEW: /usr/libexec/dnf-automatic-reboot/check-config.sh validates
   /etc/dnf/automatic-reboot.conf and lists every value that differs from the shipped one; the
   RPM runs it after every install and upgrade. The file is not edited.

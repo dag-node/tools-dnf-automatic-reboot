@@ -201,7 +201,7 @@ printf '== needs-restarting\n'
 needs_restarting_plugin_file=$(first_file /usr/lib/python3*/site-packages/dnf-plugins/needs_restarting.py)
 if [[ -n "${needs_restarting_plugin_file}" ]]; then
     report_info needs-reboot.sh "plugin: ${needs_restarting_plugin_file}"
-    grep -nE "'  \* %s'|\"  \* %s\"|NEED_REBOOT|needs-restarting.d|UnitsLoadStartTimestamp|btime|raise dnf.exceptions.Error|--services|--reboothint" \
+    grep -nE "'  \* %s'|\"  \* %s\"|NEED_REBOOT|needs-restarting.d|options\.add|UnitsLoadStartTimestamp|btime|raise dnf.exceptions.Error|--services|--reboothint" \
         "${needs_restarting_plugin_file}" | report_lines needs-reboot.sh "plugin" || true
     # The whole fixed list, which spans several lines; Oracle's build adds
     # kernel-uek and kernel-uek-core to it.
@@ -211,6 +211,11 @@ if [[ -n "${needs_restarting_plugin_file}" ]]; then
         report_pass needs-reboot.sh "-r prints flagged packages as '  * <name>'"
     else
         report_fail needs-reboot.sh "no '  * %s' line format in the plugin; the allowlist parser would read nothing"
+    fi
+    if grep -q 'needs-restarting\.d' "${needs_restarting_plugin_file}"; then
+        report_pass needs-reboot.sh "the plugin reads needs-restarting.d, where the package lists audit"
+    else
+        report_fail needs-reboot.sh "the plugin does not read needs-restarting.d; an audit update would not reboot"
     fi
 else
     report_fail needs-reboot.sh "needs_restarting.py not found"

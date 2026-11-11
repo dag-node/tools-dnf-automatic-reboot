@@ -93,6 +93,10 @@ Files installed
   /etc/logrotate.d/dnf-automatic-reboot
       Weekly rotation, 8 kept, compressed.
 
+  /etc/dnf/plugins/needs-restarting.d/automatic-reboot.conf
+      Adds audit to the packages needs-restarting -r checks, one package
+      name per line.
+
   /var/log/dnf-automatic-reboot.log
       All events logged here in addition to the journal.
 
@@ -231,7 +235,8 @@ Why packages are flagged at all
   kernel-core, kernel-rt, glibc, linux-firmware, systemd, dbus, dbus-broker,
   dbus-daemon, microcode_ctl - plus any *.conf file under
   /etc/dnf/plugins/needs-restarting.d/.  Oracle Linux 9's dnf-plugins-core
-  adds kernel-uek and kernel-uek-core to the list itself.
+  adds kernel-uek and kernel-uek-core to the list itself.  This package adds
+  audit, in /etc/dnf/plugins/needs-restarting.d/automatic-reboot.conf.
 
   The boot time comes from systemd's UnitsLoadStartTimestamp over D-Bus,
   falling back to max(mtime of /proc/1, btime in /proc/stat).  On a host with
@@ -338,7 +343,7 @@ Services still running pre-update code
   getty, serial-getty, autovt and this package's own units are never
   restarted; the setting adds units to that list and cannot remove one from
   it.  systemd refuses to restart auditd; it runs the updated version after
-  the next reboot.
+  the next reboot, which an update to the audit package requests.
 
 
 Kernel reboot loop guard
