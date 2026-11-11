@@ -201,7 +201,7 @@ printf '== needs-restarting\n'
 needs_restarting_plugin_file=$(first_file /usr/lib/python3*/site-packages/dnf-plugins/needs_restarting.py)
 if [[ -n "${needs_restarting_plugin_file}" ]]; then
     report_info needs-reboot.sh "plugin: ${needs_restarting_plugin_file}"
-    grep -nE "'  \* %s'|\"  \* %s\"|NEED_REBOOT|needs-restarting.d|options\.add|UnitsLoadStartTimestamp|btime|raise dnf.exceptions.Error|--services|--reboothint" \
+    grep -nE "'  \* %s'|\"  \* %s\"|NEED_REBOOT|needs-restarting.d|options\.add|stat_file\.read|stats\[|UnitsLoadStartTimestamp|btime|raise dnf.exceptions.Error|--services|--reboothint" \
         "${needs_restarting_plugin_file}" | report_lines needs-reboot.sh "plugin" || true
     # The whole fixed list, which spans several lines; Oracle's build adds
     # kernel-uek and kernel-uek-core to it.

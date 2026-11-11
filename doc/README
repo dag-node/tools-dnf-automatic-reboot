@@ -345,6 +345,18 @@ Services still running pre-update code
   it.  systemd refuses to restart auditd; it runs the updated version after
   the next reboot, which an update to the audit package requests.
 
+  dbus, dbus-broker, systemd-logind and auditd have no session to wait for:
+  when one of them still maps a file an update replaced, the host reboots,
+  with the same warning and cancel command as for a kernel.  A getty or a
+  user's session is replaced when it ends, and is only reported.
+  restart_services = no turns this reboot off with the restarts.
+
+  needs-restarting reads a process whose name holds a space, such as
+  "spamd child", as started at boot, and flags its service at every run.  A
+  flagged service is left running, and named in the run's summary, when none
+  of its processes maps a replaced file and all of them started after the
+  newest package install.
+
 
 Kernel reboot loop guard
 -------------------------

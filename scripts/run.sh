@@ -308,6 +308,11 @@ readonly REBOOT_RETRY_TIMEOUT_SECONDS=1800
 # autovt instances log out their console, systemd refuses to restart auditd
 # (RefuseManualStop=yes), and this package's own units would stop the run.
 readonly BUILT_IN_EXCLUDED_UNIT_PATTERNS="dbus.service,dbus-broker.service,systemd-logind.service,auditd.service,user@*.service,getty@*.service,serial-getty@*.service,autovt@*.service,dnf-automatic-reboot.service,dnf-automatic-watchdog.service"
+# The never-restart units whose pre-update code only a reboot replaces: system
+# daemons with no session to wait for.  A getty or a user manager is replaced
+# when its session ends, an operator's own exclusion by the operator, and this
+# package's units end with the run.
+readonly REBOOT_REQUIRING_UNIT_NAMES="dbus.service,dbus-broker.service,systemd-logind.service,auditd.service"
 
 # exit_if_config_invalid - exits 1, before anything is refreshed, installed or
 # rebooted, when the configuration has errors; logs each one and broadcasts
@@ -329,6 +334,8 @@ RESTARTED_SERVICE_NAMES=()
 FAILED_SERVICE_NAMES=()
 PENDING_SERVICE_NAMES=()
 EXCLUDED_SERVICE_NAMES=()
+CURRENT_SERVICE_NAMES=()
+REBOOT_REQUIRING_SERVICE_NAMES=()
 SERVICE_RESTART_SUMMARY="stale services not checked"
 SCHEDULED_REBOOT_SUMMARY=""
 # The state file content this run last published; empty before the first.
@@ -409,41 +416,243 @@ uptime_seconds() {
 #
 # Only reached when no reboot is scheduled - a reboot supersedes it.
 # ---------------------------------------------------------------------------
-# is_excluded_unit UNIT_NAME - succeeds when UNIT_NAME matches a built-in
-# exclusion or an entry of restart_services_excluded_patterns.  An entry is a
-# unit name or a bash glob such as user@*.service, which covers every instance
-# of a template unit.
-is_excluded_unit() {
-    local unit_name="$1" excluded_unit_pattern previous_ifs
-    local excluded_unit_patterns=()
+# unit_matches_patterns UNIT_NAME PATTERN_LIST - succeeds when UNIT_NAME
+# matches an entry of the comma-separated PATTERN_LIST.  An entry is a unit
+# name or a bash glob such as user@*.service, which covers every instance of a
+# template unit.
+unit_matches_patterns() {
+    local unit_name="$1" unit_pattern previous_ifs
+    local unit_patterns=()
     previous_ifs="${IFS}"
-    IFS=',' read -ra excluded_unit_patterns \
-        <<< "${BUILT_IN_EXCLUDED_UNIT_PATTERNS}${RESTART_SERVICES_EXCLUDED_PATTERNS:+,${RESTART_SERVICES_EXCLUDED_PATTERNS}}"
+    IFS=',' read -ra unit_patterns <<< "$2"
     IFS="${previous_ifs}"
-    for excluded_unit_pattern in "${excluded_unit_patterns[@]}"; do
-        [[ -n "${excluded_unit_pattern}" ]] || continue
+    for unit_pattern in "${unit_patterns[@]}"; do
+        [[ -n "${unit_pattern}" ]] || continue
         # shellcheck disable=SC2053  # the entry is a glob by design
-        if [[ "${unit_name}" == ${excluded_unit_pattern} ]]; then
+        if [[ "${unit_name}" == ${unit_pattern} ]]; then
             return 0
         fi
     done
     return 1
 }
 
-# restart_stale_services
+# is_excluded_unit UNIT_NAME - succeeds when UNIT_NAME matches a built-in
+# exclusion or an entry of restart_services_excluded_patterns.
+is_excluded_unit() {
+    unit_matches_patterns "$1" \
+        "${BUILT_IN_EXCLUDED_UNIT_PATTERNS}${RESTART_SERVICES_EXCLUDED_PATTERNS:+,${RESTART_SERVICES_EXCLUDED_PATTERNS}}"
+}
+
+# ---------------------------------------------------------------------------
+# What a flagged unit really runs.
+#
+# needs-restarting flags a unit when one of its processes maps a file of a
+# package installed after the start it computes for that process.  It takes
+# the start from /proc/PID/stat split on spaces, so a process name holding a
+# space, such as spamd's "spamd child", shifts the fields: the start reads as
+# 0, the process as old as the boot, and its unit is flagged at every run once
+# it maps a file installed since boot.
+#
+# This package reads its own evidence from /proc for every flagged unit:
+#   stale    a process maps a deleted file of a package installed after that
+#            process started: an update replaced the file under it
+#   current  no process maps a deleted file a package owns, and every process
+#            started after the newest package install, so none can hold
+#            replaced code read at start or inherited from an older parent
+#   unknown  everything else: a deleted package file with no later install
+#            (an application rewriting its own data), an older process, an
+#            unreadable /proc entry or an rpm query that failed
+# A unit is left running only when it is current.  A reboot is requested only
+# for a stale unit of REBOOT_REQUIRING_UNIT_NAMES, and those are judged
+# whether or not needs-restarting listed them.  After that reboot no process
+# maps a file replaced since it started until another update replaces one, so
+# the request cannot repeat.
+# ---------------------------------------------------------------------------
+# Set by read_process_evidence, once per restart pass.
+PROCESS_CONTROL_GROUPS=""        # one "PID CGROUP" line per process
+PROCESS_START_EVIDENCE="unread"  # read | unavailable
+NEWEST_PACKAGE_INSTALL_EPOCH=""
+BOOT_EPOCH=""
+CLOCK_TICKS_PER_SECOND=""
+# Deleted mapped path -> the INSTALLTIME of the package owning it, "unowned"
+# or "unknown", so rpm is asked once per path.
+declare -gA DELETED_FILE_INSTALL_EPOCHS=()
+# Set by read_unit_code_state: current | stale | unknown.
+UNIT_CODE_STATE="unknown"
+
+# read_newest_package_install_epoch -> the latest rpm INSTALLTIME on the host.
+# Returns 1 when rpm gives no number.
+read_newest_package_install_epoch() {
+    local newest_install_epoch
+    newest_install_epoch=$(rpm -qa --qf '%{INSTALLTIME}\n' 2>/dev/null | sort -n | tail -n 1) || return 1
+    [[ "${newest_install_epoch}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "${newest_install_epoch}"
+}
+
+# read_boot_epoch -> btime of /proc/stat, the second the kernel booted.
+# Returns 1 when the file has no such line.
+read_boot_epoch() {
+    local stat_key stat_value
+    while IFS=' ' read -r stat_key stat_value _; do
+        if [[ "${stat_key}" == "btime" && "${stat_value}" =~ ^[0-9]+$ ]]; then
+            printf '%s' "${stat_value}"
+            return 0
+        fi
+    done < <(cat "${PROC_DIRECTORY}/stat" 2>/dev/null)
+    return 1
+}
+
+# read_process_start_epoch PID -> the second the process started.  Its name
+# can hold spaces and parentheses, so the fields are counted from the last
+# ")": the start time, in clock ticks since boot, is the 20th after it.
+# Returns 1 when the file cannot be read or is of another shape.
+read_process_start_epoch() {
+    local process_id="$1" stat_line fields_after_name=()
+    stat_line=$(cat "${PROC_DIRECTORY}/${process_id}/stat" 2>/dev/null) || return 1
+    [[ "${stat_line}" == *") "* ]] || return 1
+    IFS=' ' read -r -a fields_after_name <<< "${stat_line##*) }"
+    [[ "${fields_after_name[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$(( BOOT_EPOCH + fields_after_name[19] / CLOCK_TICKS_PER_SECOND ))"
+}
+
+# read_process_evidence - sets PROCESS_CONTROL_GROUPS, and
+# PROCESS_START_EVIDENCE to "read" with NEWEST_PACKAGE_INSTALL_EPOCH,
+# BOOT_EPOCH and CLOCK_TICKS_PER_SECOND, or to "unavailable" when one of the
+# three cannot be read; no unit is then taken for current.
+read_process_evidence() {
+    local process_directory process_id control_group
+    PROCESS_CONTROL_GROUPS=""
+    DELETED_FILE_INSTALL_EPOCHS=()
+    for process_directory in "${PROC_DIRECTORY}"/[0-9]*; do
+        process_id="${process_directory##*/}"
+        control_group=$(read_process_control_group "${process_id}") || continue
+        PROCESS_CONTROL_GROUPS+="${process_id} ${control_group}"$'\n'
+    done
+    PROCESS_START_EVIDENCE="unavailable"
+    NEWEST_PACKAGE_INSTALL_EPOCH=$(read_newest_package_install_epoch) || return 0
+    BOOT_EPOCH=$(read_boot_epoch) || return 0
+    CLOCK_TICKS_PER_SECOND=$(getconf CLK_TCK 2>/dev/null) || return 0
+    [[ "${CLOCK_TICKS_PER_SECOND}" =~ ^[1-9][0-9]*$ ]] || return 0
+    PROCESS_START_EVIDENCE="read"
+}
+
+# read_deleted_file_install_epoch PATH - sets
+# DELETED_FILE_INSTALL_EPOCHS[PATH] to the latest INSTALLTIME among the
+# packages owning PATH, to "unowned" when rpm says no package owns it or it
+# does not exist, and to "unknown" for any other answer.
+read_deleted_file_install_epoch() {
+    local file_path="$1" query_output install_epoch newest_install_epoch=""
+    if query_output=$(rpm -qf --qf '%{INSTALLTIME}\n' "${file_path}" 2>&1); then
+        while IFS= read -r install_epoch; do
+            [[ "${install_epoch}" =~ ^[0-9]+$ ]] || continue
+            if [[ -z "${newest_install_epoch}" || "${install_epoch}" -gt "${newest_install_epoch}" ]]; then
+                newest_install_epoch="${install_epoch}"
+            fi
+        done <<< "${query_output}"
+        DELETED_FILE_INSTALL_EPOCHS["${file_path}"]="${newest_install_epoch:-unknown}"
+    elif [[ "${query_output}" == *"is not owned by any package"* \
+            || "${query_output}" == *"No such file or directory"* ]]; then
+        DELETED_FILE_INSTALL_EPOCHS["${file_path}"]="unowned"
+    else
+        DELETED_FILE_INSTALL_EPOCHS["${file_path}"]="unknown"
+    fi
+}
+
+# judge_process_mappings PID START_EPOCH
+# Returns: 0 = the process maps a deleted file of a package installed after
+#              START_EPOCH: an update replaced it
+#          1 = it maps no deleted file a package owns
+#          2 = it maps a deleted package file with no later install, START_EPOCH
+#              is empty, or its maps or the file's owner cannot be read
+# rpm renames a file it replaces to "<name>;<hex>" before removing it on the
+# kernels that show the mapping under that name, so the suffix is dropped.  A
+# deleted mapping no package owns, such as a memfd or a temporary file, is
+# not evidence.
+judge_process_mappings() {
+    local process_id="$1" process_start_epoch="$2"
+    local maps_content maps_line mapped_path file_install_epoch judgement=1
+    maps_content=$(cat "${PROC_DIRECTORY}/${process_id}/maps" 2>/dev/null) || return 2
+    while IFS= read -r maps_line; do
+        [[ "${maps_line}" == *" /"*" (deleted)" ]] || continue
+        mapped_path="/${maps_line#* /}"
+        mapped_path="${mapped_path% (deleted)}"
+        if [[ "${mapped_path}" =~ ^(.+)\;[0-9A-Fa-f]{8,}$ ]]; then
+            mapped_path="${BASH_REMATCH[1]}"
+        fi
+        if [[ -z "${DELETED_FILE_INSTALL_EPOCHS[${mapped_path}]:-}" ]]; then
+            read_deleted_file_install_epoch "${mapped_path}"
+        fi
+        file_install_epoch="${DELETED_FILE_INSTALL_EPOCHS[${mapped_path}]}"
+        [[ "${file_install_epoch}" != "unowned" ]] || continue
+        if [[ "${file_install_epoch}" != "unknown" && -n "${process_start_epoch}" ]] \
+           && (( file_install_epoch > process_start_epoch )); then
+            return 0
+        fi
+        judgement=2
+    done <<< "${maps_content}"
+    return "${judgement}"
+}
+
+# read_unit_code_state UNIT_NAME - sets UNIT_CODE_STATE to stale, current or
+# unknown from the processes in the unit's cgroup and the cgroups below it.
+# A process that has exited since the listing is left out.  Not to be called
+# in a command substitution: DELETED_FILE_INSTALL_EPOCHS would not be kept.
+read_unit_code_state() {
+    local unit_name="$1" process_id control_group process_start_epoch mappings_judgement
+    local unit_process_count=0 freshness_unproven=0
+    UNIT_CODE_STATE="unknown"
+    while IFS=' ' read -r process_id control_group; do
+        [[ "${control_group}" == */"${unit_name}" || "${control_group}" == */"${unit_name}"/* ]] || continue
+        [[ -d "${PROC_DIRECTORY}/${process_id}" ]] || continue
+        unit_process_count=$(( unit_process_count + 1 ))
+        process_start_epoch=""
+        if [[ "${PROCESS_START_EVIDENCE}" == "read" ]]; then
+            process_start_epoch=$(read_process_start_epoch "${process_id}") || process_start_epoch=""
+        fi
+        mappings_judgement=0
+        judge_process_mappings "${process_id}" "${process_start_epoch}" || mappings_judgement=$?
+        if [[ "${mappings_judgement}" -eq 0 ]]; then
+            UNIT_CODE_STATE="stale"
+            return 0
+        fi
+        if [[ "${mappings_judgement}" -ne 1 || -z "${process_start_epoch}" ]] \
+           || (( process_start_epoch <= NEWEST_PACKAGE_INSTALL_EPOCH )); then
+            freshness_unproven=1
+        fi
+    done <<< "${PROCESS_CONTROL_GROUPS}"
+    if (( unit_process_count > 0 && freshness_unproven == 0 )); then
+        UNIT_CODE_STATE="current"
+    fi
+    return 0
+}
+
+# restart_stale_services [reboot-allowed]
 # Sets SERVICE_RESTART_SUMMARY to one clause naming every outcome, and the
-# RESTARTED_, FAILED_, PENDING_ and EXCLUDED_SERVICE_NAMES arrays.  Returns 1
-# when a restart failed or had not finished within service_restart_timeout_seconds,
-# or when `dnf needs-restarting -s` failed to list the services: each leaves
+# RESTARTED_, FAILED_, PENDING_, EXCLUDED_, CURRENT_ and
+# REBOOT_REQUIRING_SERVICE_NAMES arrays.  Returns 1 when a restart failed or
+# had not finished within service_restart_timeout_seconds, or when
+# `dnf needs-restarting -s` failed to list the services: each leaves
 # pre-update code running that the run was meant to replace.  Excluded units
-# are left running by design and do not fail the run.
+# are left running by design, and a current unit runs no pre-update code;
+# neither fails the run.
+#
+# With reboot-allowed, a stale unit of REBOOT_REQUIRING_UNIT_NAMES is named in
+# REBOOT_REQUIRING_SERVICE_NAMES, listed by needs-restarting or not, and
+# nothing is restarted: the caller requests the reboot, which replaces every
+# restart.  Without it such a unit is reported with the other excluded units
+# when needs-restarting listed it.  restart_services = no turns off the whole
+# pass, this reboot included.
 restart_stale_services() {
-    local stale_service_output stale_service_name restart_exit_code restart_error_output
-    local summary_clauses=()
+    local reboot_allowed="${1:-}"
+    local stale_service_output stale_service_name restart_exit_code restart_error_output previous_ifs
+    local restartable_service_names=() reboot_requiring_unit_names=() summary_clauses=()
+    local -A judged_service_names=()
     RESTARTED_SERVICE_NAMES=()
     FAILED_SERVICE_NAMES=()
     PENDING_SERVICE_NAMES=()
     EXCLUDED_SERVICE_NAMES=()
+    CURRENT_SERVICE_NAMES=()
+    REBOOT_REQUIRING_SERVICE_NAMES=()
     SERVICE_RESTART_SUMMARY=""
 
     if [[ "${RESTART_SERVICES}" != "yes" ]]; then
@@ -460,16 +669,54 @@ restart_stale_services() {
         return 1
     fi
 
+    # Every flagged unit is judged before any is restarted: one that needs a
+    # reboot replaces every restart.
+    PROCESS_START_EVIDENCE="unread"
     while IFS= read -r stale_service_name; do
         stale_service_name="${stale_service_name//[[:space:]]/}"
         [[ -n "${stale_service_name}" ]] || continue
         [[ "${stale_service_name}" == *.service ]] || continue
 
-        if is_excluded_unit "${stale_service_name}"; then
-            EXCLUDED_SERVICE_NAMES+=("${stale_service_name}")
-            continue
+        if [[ "${PROCESS_START_EVIDENCE}" == "unread" ]]; then
+            read_process_evidence
         fi
+        judged_service_names["${stale_service_name}"]=1
+        read_unit_code_state "${stale_service_name}"
+        if [[ "${UNIT_CODE_STATE}" == "current" ]]; then
+            CURRENT_SERVICE_NAMES+=("${stale_service_name}")
+        elif ! is_excluded_unit "${stale_service_name}"; then
+            restartable_service_names+=("${stale_service_name}")
+        elif [[ "${UNIT_CODE_STATE}" == "stale" && "${reboot_allowed}" == "reboot-allowed" ]] \
+             && unit_matches_patterns "${stale_service_name}" "${REBOOT_REQUIRING_UNIT_NAMES}"; then
+            REBOOT_REQUIRING_SERVICE_NAMES+=("${stale_service_name}")
+        else
+            EXCLUDED_SERVICE_NAMES+=("${stale_service_name}")
+        fi
+    done <<< "${stale_service_output}"
 
+    # The daemons a reboot is requested for do not depend on the listing.
+    if [[ "${reboot_allowed}" == "reboot-allowed" ]]; then
+        previous_ifs="${IFS}"
+        IFS=',' read -ra reboot_requiring_unit_names <<< "${REBOOT_REQUIRING_UNIT_NAMES}"
+        IFS="${previous_ifs}"
+        for stale_service_name in "${reboot_requiring_unit_names[@]}"; do
+            [[ -z "${judged_service_names[${stale_service_name}]:-}" ]] || continue
+            if [[ "${PROCESS_START_EVIDENCE}" == "unread" ]]; then
+                read_process_evidence
+            fi
+            read_unit_code_state "${stale_service_name}"
+            if [[ "${UNIT_CODE_STATE}" == "stale" ]]; then
+                REBOOT_REQUIRING_SERVICE_NAMES+=("${stale_service_name}")
+            fi
+        done
+    fi
+
+    if [[ "${#REBOOT_REQUIRING_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        SERVICE_RESTART_SUMMARY="reboot needed for $(join_with ', ' "${REBOOT_REQUIRING_SERVICE_NAMES[@]}"), on pre-update code and not restartable; service restarts skipped, the reboot replaces them"
+        return 0
+    fi
+
+    for stale_service_name in "${restartable_service_names[@]}"; do
         # Bounded: a unit that hangs in stop or start must not hold the run.
         # Stopping the systemctl client leaves the restart job to systemd.
         # systemctl's stderr is kept for the log: it names why a restart failed.
@@ -488,7 +735,7 @@ restart_stale_services() {
             restart_error_output=${restart_error_output%%$'\n'*}
             log_warning "failed to restart ${stale_service_name} - it is still running pre-update code${restart_error_output:+ (systemctl: ${restart_error_output})}"
         fi
-    done <<< "${stale_service_output}"
+    done
 
     if [[ "${#RESTARTED_SERVICE_NAMES[@]}" -gt 0 ]]; then
         summary_clauses+=("restarted $(join_with ', ' "${RESTARTED_SERVICE_NAMES[@]}")")
@@ -501,6 +748,9 @@ restart_stale_services() {
     fi
     if [[ "${#EXCLUDED_SERVICE_NAMES[@]}" -gt 0 ]]; then
         summary_clauses+=("excluded from restart, still on pre-update code: $(join_with ', ' "${EXCLUDED_SERVICE_NAMES[@]}")")
+    fi
+    if [[ "${#CURRENT_SERVICE_NAMES[@]}" -gt 0 ]]; then
+        summary_clauses+=("flagged but on current code, not restarted: $(join_with ', ' "${CURRENT_SERVICE_NAMES[@]}")")
     fi
     if [[ "${#summary_clauses[@]}" -eq 0 ]]; then
         summary_clauses=("no service needed a restart")
@@ -828,9 +1078,15 @@ main() {
     # block, and the watchdog supervises the run only while the file exists.
     case "${needs_reboot_exit_code}" in
         0)
-            log "No reboot required"
-            restart_stale_services || service_restart_exit_code=$?
-            report_completion "no reboot needed" "${service_restart_exit_code}"
+            log "No flagged package needs a reboot"
+            restart_stale_services reboot-allowed || service_restart_exit_code=$?
+            if [[ "${#REBOOT_REQUIRING_SERVICE_NAMES[@]}" -gt 0 ]]; then
+                log "Reboot needed: $(join_with ', ' "${REBOOT_REQUIRING_SERVICE_NAMES[@]}") map files an update replaced and cannot be restarted"
+                request_reboot "${REBOOT_REQUEST_LOCK_TIMEOUT_SECONDS}" schedule_reboot || exit 1
+                report_completion "${SCHEDULED_REBOOT_SUMMARY}" 0
+            else
+                report_completion "no reboot needed" "${service_restart_exit_code}"
+            fi
             ;;
         1)
             request_reboot "${REBOOT_REQUEST_LOCK_TIMEOUT_SECONDS}" schedule_reboot || exit 1

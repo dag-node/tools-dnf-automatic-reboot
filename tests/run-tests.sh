@@ -1493,7 +1493,7 @@ test_run_helper_failure_fails_the_run() {
     local exit_code=0 output
     output=$( main 2>&1 ) || exit_code=$?
     assert_exit_code 1 "${exit_code}" "an unexpected helper status fails the run"
-    assert_not_contains "${output}" "No reboot required" "not reported as a clean result"
+    assert_not_contains "${output}" "No flagged package needs a reboot" "not reported as a clean result"
     assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "and does not reboot"
 }
 
@@ -1859,6 +1859,261 @@ test_services_template_units_are_excluded_by_glob() {
     return 0
 }
 
+
+# make_service_process PID CGROUP NAME START_TICKS [MAPPED_FILE] -> a /proc
+# entry for a process named NAME in CGROUP that started START_TICKS clock
+# ticks after boot and maps /usr/lib64/libc.so.6 and, when given, MAPPED_FILE,
+# written as /proc/PID/maps names it.
+make_service_process() {
+    local process_id="$1" control_group="$2" process_name="$3" start_ticks="$4" mapped_file="${5:-}"
+    mkdir -p "${TEST_ROOT_DIR}/proc/${process_id}"
+    printf '1:name=systemd:%s\n' "${control_group}" > "${TEST_ROOT_DIR}/proc/${process_id}/cgroup"
+    printf '%s (%s) S 1 %s %s 0 -1 4194624 5605 3175 0 0 27 4 12 2 20 0 1 0 %s 256180224 29459\n' \
+        "${process_id}" "${process_name}" "${process_id}" "${process_id}" "${start_ticks}" \
+        > "${TEST_ROOT_DIR}/proc/${process_id}/stat"
+    {
+        printf '7f0000000000-7f0000001000 r-xp 00000000 fd:00 100                        /usr/lib64/libc.so.6\n'
+        printf '7ffc00000000-7ffc00021000 rw-p 00000000 00:00 0                          [stack]\n'
+        if [[ -n "${mapped_file}" ]]; then
+            printf '7f0000002000-7f0000003000 r-xp 00000000 fd:00 200                        %s\n' "${mapped_file}"
+        fi
+    } > "${TEST_ROOT_DIR}/proc/${process_id}/maps"
+}
+
+# stub_process_evidence: the kernel booted at 1000000 with 100 clock ticks a
+# second, and the newest package was installed 900 seconds later.  rpm -qf
+# answers as rpm does: a path under /usr belongs to a package installed at
+# STUB_OWNER_INSTALL_EPOCH, 1000900 by default; a memfd, or a name still
+# carrying rpm's ";<hex>" transaction suffix, does not exist; any other path
+# is owned by no package.  STUB_RPM_QUERY_FAILS=yes fails every such query.
+stub_process_evidence() {
+    printf 'cpu  1 2 3\nbtime 1000000\nprocesses 5\n' > "${TEST_ROOT_DIR}/proc/stat"
+    getconf() { printf '100\n'; }
+    rpm() {
+        local queried_path="${*: -1}"
+        if [[ "$1" == "-qa" ]]; then
+            printf '1000500\n1000900\n1000100\n'
+            return 0
+        fi
+        [[ "$1" == "-qf" ]] || return 1
+        if [[ "${STUB_RPM_QUERY_FAILS:-}" == "yes" ]]; then
+            printf 'error: rpmdb: damaged header #42 retrieved -- skipping.\n'
+            return 1
+        fi
+        case "${queried_path}" in
+            *";"*|/memfd:*)
+                printf 'error: file %s: No such file or directory\n' "${queried_path}"
+                return 1 ;;
+            /usr/*)
+                printf '%s\n' "${STUB_OWNER_INSTALL_EPOCH:-1000900}"
+                return 0 ;;
+            *)
+                printf 'file %s is not owned by any package\n' "${queried_path}"
+                return 1 ;;
+        esac
+    }
+}
+
+test_services_process_start_is_read_past_a_name_with_spaces() {
+    load_run_library
+    BOOT_EPOCH=1000
+    CLOCK_TICKS_PER_SECOND=100
+    mkdir -p "${TEST_ROOT_DIR}/proc/4764" "${TEST_ROOT_DIR}/proc/4765" "${TEST_ROOT_DIR}/proc/4766"
+    # A worker of spamd: split on spaces, the 22nd field is 0, not the start.
+    printf '%s\n' '4764 (spamd child) S 4730 4730 4730 0 -1 4194624 5605 3175 0 0 27 4 12 2 20 0 1 0 14800114 256180224 29459 18446744073709551615' \
+        > "${TEST_ROOT_DIR}/proc/4764/stat"
+    assert_equals "149001" "$(read_process_start_epoch 4764)" "the start follows the name, whatever it holds"
+    printf '%s\n' '4765 (a) b (c) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 500 1 1' \
+        > "${TEST_ROOT_DIR}/proc/4765/stat"
+    assert_equals "1005" "$(read_process_start_epoch 4765)" "parentheses in the name"
+    printf '%s\n' '4766 (short) S 1 1' > "${TEST_ROOT_DIR}/proc/4766/stat"
+    read_process_start_epoch 4766 >/dev/null && fail "a line of another shape has no start time"
+    read_process_start_epoch 4999 >/dev/null && fail "a process that is gone has no start time"
+    return 0
+}
+
+test_services_current_unit_is_not_restarted() {
+    load_run_library
+    stub_service_restarts
+    stub_process_evidence
+    # needs-restarting reads a process named with a space as old as the boot
+    # and flags its unit at every run, however recently it started.  A memfd
+    # is a deleted mapping no package owns.
+    make_service_process 4730 /system.slice/spamassassin.service "spamd" 100000
+    make_service_process 4764 /system.slice/spamassassin.service "spamd child" 100100 "/memfd:cache (deleted)"
+    make_service_process 900 /system.slice/sshd.service "sshd" 50000
+    export STUB_STALE_SERVICES="spamassassin.service
+sshd.service"
+    local exit_code=0
+    restart_stale_services >/dev/null 2>&1 || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a unit left running on that evidence is not a failure"
+    assert_not_contains "$(cat "${STUB_LOG}")" "try-restart spamassassin.service" \
+        "started after the newest install and maps no replaced file: nothing to replace"
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart sshd.service" "a unit older than the install is restarted"
+    assert_equals "restarted sshd.service; flagged but on current code, not restarted: spamassassin.service" \
+        "${SERVICE_RESTART_SUMMARY}" "the summary names both"
+}
+
+test_services_recent_process_on_a_replaced_file_is_restarted() {
+    load_run_library
+    stub_service_restarts
+    stub_process_evidence
+    # A worker forked after the update inherits what its parent mapped before
+    # it: a recent start does not make its code current.
+    make_service_process 4764 /system.slice/spamassassin.service "spamd child" 100100 \
+        "/usr/lib64/libuuid.so.1.3.0 (deleted)"
+    export STUB_STALE_SERVICES="spamassassin.service"
+    restart_stale_services >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart spamassassin.service" "a replaced file is mapped"
+
+    # A failed ownership query is not "no package owns it".
+    : > "${STUB_LOG}"
+    export STUB_RPM_QUERY_FAILS=yes
+    restart_stale_services >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart spamassassin.service" "the file's owner cannot be read"
+}
+
+test_services_unit_with_an_older_process_is_restarted() {
+    load_run_library
+    stub_service_restarts
+    stub_process_evidence
+    # One process from before the install is enough, in the unit's cgroup or
+    # one below it, and so is one that started in the second of the install.
+    make_service_process 4730 /system.slice/spamassassin.service "spamd" 100000
+    make_service_process 4764 /system.slice/spamassassin.service/workers "spamd child" 50000
+    make_service_process 700 /system.slice/nginx.service "nginx" 90000
+    export STUB_STALE_SERVICES="spamassassin.service
+nginx.service"
+    restart_stale_services >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart spamassassin.service" "an older process below the unit"
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart nginx.service" "started in the second of the install"
+}
+
+test_services_unreadable_evidence_restarts() {
+    load_run_library
+    stub_service_restarts
+    stub_process_evidence
+    make_service_process 4730 /system.slice/spamassassin.service "spamd" 100000
+    export STUB_STALE_SERVICES="spamassassin.service"
+
+    printf '4730 (spamd) S 1 1\n' > "${TEST_ROOT_DIR}/proc/4730/stat"
+    restart_stale_services >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart spamassassin.service" "a start time that cannot be read"
+
+    : > "${STUB_LOG}"
+    make_service_process 4730 /system.slice/spamassassin.service "spamd" 100000
+    rm -f "${TEST_ROOT_DIR}/proc/4730/maps"
+    restart_stale_services >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart spamassassin.service" "maps that cannot be read"
+
+    : > "${STUB_LOG}"
+    make_service_process 4730 /system.slice/other.service "spamd" 100000
+    restart_stale_services >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart spamassassin.service" "no process of the unit found"
+
+    : > "${STUB_LOG}"
+    make_service_process 4730 /system.slice/spamassassin.service "spamd" 100000
+    rpm() { return 1; }
+    restart_stale_services >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart spamassassin.service" "the newest install cannot be read"
+
+    : > "${STUB_LOG}"
+    stub_process_evidence
+    rm -f "${TEST_ROOT_DIR}/proc/stat"
+    restart_stale_services >/dev/null 2>&1
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart spamassassin.service" "the boot time cannot be read"
+}
+
+test_run_stale_unrestartable_daemon_requests_a_reboot() {
+    load_run_library
+    stub_run_main
+    stub_service_restarts
+    stub_process_evidence
+    # dbus-daemon still maps a library the update replaced, under the name rpm
+    # gave the old file, and nothing but a reboot restarts it.  logind does
+    # too, and is judged though needs-restarting did not list it.
+    make_service_process 918 /system.slice/dbus.service "dbus-daemon" 3000 \
+        "/usr/lib64/libmount.so.1.1.0;5f3a2b1c (deleted)"
+    make_service_process 917 /system.slice/systemd-logind.service "systemd-logind" 3000 \
+        "/usr/lib64/libblkid.so.1.1.0 (deleted)"
+    make_service_process 900 /system.slice/sshd.service "sshd" 3000
+    export STUB_STALE_SERVICES="dbus.service
+sshd.service"
+    local exit_code=0 output
+    output=$( main 2>&1 ) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "a scheduled reboot is a successful run"
+    assert_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "the reboot is requested"
+    assert_not_contains "$(cat "${STUB_LOG}")" "try-restart" "the reboot replaces every restart"
+    assert_contains "${output}" "reboot needed for dbus.service, systemd-logind.service, on pre-update code and not restartable" \
+        "the completion line names the reason"
+}
+
+test_run_daemon_on_a_file_no_update_replaced_does_not_reboot() {
+    load_run_library
+    stub_run_main
+    stub_service_restarts
+    stub_process_evidence
+    # A package's data file rewritten by its application is deleted and
+    # package-owned too, but the package was installed before the daemon
+    # started: no update replaced it, and a reboot would not be the last.
+    export STUB_OWNER_INSTALL_EPOCH=1000010
+    make_service_process 918 /system.slice/dbus.service "dbus-daemon" 3000 \
+        "/usr/lib64/gconv/gconv-modules.cache (deleted)"
+    export STUB_STALE_SERVICES="dbus.service"
+    local exit_code=0 output
+    output=$( main 2>&1 ) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the run succeeds"
+    assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "no reboot without a later install"
+    assert_contains "${output}" "excluded from restart, still on pre-update code: dbus.service" "it is reported"
+
+    # Nor when the file's owner cannot be read.
+    : > "${STUB_LOG}"
+    export STUB_OWNER_INSTALL_EPOCH=1000900 STUB_RPM_QUERY_FAILS=yes
+    ( main ) >/dev/null 2>&1
+    assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "no reboot on a failed rpm query"
+}
+
+test_run_unrestartable_daemon_without_a_replaced_file_does_not_reboot() {
+    load_run_library
+    stub_run_main
+    stub_service_restarts
+    stub_process_evidence
+    # Flagged, older than the newest install, but mapping no replaced file:
+    # not evidence enough for a reboot, and what a host shows after one.
+    make_service_process 918 /system.slice/dbus.service "dbus-daemon" 3000
+    # A getty is replaced when its session ends: reported, never rebooted for.
+    make_service_process 1251 /system.slice/system-getty.slice/getty@tty1.service "agetty" 3000 \
+        "/usr/lib64/libmount.so.1.1.0 (deleted)"
+    export STUB_STALE_SERVICES="dbus.service
+getty@tty1.service"
+    local exit_code=0 output
+    output=$( main 2>&1 ) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "the run succeeds"
+    assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "no reboot is requested"
+    assert_contains "${output}" "excluded from restart, still on pre-update code: dbus.service, getty@tty1.service" \
+        "both are reported"
+}
+
+test_run_withheld_reboot_is_not_requested_for_a_stale_daemon() {
+    load_run_library
+    stub_run_main
+    stub_service_restarts
+    stub_process_evidence
+    # needs-reboot.sh exits 2 when a kernel the host would not boot withholds
+    # every reboot: a stale daemon does not get one either.
+    export STUB_NEEDS_REBOOT_RC=2
+    make_service_process 918 /system.slice/dbus.service "dbus-daemon" 3000 \
+        "/usr/lib64/libmount.so.1.1.0 (deleted)"
+    make_service_process 900 /system.slice/sshd.service "sshd" 3000
+    export STUB_STALE_SERVICES="dbus.service
+sshd.service"
+    local exit_code=0 output
+    output=$( main 2>&1 ) || exit_code=$?
+    assert_exit_code 1 "${exit_code}" "the undecidable reboot state fails the run"
+    assert_not_contains "$(cat "${STUB_LOG}")" "schedule_reboot" "no reboot is requested"
+    assert_contains "$(cat "${STUB_LOG}")" "try-restart sshd.service" "restartable services are still restarted"
+    assert_contains "${output}" "excluded from restart, still on pre-update code: dbus.service" "the daemon is reported"
+}
 
 test_services_disabled_by_config() {
     load_run_library
@@ -4240,6 +4495,15 @@ run_test "services: exclusions are additive"         test_services_exclusions_ar
 run_test "services: excluded units are not restarted" test_services_excluded_units_are_not_restarted needs-exec
 run_test "services: failed restart logs the reason"  test_services_failed_restart_logs_the_reason
 run_test "services: reboot list installs only package names" test_reboot_list_installs_only_package_names
+run_test "services: process start is read past a name with spaces" test_services_process_start_is_read_past_a_name_with_spaces
+run_test "services: current unit is not restarted"   test_services_current_unit_is_not_restarted
+run_test "services: recent process on a replaced file is restarted" test_services_recent_process_on_a_replaced_file_is_restarted
+run_test "services: unit with an older process is restarted" test_services_unit_with_an_older_process_is_restarted
+run_test "services: unreadable evidence restarts"     test_services_unreadable_evidence_restarts
+run_test "services: stale unrestartable daemon requests a reboot" test_run_stale_unrestartable_daemon_requests_a_reboot
+run_test "services: unrestartable daemon without a replaced file does not reboot" test_run_unrestartable_daemon_without_a_replaced_file_does_not_reboot
+run_test "services: daemon on a file no update replaced does not reboot" test_run_daemon_on_a_file_no_update_replaced_does_not_reboot
+run_test "services: withheld reboot is not requested for a stale daemon" test_run_withheld_reboot_is_not_requested_for_a_stale_daemon
 run_test "services: disabled by config"              test_services_disabled_by_config
 run_test "services: restart is bounded"              test_services_restart_is_bounded
 run_test "services: template units excluded by glob" test_services_template_units_are_excluded_by_glob

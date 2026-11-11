@@ -584,6 +584,10 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   so the updated version runs only after a reboot.
   /etc/dnf/plugins/needs-restarting.d/automatic-reboot.conf adds audit to the packages
   needs-restarting -r checks.
+- CHANGE: The host reboots when dbus, dbus-broker, systemd-logind or auditd still maps a file
+  an update replaced. These are never restarted, so 1.5.0 left them on the pre-update
+  library until a reboot for another reason. The reboot is requested once per update, with
+  the usual warning and cancel command.
 - NEW: /usr/libexec/dnf-automatic-reboot/check-config.sh validates
   /etc/dnf/automatic-reboot.conf and lists every value that differs from the shipped one; the
   RPM runs it after every install and upgrade. The file is not edited.
@@ -609,6 +613,10 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   password.
 - FIX: auditd.service is never restarted. systemd refuses the request, and the run failed.
 - FIX: The warning for a failed service restart carries the reason systemctl gave.
+- FIX: A service with a space in a process name, such as spamassassin's "spamd child", is no
+  longer restarted at every run. needs-restarting reads such a process as started at boot; a
+  flagged service is left running, and named in the run's summary, when none of its processes
+  maps a replaced file and all of them started after the newest package install.
 - DOCS: dnf-automatic-reboot.timer explains how to override the schedule and how far apart runs
   must stay, with three-a-day schedules weighted on the US, Asia, the EU or global traffic.
 

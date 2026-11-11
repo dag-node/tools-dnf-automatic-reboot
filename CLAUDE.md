@@ -289,8 +289,10 @@ reported as code 2.
 
 Code 2 does not reboot, to avoid a loop. `run.sh` escalates it to a non-zero exit so `OnFailure=` fires and the fail-open is never silent. Any status other
 than 0, 1 and 2, such as 127 from a missing helper, is handled as code 2: only 0 means
-"no reboot needed". Nothing promotes a 0 to a reboot: the host reboots only when a
-flagged package needs it.
+"no reboot needed". After a 0, `run.sh` requests a reboot in one case only: a daemon that
+cannot be restarted maps a file an update replaced (see
+[What `needs-restarting -r` does not cover](#what-needs-restarting--r-does-not-cover)).
+Codes 1 and 2 are final.
 
 ### State file `/run/dnf-automatic-reboot.state`
 
@@ -699,7 +701,8 @@ with no reboot flag raised.
 `run.sh` closes this with a `needs-restarting -s` pass, which walks `/proc/*/smaps`
 and names the affected systemd units. Units are restarted with `systemctl try-restart`
 so a unit that is not running is left alone, each under `service_restart_timeout_seconds`,
-and the pass is skipped entirely when a reboot is already scheduled.
+and the pass is skipped entirely when a reboot is already scheduled. Every flagged unit is
+judged before any is restarted.
 `BUILT_IN_EXCLUDED_UNIT_PATTERNS` in `run.sh` holds the units that must never be restarted
 from underneath a running system — `dbus`/`dbus-broker` break every client holding a bus
 connection, `systemd-logind` drops session tracking, `user@`, `getty@` and `autovt@` end
@@ -710,9 +713,47 @@ drop-in. `needs-reboot.sh` handles `audit` as any flagged non-kernel package.
 `restart_services_excluded_patterns` adds to it and cannot remove from it. Extend that
 list, never shorten it.
 
+`needs-restarting` flags a unit when a process of it maps a file of a package installed after
+the start it computes for that process, and it takes the start from `/proc/PID/stat` split
+on spaces. A process name holding a space, such as spamd's `spamd child`, shifts the fields:
+the start reads as 0, the process as old as the boot, and its unit is flagged at every run
+once it maps a file installed since boot. `run.sh` therefore reads its own evidence for every
+flagged unit, from the processes in the unit's cgroup (`read_unit_code_state`):
+
+| State | Evidence | Restartable unit | Never-restart unit |
+|-------|----------|------------------|--------------------|
+| `stale` | a process maps a deleted file of a package installed after that process started: an update replaced it | restart | reboot if in `REBOOT_REQUIRING_UNIT_NAMES`, else reported |
+| `current` | no process maps a deleted file a package owns, and every process started after the newest rpm `INSTALLTIME` | left running, named `flagged but on current code` | the same |
+| `unknown` | anything else: a deleted package file with no later install, an older process, no process found, an unreadable `maps`, `stat`, `btime` or `CLK_TCK`, an rpm query that failed | restart | reported as `excluded from restart, still on pre-update code` |
+
+Both halves of `current` are needed. A worker forked after an update keeps the mappings of
+its older parent, so a recent start alone proves nothing; code read at start, as an
+interpreter's is, shows in no mapping, so the start has to be recent too. The start is
+counted from the last `)` of the stat line and added to `btime`.
+
+A deleted mapping is judged by its owner (`rpm -qf`), after dropping the `;<hex>` suffix rpm
+gives a file it replaces, as the plugin does; on the surveyed RHEL 8.10 host a replaced
+library reads `<path> (deleted)`, without the suffix. One no package owns, such as a memfd or a
+temporary file, is not evidence. One a package owns is `stale` only when that package was
+installed after the process started: an application rewriting its own package-owned data file
+is deleted and owned too, and a reboot for it would come back at every rewrite. A query that
+fails is neither "owned" nor "not owned".
+
+`REBOOT_REQUIRING_UNIT_NAMES` holds the never-restart daemons whose pre-update code only a
+reboot replaces: `dbus`, `dbus-broker`, `systemd-logind` and `auditd`. A getty or a user
+manager is replaced when its session ends, an operator's own exclusion by the operator. The
+four are judged at every pass, listed by `needs-restarting -s` or not. When one is `stale`
+and `needs-reboot.sh` exited 0, `run.sh` restarts nothing and requests the reboot through
+`request_reboot`, as for a flagged package. Only `stale` requests it, never `unknown`: after
+the reboot no process maps a file replaced since it started until another update replaces
+one, so the request cannot repeat. A reboot `needs-reboot.sh` withheld (exit 2) is not
+requested for a daemon either, and `restart_services = no` turns off the whole pass, this
+reboot included.
+
 A restart that fails, one still unfinished at `service_restart_timeout_seconds`, and a
 `needs-restarting -s` that cannot list the units each leave pre-update code running, so
-each fails the run. An excluded unit does not: it is left running by design. The run
+each fails the run. An excluded unit does not: it is left running by design, or the host
+reboots for it. The run
 ends with one line naming the update, reboot and restart outcome, for example
 `Updates installed (packages: 3); no reboot needed; restart still pending for sshd.service. Check:
 systemctl status sshd.service`, logged, and sent through `wall` when the run failed. `wall`
