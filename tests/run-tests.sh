@@ -1337,6 +1337,22 @@ dbus.service"
         "one line for the whole run"
 }
 
+test_run_auditd_is_excluded_and_does_not_fail_the_run() {
+    load_run_library
+    stub_run_main
+    stub_service_restarts
+    # systemd refuses to restart auditd.service (RefuseManualStop=yes).
+    export STUB_STALE_SERVICES="spamassassin.service
+auditd.service"
+    export STUB_RESTART_RC_auditd=1
+    local exit_code=0 output
+    output=$( main 2>&1 ) || exit_code=$?
+    assert_exit_code 0 "${exit_code}" "auditd left on pre-update code is by design, not a failure"
+    assert_contains "${output}" "restarted spamassassin.service; excluded from restart, still on pre-update code: auditd.service" \
+        "auditd is named as left on pre-update code"
+    assert_not_contains "$(cat "${STUB_LOG}")" "try-restart auditd.service" "no restart is requested for auditd"
+}
+
 test_run_summary_counts_what_was_installed() {
     load_run_library
     rpm() { printf '100\n200\n300\n'; }
@@ -1589,7 +1605,7 @@ test_services_exclusions_are_additive() {
         > "${TEST_ROOT_DIR}/etc/dnf/automatic-reboot.conf"
     load_run_library
     local unit_name
-    for unit_name in dbus.service dbus-broker.service systemd-logind.service user@1000.service \
+    for unit_name in dbus.service dbus-broker.service systemd-logind.service auditd.service user@1000.service \
                      getty@tty1.service serial-getty@ttyS0.service autovt@tty2.service \
                      dnf-automatic-reboot.service dnf-automatic-watchdog.service \
                      postgresql.service container-web.service; do
@@ -4145,6 +4161,7 @@ run_test "run: interrupted request keeps its marker" test_run_interrupted_reques
 run_test "run: pending restart fails the run"       test_run_pending_restart_fails_the_run
 run_test "run: failed restart fails the run"        test_run_failed_restart_fails_the_run
 run_test "run: completion summary names every outcome" test_run_completion_summary_names_every_outcome
+run_test "run: auditd is excluded and does not fail the run" test_run_auditd_is_excluded_and_does_not_fail_the_run
 run_test "run: reboot is scheduled on a named unit"  test_reboot_is_scheduled_on_a_named_unit needs-exec
 run_test "run: reboot already scheduled is kept"     test_reboot_already_scheduled_is_not_scheduled_twice needs-exec
 run_test "run: summary counts what was installed"   test_run_summary_counts_what_was_installed

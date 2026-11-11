@@ -334,9 +334,11 @@ Services still running pre-update code
   restart_services_excluded_patterns = postgresql.service,container-*.service
 
   Units are restarted with systemctl try-restart, so a unit that is not
-  running is left alone.  dbus, dbus-broker, systemd-logind, user@, getty,
-  serial-getty, autovt and this package's own units are never restarted; the
-  setting adds units to that list and cannot remove one from it.
+  running is left alone.  dbus, dbus-broker, systemd-logind, auditd, user@,
+  getty, serial-getty, autovt and this package's own units are never
+  restarted; the setting adds units to that list and cannot remove one from
+  it.  systemd refuses to restart auditd; it runs the updated version after
+  the next reboot.
 
 
 Kernel reboot loop guard

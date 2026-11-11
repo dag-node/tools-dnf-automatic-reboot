@@ -246,6 +246,16 @@ stale_services_output=$(timeout "${COMMAND_TIMEOUT_SECONDS}" dnf -q -C needs-res
 report_info run.sh "dnf -q -C needs-restarting -s exited ${stale_services_exit_code}"
 printf '%s\n' "${stale_services_output}" | head -n 15 | report_lines run.sh "-s" || true
 
+# run.sh never restarts auditd.service: systemd refuses the request.
+auditd_refusal_properties=$(systemctl show --property=RefuseManualStart --property=RefuseManualStop \
+                            auditd.service 2>&1) || true
+if grep -qx 'RefuseManualStop=yes' <<< "${auditd_refusal_properties}"; then
+    report_pass run.sh "auditd.service refuses a manual stop"
+else
+    report_info run.sh "auditd.service does not report RefuseManualStop=yes"
+fi
+printf '%s\n' "${auditd_refusal_properties}" | report_lines run.sh "auditd.service" || true
+
 # ---------------------------------------------------------------------------
 printf '== security advisories\n'
 # ---------------------------------------------------------------------------

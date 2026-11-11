@@ -590,6 +590,7 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 - FIX: dnf-makecache.timer's run no longer reads as a manual dnf command. The warning names
   each other dnf process by PID and cgroup, never by its arguments, which can carry a
   password.
+- FIX: auditd.service is never restarted. systemd refuses the request, and the run failed.
 - DOCS: dnf-automatic-reboot.timer explains how to override the schedule and how far apart runs
   must stay, with three-a-day schedules weighted on the US, Asia, the EU or global traffic.
 

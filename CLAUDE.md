@@ -699,7 +699,8 @@ and the pass is skipped entirely when a reboot is already scheduled.
 `BUILT_IN_EXCLUDED_UNIT_PATTERNS` in `run.sh` holds the units that must never be restarted
 from underneath a running system — `dbus`/`dbus-broker` break every client holding a bus
 connection, `systemd-logind` drops session tracking, `user@`, `getty@` and `autovt@` end
-sessions, and this package's units would kill the run.
+sessions, and this package's units would kill the run. systemd refuses to restart
+`auditd.service` (`RefuseManualStop=yes`); it runs the updated version after the next reboot.
 `restart_services_excluded_patterns` adds to it and cannot remove from it. Extend that
 list, never shorten it.
 

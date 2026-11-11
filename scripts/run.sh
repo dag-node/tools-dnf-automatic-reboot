@@ -303,9 +303,9 @@ readonly REBOOT_RETRY_TIMEOUT_SECONDS=1800
 # Units never restarted, whatever the configuration adds: dbus and dbus-broker
 # break every client holding a bus connection, systemd-logind drops session
 # tracking, user@ ends that user's services and sessions, the getty and
-# autovt instances log out their console, and this package's own units would
-# stop the run.
-readonly BUILT_IN_EXCLUDED_UNIT_PATTERNS="dbus.service,dbus-broker.service,systemd-logind.service,user@*.service,getty@*.service,serial-getty@*.service,autovt@*.service,dnf-automatic-reboot.service,dnf-automatic-watchdog.service"
+# autovt instances log out their console, systemd refuses to restart auditd
+# (RefuseManualStop=yes), and this package's own units would stop the run.
+readonly BUILT_IN_EXCLUDED_UNIT_PATTERNS="dbus.service,dbus-broker.service,systemd-logind.service,auditd.service,user@*.service,getty@*.service,serial-getty@*.service,autovt@*.service,dnf-automatic-reboot.service,dnf-automatic-watchdog.service"
 
 # exit_if_config_invalid - exits 1, before anything is refreshed, installed or
 # rebooted, when the configuration has errors; logs each one and broadcasts
