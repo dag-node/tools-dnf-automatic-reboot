@@ -15,8 +15,10 @@
 # transient service, the message says whether update runs stay blocked and
 # how to recover.
 #
-# Configuration: /etc/dnf/automatic-reboot.conf
-# Log:           /var/log/dnf-automatic-reboot.log
+# It reads no configuration, so an invalid /etc/dnf/automatic-reboot.conf
+# cannot stop the notice that reports it.
+#
+# Log: /var/log/dnf-automatic-reboot.log
 # ---------------------------------------------------------------------------
 set -euo pipefail
 IFS=$'\n\t'
@@ -27,7 +29,6 @@ export LC_ALL=C
 # temporary tree so every path below resolves inside it.
 readonly TEST_ROOT="${DNF_AUTOMATIC_REBOOT_TEST_ROOT:-}"
 
-readonly CONFIG_FILE="${TEST_ROOT}/etc/dnf/automatic-reboot.conf"
 readonly LOG_FILE="${TEST_ROOT}/var/log/dnf-automatic-reboot.log"
 readonly REBOOT_PENDING_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-pending"
 readonly REBOOT_DISPATCHED_FILE="${TEST_ROOT}/run/dnf-automatic-reboot.reboot-dispatched"
@@ -41,12 +42,8 @@ log_error() {
     printf '%s %s: ERROR: %s\n' "$(date -Iseconds)" "${SCRIPT_NAME}" "$*" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
-wall_msg() {
-    local wall_messages_enabled
-    # A trailing comment is not part of the value: `wall_messages = no  # quiet`.
-    wall_messages_enabled=$(grep -E "^\s*wall_messages\s*=" "${CONFIG_FILE}" 2>/dev/null \
-                            | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' | tr -d ' ') || true
-    [[ "${wall_messages_enabled:-yes}" == "no" ]] && return 0
+# send_wall_message TEXT... - broadcasts to logged-in users.
+send_wall_message() {
     wall "$*" 2>/dev/null || true
 }
 
@@ -112,9 +109,9 @@ main() {
         log_error "${outcome_summary}"
     fi
 
-    wall_msg "dnf-automatic-reboot: ${failed_unit_name} FAILED." \
-             "${outcome_summary}" \
-             "Inspect: journalctl -u ${failed_unit_name} -e"
+    send_wall_message "dnf-automatic-reboot: ${failed_unit_name} FAILED." \
+                      "${outcome_summary}" \
+                      "Inspect: journalctl -u ${failed_unit_name} -e"
     exit 0
 }
 

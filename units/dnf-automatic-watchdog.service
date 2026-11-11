@@ -10,9 +10,8 @@ Type=oneshot
 ExecStart=/usr/libexec/dnf-automatic-reboot/watchdog.sh
 RemainAfterExit=no
 # A oneshot has no start timeout by default.  A watchdog that hangs never
-# exits, so the timer cannot start the next cycle and the hard timeout is
-# never reached.  watchdog.sh bounds its own reboot check to less than this
-# at the default needs_restarting_timeout_sec.
+# exits, so the timer cannot start the next cycle.  watchdog.sh's slowest
+# path, the kill and up to 300 s to confirm it, ends well inside this.
 TimeoutStartSec=15min
 # The recovery file never outlives the watchdog.  watchdog.sh removes it on
 # exit; this covers a watchdog killed at the timeout, which would otherwise

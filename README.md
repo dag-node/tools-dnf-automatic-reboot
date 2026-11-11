@@ -3,6 +3,24 @@
 Installs system updates every night and restarts the computer only when an
 update needs a restart to take effect.
 
+> [!WARNING]
+> **Versions 1.5.0 and older can cut a long update off halfway.** They stop
+> `dnf-automatic` after 60 minutes (`dnf_timeout_min`) and kill whatever is
+> left after 180 (`watchdog_hard_timeout_min`), even while packages are being
+> installed. An upgrade to the next minor release of the distribution can take
+> longer than that on a slow device such as a Raspberry Pi, or over a slow
+> link, and is then stopped with packages half-installed. With
+> `force_reboot_on_hard_timeout = yes` the computer is restarted in that state.
+>
+> Upgrade to 1.6.0. It never stops an update that is still making progress,
+> and its settings file is rewritten to be safe by default: the time limits
+> and the forced restart are gone, and every remaining setting only accepts
+> safe values. An edited settings file from an older version has to be
+> replaced; see
+> [Upgrading from an earlier version](#upgrading-from-an-earlier-version).
+> Until then, set both limits above your longest update and keep
+> `force_reboot_on_hard_timeout = no`.
+
 ## Who this is for
 
 On most Enterprise Linux 9 systems, `dnf-automatic` restarts after updates
@@ -22,9 +40,9 @@ On Red Hat Enterprise Linux 8, `dnf-automatic` does not restart after
 updates at all.
 
 This package filters out the false restart requests and restarts only when
-the restart applies an update. Before a kernel restart it checks that the new
-kernel is the one that will boot; if not, it does not restart and
-logs why.
+the restart applies an update. Before every restart it checks that the newest
+kernel is the one that will boot. If not, it does not restart for any update
+until the boot setting is fixed, and each night's alert says how to fix it.
 
 It installs on Enterprise Linux 8 and 9 (Red Hat Enterprise Linux, Oracle
 Linux, Rocky Linux, AlmaLinux) with the standard GRUB boot menu.
@@ -34,7 +52,7 @@ Linux, Rocky Linux, AlmaLinux) with the standard GRUB boot menu.
 ```bash
 sudo dnf install dnf-automatic
 sudoedit /etc/dnf/automatic.conf
-sudo dnf install ./dnf-automatic-reboot-1.5.0-*.el9.noarch.rpm
+sudo dnf install ./dnf-automatic-reboot-1.6.0-*.el9.noarch.rpm
 sudo systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer
 ```
 
@@ -44,17 +62,24 @@ Enterprise Linux 8. The file comes from a CI run of this repository or from
 [Building from source](#building-from-source).
 
 The first two commands install `dnf-automatic` and open its settings file,
-in which two lines must read:
+in which the `[commands]` section must set:
 
 ```ini
+[commands]
+upgrade_type = default
+download_updates = yes
 apply_updates = yes
 reboot = never
 ```
 
-`apply_updates = yes` makes `dnf-automatic` install updates, not only
-download them; `reboot = never` leaves the restart decision to this package.
-If `dnf-automatic` is already set up, keep your other settings as they are.
-This package reads the file and does not change it.
+`upgrade_type = security` installs security updates only; both work.
+`download_updates` and `apply_updates` make `dnf-automatic` download and
+install updates, not only report them; `reboot = never` leaves the restart
+decision to this package. Put any comment on a line of its own:
+`dnf-automatic` reads `apply_updates = yes # install` as an invalid value and
+installs nothing. If `dnf-automatic` is already set up, keep your other
+settings as they are. This package asks `dnf-automatic` what it reads from
+the file, and does not change it.
 
 The third command installs this package. It first checks that the system
 is one it can restart safely; if not, it stops before installing any files
@@ -68,7 +93,10 @@ Between 03:00 and 03:10 UTC the package:
 
 1. Fetches the current list of updates, so one published today is not missed
    because `dnf` still had yesterday's.
-2. Blocks shutdown and restart, so an update is never cut off halfway.
+2. Tells everyone logged in that updates are being installed, and blocks
+   shutdown and restart for ordinary users and for its own restart. A restart
+   typed by `root` or through `sudo` is not blocked and cuts the update off:
+   wait for the message that the run has ended.
 3. Installs the available updates with `dnf-automatic`.
 4. Checks whether any update needs a restart: a new kernel, or a core
    component such as `glibc` or `systemd`.
@@ -86,9 +114,16 @@ Between 03:00 and 03:10 UTC the package:
 Updates that `dnf` knows about but refuses to install, and repositories that
 install packages without checking their signatures, are reported in the log.
 
-A separate watchdog checks every five minutes. If an update run is still going
-after three hours, the watchdog stops it and alerts you; it does not restart
-while packages may be half-installed.
+An update is never stopped while dnf is still working, so a download over a
+slow link, or an upgrade to the next minor release on a Raspberry Pi, can take
+as long as it needs. A separate watchdog checks every five minutes and stops
+a run only when it has stopped working. If the update reads and writes nothing
+for an hour before it starts installing, the watchdog stops the run and alerts
+you; nothing was installed, and the next run tries again. Once installing has
+started, it waits for three idle hours, then stops the run and alerts you with
+the commands that show what to repair. If the restart check after the update
+hangs for an hour, the watchdog stops it, and the next night's run decides the
+restart. The watchdog itself never restarts the computer.
 
 When something goes wrong, logged-in users get a message on their terminal and
 the details go to `/var/log/dnf-automatic-reboot.log`.
@@ -137,30 +172,44 @@ files. Fix each one and run `sudo dnf install dnf-automatic-reboot` again.
 | `the GRUB default is ..., not the newest installed` | If the newest kernel should run, run the `grubby --set-default` command the message shows, with `sudo`. The installer does not change the default itself, since that changes which kernel the next boot runs. |
 | `upgrading from a version before 1.4.0` | See [Upgrading from an earlier version](#upgrading-from-an-earlier-version). |
 | `dnf-automatic.timer is still enabled` | `sudo systemctl disable --now dnf-automatic.timer dnf-automatic-install.timer` |
-| `/etc/dnf/automatic.conf has 'reboot = ...'` | Set `reboot = never` in `/etc/dnf/automatic.conf`; this package decides when to restart. |
-| `/etc/dnf/automatic.conf has 'apply_updates = ...'` | Set `apply_updates = yes` in `/etc/dnf/automatic.conf`. |
+| `dnf-automatic reads ... from /etc/dnf/automatic.conf` | Set the four lines shown in [Quick start](#quick-start) under `[commands]` in `/etc/dnf/automatic.conf`, each on a line of its own with no comment after the value. The message names the value `dnf-automatic` reads now. |
+| `dnf-automatic cannot load /etc/dnf/automatic.conf` | `dnf-automatic` itself cannot parse the file, for example a line without `=`. Fix the file, then set the four lines shown in [Quick start](#quick-start). |
 
-The nightly run checks the `reboot` and `apply_updates` lines again each
-time it starts. When either one no longer reads as in
-[Quick start](#quick-start), the run stops, logged-in users get a message,
-and the log names the line to fix.
+The nightly run asks `dnf-automatic` again each time it starts. When the
+file no longer reads as in [Quick start](#quick-start), the run stops,
+logged-in users get a message, and the log names what to set. On EL8,
+`dnf-automatic` has no `reboot` setting and never restarts the host, so
+`reboot` is not checked there.
 
 A `WARNING` about `GRUB_SAVEDEFAULT=true` does not stop the install. It means
 that choosing an older kernel from the boot menu once makes it the default;
-after that, restarts for new kernels are held back, and the log says so, until
-`sudo grubby --set-default` points at the newest kernel again.
+after that, the package restarts for no update, and each night's run fails
+naming the command that fixes it, until `sudo grubby --set-default` points at
+the newest kernel again.
 
 ## Changing the settings
 
 Settings are in `/etc/dnf/automatic-reboot.conf`; each one is explained in the
-file. The ones people change most:
+file, with its default and the values it accepts. After editing, check the file:
+
+```bash
+sudo /usr/libexec/dnf-automatic-reboot/check-config.sh
+```
+
+It names every mistake with its line number, or lists the settings that differ
+from the defaults. A mistake stops the updates and restarts: a misspelt or
+unknown setting, one set twice, a value outside its range, or a yes/no setting
+that is not `yes`, `true`, `on`, `1`, `no`, `false`, `off` or `0`. The nightly
+run then fails and the alert names the line, so a typo never leaves the
+computer running on a setting you did not choose.
+
+The settings people change most:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `reboot_delay_sec` | `300` | Seconds between the warning and the restart |
-| `always_reboot` | `no` | `yes` restarts after every update, needed or not |
+| `restart_services_excluded_patterns` | empty | Services you restart yourself, such as `postgresql.service` |
+| `metadata_refresh_timeout_seconds` | `1800` | Raise on a slow link, such as a modem connection |
 | `restart_services` | `yes` | `no` leaves updated background services running the old program |
-| `wall_messages` | `yes` | `no` stops the messages to logged-in users |
 
 To run at another time, override the timer:
 
@@ -200,6 +249,21 @@ correct time at boot, those false alarms do not occur.
 
 ## Upgrading from an earlier version
 
+An upgrade replaces `/etc/dnf/automatic-reboot.conf` if you never edited it.
+If you did, it keeps your copy, puts the new one beside it as
+`/etc/dnf/automatic-reboot.conf.rpmnew`, and prints what to do. When your copy
+names a setting the new version does not read, the nightly run does not install
+updates or restart the computer until the copy is valid; its alert names the
+problem. This also applies when the nightly run installs the upgrade itself.
+Keep a copy, start from the new file, and carry your values over:
+
+```bash
+sudo cp -p /etc/dnf/automatic-reboot.conf /etc/dnf/automatic-reboot.conf.bak
+sudo mv /etc/dnf/automatic-reboot.conf.rpmnew /etc/dnf/automatic-reboot.conf
+sudoedit /etc/dnf/automatic-reboot.conf
+sudo /usr/libexec/dnf-automatic-reboot/check-config.sh
+```
+
 Versions before 1.4.0 cannot be upgraded in place. Remove the old version,
 then install as in [Quick start](#quick-start):
 
@@ -228,8 +292,8 @@ state. A settings file you changed is kept as
 ## More information
 
 - [doc/README](doc/README), installed as
-  `/usr/share/doc/dnf-automatic-reboot/README`: every setting, the log, and
-  how restart decisions are made.
+  `/usr/share/doc/dnf-automatic-reboot/README`: the settings file, the log,
+  and how restart decisions are made.
 - [doc/END-TO-END-TEST.md](doc/END-TO-END-TEST.md): checking on a live host
   that a reboot waits for shutdown inhibitors and can be cancelled.
 - Source and issues: <https://github.com/dag-node/tools-dnf-automatic-reboot>
@@ -247,7 +311,7 @@ Enterprise Linux 8 into the `el8` folder beside it; each build replaces only
 its own folder. Building in the container gives the file the
 right `.el8` or `.el9` tag whatever the build host runs, and keeps the
 test suite off that host. The file carries a local snapshot version,
-`1.5.0-0.local.git<commit>`, which a released `1.5.0-1` replaces as an
+`1.6.0-0.local.git<commit>`, which a released `1.6.0-1` replaces as an
 ordinary upgrade. Copy it to the system it is for and install it as in
 [Quick start](#quick-start).
 

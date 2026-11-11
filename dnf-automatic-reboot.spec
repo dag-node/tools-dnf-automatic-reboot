@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 Name:           dnf-automatic-reboot
-Version:        1.5.0
+Version:        1.6.0
 # Plain "1" for a release; CI passes --define "rpm_release 0.<run>.git<sha>"
 # for a snapshot build.  The leading "0." makes rpm rank the release above
 # every snapshot that preceded it, so a trial build upgrades to it in place.
@@ -40,6 +40,11 @@ Requires:       logrotate
 # (require_clock_sync = yes by default).  Installed is not running: the
 # runtime check stays.
 Requires:       chrony
+# rpm's systemd_inhibit plugin holds a block-mode shutdown inhibitor for every
+# rpm transaction, a `dnf upgrade` started by hand included; the scheduled
+# reboot waits while one is held.  Without it, that reboot can stop such a
+# transaction halfway.
+Requires:       rpm-plugin-systemd-inhibit
 
 # We install systemd unit files
 BuildRequires:  systemd-rpm-macros
@@ -57,15 +62,16 @@ Companion service to dnf-automatic that:
     kernel version comparison against the running kernel, and ELF
     build-id comparison for daemons whose package was reinstalled.
   - Detects genuine update-triggered reboot requirements and schedules
-    a timed reboot, refusing to reboot into a kernel the GRUB default
-    would not select.
+    a timed reboot.  While the GRUB default would not boot the newest
+    kernel, it requests no reboot and fails each run with the repair.
   - Restarts services still mapping pre-update files, which
     needs-restarting -r does not report.
   - Provides an independent watchdog with configurable soft and hard
     timeouts to recover from hung updates without operator intervention.
   - Warns logged-in users via wall(1) at all key events.
 
-All behaviour is controlled by /etc/dnf/automatic-reboot.conf.
+Settings are in /etc/dnf/automatic-reboot.conf.  An error in it stops
+every update run and reboot until the file is fixed.
 
 %prep
 %autosetup
@@ -94,7 +100,9 @@ install -m 0750 scripts/needs-reboot.sh   %{buildroot}%{pkglibexecdir}/needs-reb
 install -m 0750 scripts/notify-failure.sh %{buildroot}%{pkglibexecdir}/notify-failure.sh
 install -m 0750 scripts/cancel-reboot.sh  %{buildroot}%{pkglibexecdir}/cancel-reboot.sh
 install -m 0750 scripts/reboot-if-pending.sh %{buildroot}%{pkglibexecdir}/reboot-if-pending.sh
+install -m 0750 scripts/check-config.sh   %{buildroot}%{pkglibexecdir}/check-config.sh
 install -m 0640 scripts/reboot-request.sh %{buildroot}%{pkglibexecdir}/reboot-request.sh
+install -m 0640 scripts/config.sh         %{buildroot}%{pkglibexecdir}/config.sh
 install -m 0640 scripts/run-state.sh      %{buildroot}%{pkglibexecdir}/run-state.sh
 
 # systemd units
@@ -109,6 +117,10 @@ install -m 0644 units/dnf-automatic-reboot-notify@.service %{buildroot}%{_unitdi
 install -d -m 0755 %{buildroot}%{_sysconfdir}/dnf
 install -m 0640 conf/automatic-reboot.conf \
     %{buildroot}%{_sysconfdir}/dnf/automatic-reboot.conf
+# The same file as shipped, never edited: check-config.sh compares the one in
+# /etc with it.  Not %%doc, which --excludedocs leaves out.
+install -d -m 0755 %{buildroot}%{_datadir}/%{name}
+install -m 0644 conf/automatic-reboot.conf %{buildroot}%{_datadir}/%{name}/automatic-reboot.conf
 
 # tmpfiles.d - owns the mode and label of the log and state paths
 install -d -m 0755 %{buildroot}%{_tmpfilesdir}
@@ -117,6 +129,12 @@ install -m 0644 tmpfiles/%{name}.conf %{buildroot}%{_tmpfilesdir}/%{name}.conf
 # logrotate.d
 install -d -m 0755 %{buildroot}%{_sysconfdir}/logrotate.d
 install -m 0644 logrotate/%{name} %{buildroot}%{_sysconfdir}/logrotate.d/%{name}
+
+# needs-restarting.d - package names the plugin adds to its reboot list.  It
+# reads every line as a name, so the file is installed without its # header.
+install -d -m 0755 %{buildroot}%{_sysconfdir}/dnf/plugins/needs-restarting.d
+sed '/^#/d' conf/needs-restarting.d/automatic-reboot.conf | install -m 0644 /dev/stdin \
+    %{buildroot}%{_sysconfdir}/dnf/plugins/needs-restarting.d/automatic-reboot.conf
 
 # Documentation
 install -d -m 0755 %{buildroot}%{_docdir}/%{name}
@@ -184,7 +202,7 @@ fi
 # The packages every decision depends on.  Requires: covers a normal install;
 # this catches `rpm -i --nodeps`, which would otherwise leave the build-id or
 # GRUB check silently disabled at runtime.
-for required_package in dnf-automatic yum-utils elfutils grubby chrony; do
+for required_package in dnf-automatic yum-utils elfutils grubby chrony rpm-plugin-systemd-inhibit; do
     if ! rpm -q "${required_package}" >/dev/null 2>&1; then
         echo "ERROR: ${required_package} is not installed." >&2
         echo "       Install it first:  dnf install ${required_package}" >&2
@@ -278,16 +296,18 @@ else
     fi
 
     # The default must already be the newest installed kernel of that package,
-    # or every kernel reboot is withheld at runtime.  It is not set here:
-    # setting it changes which kernel the next boot runs, which may be one an
-    # operator left behind on purpose.
-    newest_kernel_version=$(rpm -q --qf '%%{VERSION}-%%{RELEASE}.%%{ARCH}\n' "${running_kernel_package}" 2>/dev/null \
-                            | sort -V | tail -1) || true
-    if [[ -n "${newest_kernel_version}" && "${grub_default_kernel}" == /boot/vmlinuz-* \
-          && "${grub_default_kernel}" != "/boot/vmlinuz-${newest_kernel_version}" ]]; then
+    # or every reboot is withheld at runtime.  The releases are read the way
+    # needs-reboot.sh reads them, from the /lib/modules/<release>/vmlinuz
+    # files the package owns.  The default is not set here: setting it changes
+    # which kernel the next boot runs, which may be one an operator left
+    # behind on purpose.
+    newest_kernel_release=$(rpm -ql "${running_kernel_package}" 2>/dev/null \
+                            | sed -n 's#^/lib/modules/\([^/]*\)/vmlinuz$#\1#p' | sort -V | tail -1) || true
+    if [[ -n "${newest_kernel_release}" && "${grub_default_kernel}" == /boot/vmlinuz-* \
+          && "${grub_default_kernel}" != "/boot/vmlinuz-${newest_kernel_release}" ]]; then
         echo "ERROR: the GRUB default is ${grub_default_kernel}, not the newest installed" >&2
-        echo "       ${running_kernel_package} ${newest_kernel_version}, so kernel reboots would be withheld." >&2
-        echo "       If that kernel should run:  grubby --set-default /boot/vmlinuz-${newest_kernel_version}" >&2
+        echo "       ${running_kernel_package} ${newest_kernel_release}, so every reboot would be withheld." >&2
+        echo "       If that kernel should run:  grubby --set-default /boot/vmlinuz-${newest_kernel_release}" >&2
         FAIL=1
     fi
 fi
@@ -311,37 +331,61 @@ for timer in dnf-automatic.timer dnf-automatic-install.timer; do
     fi
 done
 
-# /etc/dnf/automatic.conf must not trigger reboots itself; this package does that.
+# /etc/dnf/automatic.conf is judged by what dnf-automatic itself reads from
+# it, asked of its own config loader, so a comment after a value, a key
+# outside [commands] or a later [commands] section counts as dnf-automatic
+# counts it.  dnf-automatic exits 0 having installed nothing while
+# download_updates or apply_updates is off, and on EL9 reboots on its own
+# unless reboot = never; EL8's has no reboot option (`unread`).  The query and
+# its shape are copies of those in run.sh.  The file is the operator's: it is
+# read, never written.
 ACONF="${PREFLIGHT_ROOT}/etc/dnf/automatic.conf"
-if [[ -f "${ACONF}" ]]; then
-    reboot_val=$(grep -E '^\s*reboot\s*=' "${ACONF}" 2>/dev/null \
-                 | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
-                 | tr -d '[:space:]') || true
-    if [[ -n "${reboot_val}" && "${reboot_val}" != "never" ]]; then
-        echo "ERROR: /etc/dnf/automatic.conf has 'reboot = ${reboot_val}'." >&2
+readonly PLATFORM_PYTHON="${PREFLIGHT_ROOT}/usr/libexec/platform-python"
+readonly AUTOMATIC_CONFIG_QUERY='import sys
+from dnf.automatic.main import AutomaticConfig
+commands = AutomaticConfig(sys.argv[1]).commands
+print("apply_updates=" + str(commands.apply_updates)
+      + " download_updates=" + str(commands.download_updates)
+      + " upgrade_type=" + str(commands.upgrade_type)
+      + " reboot=" + str(getattr(commands, "reboot", "unread")))'
+readonly AUTOMATIC_CONFIG_SHAPE='^apply_updates=(True|False) download_updates=(True|False) upgrade_type=([a-z]+) reboot=([a-z-]+)$'
+automatic_settings=$("${PLATFORM_PYTHON}" -I -c "${AUTOMATIC_CONFIG_QUERY}" "${ACONF}" 2>/dev/null) \
+    || automatic_settings=""
+automatic_config_refused=0
+if [[ ! "${automatic_settings}" =~ ${AUTOMATIC_CONFIG_SHAPE} ]]; then
+    echo "ERROR: dnf-automatic cannot load /etc/dnf/automatic.conf, so it would fail with it." >&2
+    automatic_config_refused=1
+else
+    apply_updates_value="${BASH_REMATCH[1]}"
+    download_updates_value="${BASH_REMATCH[2]}"
+    upgrade_type_value="${BASH_REMATCH[3]}"
+    automatic_reboot_value="${BASH_REMATCH[4]}"
+    if [[ "${apply_updates_value}" != "True" || "${download_updates_value}" != "True" ]]; then
+        echo "ERROR: dnf-automatic reads download_updates = ${download_updates_value} and apply_updates = ${apply_updates_value}" >&2
+        echo "       from /etc/dnf/automatic.conf, so it would install nothing and report success." >&2
+        automatic_config_refused=1
+    fi
+    if [[ "${upgrade_type_value}" != "default" && "${upgrade_type_value}" != "security" ]]; then
+        echo "ERROR: dnf-automatic reads upgrade_type = ${upgrade_type_value} from /etc/dnf/automatic.conf." >&2
+        echo "       This package knows default and security." >&2
+        automatic_config_refused=1
+    fi
+    if [[ "${automatic_reboot_value}" != "never" && "${automatic_reboot_value}" != "unread" ]]; then
+        echo "ERROR: dnf-automatic reads reboot = ${automatic_reboot_value} from /etc/dnf/automatic.conf." >&2
         echo "       dnf-automatic must not reboot independently of this package." >&2
-        echo "       Set it to 'never' in /etc/dnf/automatic.conf:  reboot = never" >&2
-        FAIL=1
+        automatic_config_refused=1
     fi
 fi
-
-# dnf-automatic must install what it downloads.  apply_updates defaults to
-# false in dnf-automatic, which then exits 0 after downloading, so every run
-# would report success without installing an update.  The file is the
-# operator's: this scriptlet reads it and does not write it.  True values are those libdnf's
-# OptionBool accepts.
-apply_updates_value=$(grep -E '^\s*apply_updates\s*=' "${ACONF}" 2>/dev/null \
-                      | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//' \
-                      | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]') || true
-case "${apply_updates_value}" in
-    yes|true|1|on) ;;
-    *)
-        echo "ERROR: /etc/dnf/automatic.conf has 'apply_updates = ${apply_updates_value:-<unset>}'." >&2
-        echo "       dnf-automatic would download updates without installing them." >&2
-        echo "       Set it in /etc/dnf/automatic.conf:  apply_updates = yes" >&2
-        FAIL=1
-        ;;
-esac
+if [[ "${automatic_config_refused}" -ne 0 ]]; then
+    echo "       Set these lines under [commands] in /etc/dnf/automatic.conf, each on a" >&2
+    echo "       line of its own, with no comment after the value; upgrade_type may be" >&2
+    echo "       default or security:" >&2
+    echo "           upgrade_type = default" >&2
+    echo "           download_updates = yes" >&2
+    echo "           apply_updates = yes" >&2
+    echo "           reboot = never" >&2
+    FAIL=1
+fi
 
 if [[ "${FAIL}" -ne 0 ]]; then
     echo "" >&2
@@ -370,13 +414,6 @@ if [ -x /sbin/restorecon ]; then
                    2>/dev/null || true
 fi
 
-ARC_CONF=/etc/dnf/automatic-reboot.conf
-arc_conf_get() {
-    _val=$(grep -E "^[[:space:]]*$1[[:space:]]*=" "${ARC_CONF}" 2>/dev/null \
-           | tail -1 | sed 's/^[^=]*=[[:space:]]*//' | sed 's/[[:space:]]*#.*//') || true
-    if [ -n "${_val}" ]; then printf '%s' "${_val}"; else printf '%s' "$2"; fi
-}
-
 # ---------------------------------------------------------------------------
 # Real time-sync.target gate.
 #
@@ -392,9 +429,7 @@ arc_conf_get() {
 # this is the one deliberate exception to the macro-only scriptlet rule.  Never
 # disabled on erase: a synchronised clock is not this package's to take away.
 # ---------------------------------------------------------------------------
-ARC_CHRONY_WAIT=$(arc_conf_get enable_chrony_wait yes)
-if [ "${ARC_CHRONY_WAIT}" = "yes" ] \
-   && systemctl cat chrony-wait.service >/dev/null 2>&1 \
+if systemctl cat chrony-wait.service >/dev/null 2>&1 \
    && ! systemctl is-enabled --quiet chrony-wait.service 2>/dev/null; then
     if systemctl --no-reload enable chrony-wait.service >/dev/null 2>&1; then
         echo "dnf-automatic-reboot: enabled chrony-wait.service - time-sync.target now waits for real clock sync"
@@ -408,6 +443,16 @@ echo "Next steps:"
 echo "  1. Review /etc/dnf/automatic-reboot.conf"
 echo "  2. Enable this package:"
 echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-watchdog.timer"
+
+%posttrans
+# The configuration is %%config(noreplace): rpm keeps an edited copy and
+# writes the shipped one beside it as .rpmnew.  An edited copy from an earlier
+# version names keys this one does not read, and every update run and reboot
+# stops until it is valid: name every error and the commands that replace it,
+# or every value that differs from the shipped one.  The file itself is the
+# operator's and is not edited.  %%posttrans, so the copy in /etc is final
+# whichever way rpm resolved it.
+%{pkglibexecdir}/check-config.sh || :
 
 %preun
 %systemd_preun dnf-automatic-reboot.service
@@ -435,11 +480,15 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %attr(0750, root, root) %{pkglibexecdir}/notify-failure.sh
 %attr(0750, root, root) %{pkglibexecdir}/cancel-reboot.sh
 %attr(0750, root, root) %{pkglibexecdir}/reboot-if-pending.sh
+%attr(0750, root, root) %{pkglibexecdir}/check-config.sh
 # Sourced by run.sh, watchdog.sh, cancel-reboot.sh and reboot-if-pending.sh;
 # never executed.
 %attr(0640, root, root) %{pkglibexecdir}/reboot-request.sh
 # Sourced by run.sh and watchdog.sh; never executed.
 %attr(0640, root, root) %{pkglibexecdir}/run-state.sh
+# Sourced by run.sh, watchdog.sh, needs-reboot.sh and check-config.sh; never
+# executed.
+%attr(0640, root, root) %{pkglibexecdir}/config.sh
 
 # systemd units
 %{_unitdir}/dnf-automatic-reboot.service
@@ -451,12 +500,20 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 
 # Config - preserved across upgrades; root:root 640 (no world read for safety)
 %config(noreplace) %attr(0640, root, root) %{_sysconfdir}/dnf/automatic-reboot.conf
+# The config as shipped, for check-config.sh
+%dir %{_datadir}/%{name}
+%{_datadir}/%{name}/automatic-reboot.conf
 
 # tmpfiles.d - creates the log and state paths with the modes declared below
 %{_tmpfilesdir}/%{name}.conf
 
 # logrotate.d - admin-editable, so noreplace
 %config(noreplace) %{_sysconfdir}/logrotate.d/%{name}
+
+# needs-restarting.d - the directory is not there on every host, so it is
+# owned here.
+%dir %{_sysconfdir}/dnf/plugins/needs-restarting.d
+%config(noreplace) %{_sysconfdir}/dnf/plugins/needs-restarting.d/automatic-reboot.conf
 
 # Log file - created by systemd-tmpfiles, %%ghost so RPM owns the path and its
 # SELinux label without owning the content
@@ -470,6 +527,108 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
 %ghost %attr(0640, root, root) %{_localstatedir}/lib/%{name}/kernel-reboot-attempts
 
 %changelog
+* Thu Oct 22 2026 DagNode <packages@dagnode.com> - 1.6.0-1
+- CHANGE: The host is never rebooted while packages are still installing. In 1.5.0,
+  dnf-automatic was stopped after 60 minutes and any remaining process was killed after 180
+  minutes. Long upgrades (e.g. the next minor EL release on a Raspberry Pi, or a slow download)
+  could be aborted with packages half-installed; with force_reboot_on_hard_timeout = yes the
+  watchdog then rebooted the host. The watchdog now only
+  stops a run whose own processes have shown no I/O for one hour before installation begins,
+  three hours while packages install, or one hour during the reboot check. Other dnf commands
+  do not keep a hung run alive. The watchdog itself never reboots. When it stops a run that may
+  have left packages half-installed, the alert names dnf history info last and dnf check; the
+  next run decides whether a reboot is needed.
+- CHANGE: The package now requires rpm-plugin-systemd-inhibit. Without it a package transaction
+  does not hold a shutdown inhibitor, so a scheduled reboot could interrupt a manual
+  transaction. With the plugin the reboot waits until the transaction finishes.
+- CHANGE: /etc/dnf/automatic-reboot.conf is reduced to the nine settings an operator actually
+  needs to change. Defaults are suitable for an unattended host (including a Raspberry Pi
+  without a battery-backed clock) with no editing required. All protective behaviour is always
+  active: metadata refresh before every run, reboot warning to logged-in users (with the cancel
+  command), every failure notice, kernel and GRUB default checks, verification and learning of
+  false reboot flags, chrony-wait.service, and the list of services that are never restarted.
+  A syntax or value error in the file prevents both update runs and reboots; the failure notice
+  names the offending line. An unedited 1.5.0 file is replaced on upgrade. An edited file is
+  left in place (the new version appears beside it as .rpmnew) and blocks every run until it is
+  replaced; check-config.sh prints the exact commands to do so.
+- CHANGE: Settings renamed (and tightened where noted):
+  restart_services_exclude -> restart_services_excluded_patterns (adds to the never-restart
+  list; empty by default);
+  restart_service_timeout_sec -> service_restart_timeout_seconds (range 10-900; 0 for unbounded
+  is no longer allowed);
+  needs_restarting_timeout_sec -> dnf_query_timeout_seconds;
+  metadata_refresh_timeout_sec -> metadata_refresh_timeout_seconds (default raised from 900 to
+  1800 for slow links);
+  clock_sync_wait_sec -> clock_sync_timeout_seconds.
+  Unchanged names: restart_services, warn_unsigned_repositories, warn_unapplied_advisories,
+  require_clock_sync.
+- CHANGE: Settings removed; behaviour is now fixed or always on.
+  Fixed values: reboot_delay_sec = 300 s, reboot_inhibited_wait_sec = 1800 s,
+  reboot_request_lock_wait_sec = 300 s, kill_grace_sec = 300 s,
+  watchdog_kill_confirm_sec = 300 s, kernel_reboot_attempt_limit = 3.
+  Always on: metadata refresh (refresh_metadata), kernel-version verification
+  (verify_kernel_version), GRUB-default verification (verify_grub_default), false-positive
+  learning (learn_false_positives), chrony-wait (enable_chrony_wait), wall messages
+  (wall_messages).
+  Built in: package filtering (filter_packages; running kernel packages checked by version,
+  systemd by build-id, everything else learned).
+  Replaced by the progress-based inactivity windows above: dnf_timeout_min,
+  watchdog_soft_timeout_min, watchdog_hard_timeout_min.
+  Gone: force_reboot_on_hard_timeout (watchdog never reboots) and always_reboot (a run reboots
+  only when an update actually requires it).
+- CHANGE: While the host would not boot its newest kernel, no reboot is requested for any
+  update, and each run's alert names the repair. Real-time and 64k kernels are recognised.
+- CHANGE: An update to the audit package reboots the host. systemd refuses to restart auditd,
+  so the updated version runs only after a reboot.
+  /etc/dnf/plugins/needs-restarting.d/automatic-reboot.conf adds audit to the packages
+  needs-restarting -r checks.
+- CHANGE: The host reboots when dbus, dbus-broker, systemd-logind or auditd still maps a file
+  an update replaced. These are never restarted, so 1.5.0 left them on the pre-update
+  library until a reboot for another reason. The reboot is requested once per update, with
+  the usual warning and cancel command.
+- CHANGE: A run fails, naming the repair, while the host runs an older kernel than the newest
+  installed one of its family. needs-restarting flags a kernel only in the boot that
+  installed it, so such a host ran the older kernel with every run reporting success. No
+  reboot is requested for it, and a reboot another update needs still happens.
+- NEW: /usr/libexec/dnf-automatic-reboot/check-config.sh validates
+  /etc/dnf/automatic-reboot.conf and lists every value that differs from the shipped one; the
+  RPM runs it after every install and upgrade. The file is not edited.
+- FIX: A dnf query or a service restart that ignores SIGTERM at its timeout is killed five
+  minutes later, so it cannot hold the run open.
+- FIX: /etc/dnf/automatic.conf is checked by asking dnf-automatic's own config loader what it
+  reads. A comment after apply_updates = yes made dnf-automatic read an invalid value and only
+  download updates, and a line outside [commands] was taken as set; the install and every run
+  now refuse both. download_updates = no, with which dnf-automatic installs nothing, is refused
+  too. The refusal names the four lines to set under [commands]: upgrade_type = default (or
+  security), download_updates = yes, apply_updates = yes, reboot = never. On EL8, whose
+  dnf-automatic has no reboot setting, reboot is no longer checked.
+- FIX: Every security advisory that still applies after a successful update is reported at
+  error level and to logged-in users, with each package it names, whatever kept it out:
+  excludepkgs=, a repository priority=, a versionlock or a dependency dnf cannot satisfy.
+  1.5.0 left out an advisory whose package excludepkgs= kept out, and only warned about one
+  listed next to any installable update. A listing that fails or runs out of time is
+  reported as an incomplete report.
+- FIX: A repository with enabled=off, or any other spelling dnf reads as false, is no longer
+  reported as an enabled unsigned repository.
+- FIX: dnf-makecache.timer's run no longer reads as a manual dnf command. The warning names
+  each other dnf process by PID and cgroup, never by its arguments, which can carry a
+  password.
+- FIX: auditd.service is never restarted. systemd refuses the request, and the run failed.
+- FIX: The warning for a failed service restart carries the reason systemctl gave.
+- FIX: The message at the start of a run no longer says that a reboot is inhibited. A reboot
+  typed by root is not held back and cuts the installation off; the message says so, and the
+  documentation with it.
+- FIX: The watchdog checks again, right before it stops a stalled run, that the run has still
+  made no progress and has not started its rpm transaction, and leaves it alone otherwise.
+  The alert after a stop reads the transaction state again, so it does not say nothing was
+  installed for a run that had just begun installing.
+- FIX: A service with a space in a process name, such as spamassassin's "spamd child", is no
+  longer restarted at every run. needs-restarting reads such a process as started at boot; a
+  flagged service is left running, and named in the run's summary, when none of its processes
+  maps a replaced file and all of them started after the newest package install.
+- DOCS: dnf-automatic-reboot.timer explains how to override the schedule and how far apart runs
+  must stay, with three-a-day schedules weighted on the US, Asia, the EU or global traffic.
+
 * Thu Oct 01 2026 DagNode <packages@dagnode.com> - 1.5.0-1
 - CHANGE: A pending reboot holds update runs through its own marker,
   /run/dnf-automatic-reboot.reboot-pending, created before the reboot is requested and removed

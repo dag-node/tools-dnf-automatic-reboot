@@ -5,15 +5,21 @@
 # Determines whether a reboot is required after package updates.
 #
 # Wraps needs-restarting(1) and filters known false positives before
-# making the final decision.  Designed to be called from run.sh and
-# watchdog.sh so the logic lives in exactly one place.
+# making the final decision.  Called by run.sh, and by hand.
 #
 # Exit codes:
 #   0  No reboot needed
 #   1  Reboot is needed
-#   2  Tool error, or a genuine reboot requirement that rebooting would not
-#      satisfy.  Treated as "no reboot" to avoid a reboot loop; run.sh
-#      escalates it to a unit failure so the outcome is never silent.
+#   2  Undecidable: an invalid configuration, a tool error, or a kernel that
+#      needs an operator (a newer one the GRUB default would not boot, one of
+#      another kernel family, the reboot attempt limit reached, an attempt
+#      that could not be recorded).  A kernel case stops every reboot, also
+#      one another flagged package needs.  No reboot follows; run.sh fails
+#      its unit, so OnFailure= reports it.
+#   3  No flagged package needs a reboot, but the host does not run the newest
+#      installed kernel of its family, which needs-restarting does not flag
+#      once the host has booted past its installation.  run.sh requests no
+#      reboot for it and fails its unit, so OnFailure= reports it.
 #
 # Parsing contract: needs-restarting output is read with an allowlist - only
 # lines of the exact form "  * <name>" are taken as package names, and the
@@ -24,7 +30,10 @@
 #
 # Verification contract: a package is dropped only on positive evidence that
 # it is spurious.  Every "cannot tell" outcome keeps the package, so an
-# unverifiable state costs a reboot rather than skipping a needed one.
+# unverifiable state costs a reboot rather than skipping a needed one.  A
+# kernel is the exception: when its target cannot be established, or a
+# reboot would come back on the running kernel, exit 2 withholds every
+# reboot, since that reboot would repeat on every run.
 #
 # Sourcing this file defines its functions without running the decision, so
 # tests/run-tests.sh can exercise them directly.
@@ -51,6 +60,17 @@ readonly STATE_LOCK_FILE="${STATE_DIRECTORY}/.state.lock"
 readonly PROC_DIRECTORY="${TEST_ROOT}/proc"
 readonly BOOT_ID_FILE="${PROC_DIRECTORY}/sys/kernel/random/boot_id"
 readonly DNF_BIN="${TEST_ROOT}/usr/bin/dnf"
+# What an operator runs to see every configuration error.
+readonly CHECK_CONFIG_COMMAND=/usr/libexec/dnf-automatic-reboot/check-config.sh
+# The packages verified by ELF build-id.  systemd's code runs only in binaries
+# it owns, so comparing every running image with the one on disk settles its
+# flag.  A library such as glibc runs inside other packages' processes, which
+# that comparison does not cover; it is learned instead.
+readonly BUILD_ID_VERIFIED_PACKAGES=(systemd)
+
+# load_config and config_value.
+# shellcheck source=/dev/null
+source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -69,48 +89,10 @@ log_error() {
 }
 
 # ---------------------------------------------------------------------------
-# Config helpers
-# ---------------------------------------------------------------------------
-# get_config_value KEY DEFAULT_VALUE
-# Reads a key from any section; returns DEFAULT_VALUE when the key is absent.
-get_config_value() {
-    local config_key="$1" default_value="$2" config_value
-    config_value=$(grep -E "^\s*${config_key}\s*=" "${CONFIG_FILE}" 2>/dev/null \
-                   | tail -1 | sed 's/^[^=]*=\s*//' | sed 's/\s*#.*//') || true
-    printf '%s' "${config_value:-${default_value}}"
-}
-
-# get_config_integer KEY DEFAULT_VALUE
-# As get_config_value, but falls back to DEFAULT_VALUE when the configured value is
-# not a plain non-negative integer.  Keeps a typo in the config from aborting
-# the run inside an arithmetic comparison.
-# get_config_integer KEY DEFAULT_VALUE [MINIMUM [MAXIMUM]] -> the value as a
-# decimal integer.  Leading zeros are dropped: bash arithmetic reads 08 as an
-# invalid octal number.  A value that is not 1 to 9 digits, or lies outside
-# MINIMUM..MAXIMUM (default 0..999999999), is reported and DEFAULT_VALUE used.
-get_config_integer() {
-    local config_key="$1" default_value="$2" minimum_value="${3:-0}" maximum_value="${4:-999999999}"
-    local config_value
-    config_value=$(get_config_value "${config_key}" "${default_value}")
-    config_value="${config_value//[[:space:]]/}"
-    if [[ ! "${config_value}" =~ ^[0-9]{1,9}$ ]]; then
-        log_warning "${config_key}='${config_value}' is not a non-negative integer - using default ${default_value}" >&2
-        printf '%s' "${default_value}"
-        return 0
-    fi
-    config_value=$(( 10#${config_value} ))
-    if (( config_value < minimum_value || config_value > maximum_value )); then
-        log_warning "${config_key}=${config_value} is outside ${minimum_value}..${maximum_value} - using default ${default_value}" >&2
-        config_value="${default_value}"
-    fi
-    printf '%s' "${config_value}"
-}
-
-# ---------------------------------------------------------------------------
 # Persistent state
 #
 # Both state files are tab-delimited with the package name in field 1 and are
-# rewritten whole under an flock, so a watchdog-triggered run racing the main
+# rewritten whole under an flock, so a check run by hand racing the main
 # service cannot interleave a partial write.  Rows are matched by exact awk
 # field comparison, never by grep: "libglibc" must not match a rule about
 # "glibc".  Every failure path is silent and non-fatal - a lost update means
@@ -193,19 +175,18 @@ write_kernel_reboot_attempts() {
 # on a host with a correct clock it no longer flags the kernel once the new one
 # runs, so the false-positive branch that also clears the row is not reached.
 clear_kernel_reboot_attempts_for_running_kernel() {
-    local running_kernel_version machine_architecture
+    local running_kernel_version
     [[ -s "${KERNEL_REBOOT_ATTEMPT_FILE}" ]] || return 0
     running_kernel_version=$(uname -r)
-    machine_architecture=$(uname -m)
-    awk -F'\t' -v running="${running_kernel_version}" -v arch="${machine_architecture}" \
-        '$2 == running || $2 == running "." arch { found = 1 } END { exit !found }' \
+    awk -F'\t' -v running="${running_kernel_version}" \
+        '$2 == running { found = 1 } END { exit !found }' \
         "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || return 0
     (
         flock -w 10 9 || exit 0
         local temporary_file
         temporary_file=$(mktemp "${KERNEL_REBOOT_ATTEMPT_FILE}.XXXXXX") || exit 0
-        awk -F'\t' -v running="${running_kernel_version}" -v arch="${machine_architecture}" \
-            '!($2 == running || $2 == running "." arch)' "${KERNEL_REBOOT_ATTEMPT_FILE}" \
+        awk -F'\t' -v running="${running_kernel_version}" \
+            '$2 != running' "${KERNEL_REBOOT_ATTEMPT_FILE}" \
             > "${temporary_file}" 2>/dev/null || { rm -f "${temporary_file}"; exit 0; }
         chmod 0640 "${temporary_file}" 2>/dev/null || true
         mv -f "${temporary_file}" "${KERNEL_REBOOT_ATTEMPT_FILE}" 2>/dev/null || rm -f "${temporary_file}"
@@ -214,31 +195,21 @@ clear_kernel_reboot_attempts_for_running_kernel() {
 }
 
 # ---------------------------------------------------------------------------
-# Read config
+# Read config.  An invalid file still yields well-formed values, so sourcing
+# this script works; main decides nothing while it is invalid.
 # ---------------------------------------------------------------------------
-FILTER_PACKAGE_LIST=$(get_config_value filter_packages "kernel-uek,kernel-uek-core,kernel,kernel-core,systemd")
-VERIFY_KERNEL_VERSION=$(get_config_value verify_kernel_version yes)
-LEARN_FALSE_POSITIVES=$(get_config_value learn_false_positives yes)
-VERIFY_GRUB_DEFAULT=$(get_config_value verify_grub_default yes)
-KERNEL_REBOOT_ATTEMPT_LIMIT=$(get_config_integer kernel_reboot_attempt_limit 3)
-NEEDS_RESTARTING_TIMEOUT_SEC=$(get_config_integer needs_restarting_timeout_sec 120)
+load_config "${CONFIG_FILE}" || true
+DNF_QUERY_TIMEOUT_SECONDS=$(config_value dnf_query_timeout_seconds)
+# Consecutive reboots for the same newest kernel that did not make it the
+# running one, after which every reboot is withheld until an operator repairs
+# the boot.
+readonly KERNEL_REBOOT_ATTEMPT_LIMIT=3
 
-# Save and restore IFS around the comma-split so the global \n\t setting
-# is not silently clobbered for the rest of the script.
-PREVIOUS_IFS="${IFS}"
-IFS=',' read -ra FILTER_PACKAGE_FIELDS <<< "${FILTER_PACKAGE_LIST}"
-IFS="${PREVIOUS_IFS}"
-FILTER_PACKAGE_NAMES=()
-for filter_package_field in "${FILTER_PACKAGE_FIELDS[@]:-}"; do
-    filter_package_field="${filter_package_field//[[:space:]]/}"
-    [[ -n "${filter_package_field}" ]] && FILTER_PACKAGE_NAMES+=("${filter_package_field}")
-done
-
-# is_filtered_package PACKAGE_NAME
-is_filtered_package() {
-    local package_name="$1" filter_package_name
-    for filter_package_name in "${FILTER_PACKAGE_NAMES[@]:-}"; do
-        [[ "${filter_package_name}" == "${package_name}" ]] && return 0
+# is_build_id_verified_package PACKAGE_NAME
+is_build_id_verified_package() {
+    local package_name="$1" verified_package_name
+    for verified_package_name in "${BUILD_ID_VERIFIED_PACKAGES[@]}"; do
+        [[ "${verified_package_name}" == "${package_name}" ]] && return 0
     done
     return 1
 }
@@ -268,7 +239,7 @@ parse_flagged_package_names() {
 declare -gA PROCESS_BINARY_TO_PIDS=()
 declare -gA PROCESS_BINARY_TO_PACKAGE=()
 # Packages classify_flagged_packages handed to restart-state learning: those
-# outside filter_packages, which no verifier covers.  Learning never sees a
+# neither a kernel nor build-id verified, which no verifier covers.  Learning never sees a
 # kernel or a package a build-id check examined, so history cannot overrule a
 # current result.
 declare -gA LEARNABLE_PACKAGE_NAMES=()
@@ -294,7 +265,7 @@ build_process_binary_map() {
 }
 
 # ---------------------------------------------------------------------------
-# Build-id cross-verification for non-kernel filtered packages.
+# Build-id cross-verification for BUILD_ID_VERIFIED_PACKAGES.
 #
 # Every running process whose binary the package owns is checked, not just the
 # first: PID 1 re-execs itself during a systemd upgrade and would always match,
@@ -374,53 +345,133 @@ verify_build_id() {
 }
 
 # ---------------------------------------------------------------------------
-# Kernel cross-verification (aarch64 and x86_64).
+# Kernel cross-verification, for the running kernel's family.
 #
-# uname -r and rpm's VERSION-RELEASE.ARCH are the same string on both UEK and
-# stock EL kernels, so this is an equality test, not a substring search.  The
-# arch-stripped form is accepted as well, for kernels whose release string
-# carries no arch suffix.
+# The family is the package that owns /lib/modules/$(uname -r)/vmlinuz
+# (kernel-uek-core, kernel-core) and its meta package, the same name without
+# -core (kernel-uek, kernel), which owns no files.  Its installed releases are
+# read from the vmlinuz files it owns: /lib/modules/<release>/vmlinuz names
+# each one exactly as uname -r prints it for that kernel, so the comparison is
+# an equality test whatever the release string carries.
 # ---------------------------------------------------------------------------
 
-# newest_installed_kernel_version PACKAGE_NAME
-# Prints the highest installed VERSION-RELEASE.ARCH, empty when not installed.
-newest_installed_kernel_version() {
-    rpm -q --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' "$1" 2>/dev/null | sort -V | tail -1 || true
+# running_kernel_package -> the NAME of the package that owns the running
+# kernel's vmlinuz, empty when rpm names none.
+running_kernel_package() {
+    rpm -qf "/lib/modules/$(uname -r)/vmlinuz" --qf '%{NAME}\n' 2>/dev/null | head -n 1 || true
 }
 
-# running_kernel_is_newest PACKAGE_NAME
-# Returns: 0 = the running kernel is the newest installed one (false positive)
-#          1 = a newer kernel is installed, or the state cannot be established
-running_kernel_is_newest() {
-    local package_name="$1" running_kernel_version machine_architecture
-    local newest_kernel_version newest_kernel_version_without_arch
-    running_kernel_version=$(uname -r)
-    machine_architecture=$(uname -m)
-    newest_kernel_version=$(newest_installed_kernel_version "${package_name}")
-    if [[ -z "${newest_kernel_version}" ]]; then
-        # Flagged but not installed, or rpm failed: no evidence of spuriousness.
-        log_warning "${package_name}: no installed version found, treating as genuine"
-        return 1
-    fi
-    newest_kernel_version_without_arch="${newest_kernel_version%".${machine_architecture}"}"
-    [[ "${running_kernel_version}" == "${newest_kernel_version}" \
-       || "${running_kernel_version}" == "${newest_kernel_version_without_arch}" ]]
+# newest_installed_kernel_release PACKAGE_NAME -> the highest release among the
+# /lib/modules/<release>/vmlinuz files PACKAGE_NAME owns, empty when none.
+newest_installed_kernel_release() {
+    rpm -ql "$1" 2>/dev/null | sed -n 's#^/lib/modules/\([^/]*\)/vmlinuz$#\1#p' | sort -V | tail -n 1 || true
 }
 
-# grub_default_is_newest_kernel PACKAGE_NAME
-# Returns: 0 = the GRUB default already points at the newest installed kernel
-#          1 = it does not - a reboot would come back on the same kernel
+# grub_default_is_kernel_release RELEASE
+# Returns: 0 = the GRUB default is /boot/vmlinuz-RELEASE
+#          1 = it is another kernel - a reboot would not boot RELEASE
 #          2 = cannot determine
-grub_default_is_newest_kernel() {
-    local package_name="$1" newest_kernel_version grub_default_kernel_path
+grub_default_is_kernel_release() {
+    local kernel_release="$1" grub_default_kernel_path
     command -v grubby >/dev/null 2>&1 || return 2
-    newest_kernel_version=$(newest_installed_kernel_version "${package_name}")
-    [[ -n "${newest_kernel_version}" ]] || return 2
     grub_default_kernel_path=$(grubby --default-kernel 2>/dev/null) || return 2
     # grubby prints "/boot" and exits 0 when it cannot read grubenv.  Anything
     # that is not a kernel image path is no reading at all, not a stale default.
     [[ "${grub_default_kernel_path}" == /boot/vmlinuz-* ]] || return 2
-    [[ "${grub_default_kernel_path}" == "/boot/vmlinuz-${newest_kernel_version}" ]]
+    [[ "${grub_default_kernel_path}" == "/boot/vmlinuz-${kernel_release}" ]]
+}
+
+# classify_running_kernel_family KERNEL_PACKAGE CURRENT_BOOT_ID FLAGGED_NAME...
+# One decision for the running kernel's family, whose flagged packages are
+# FLAGGED_NAME...: none is a trigger when the running kernel is the newest
+# installed one; all are when a newer one is installed and a reboot boots it.
+# Sets REBOOT_WITHHELD when a reboot would not boot it, the newest release
+# cannot be read, or KERNEL_REBOOT_ATTEMPT_LIMIT is reached, and
+# REBOOT_VETOED when the attempt cannot be recorded.  Either stops every
+# reboot, so a host never reboots in a loop onto the kernel it already runs.
+classify_running_kernel_family() {
+    local kernel_package="$1" current_boot_id="$2"
+    local running_kernel_release newest_kernel_release grub_default_check_result
+    local kernel_reboot_attempts attempt_boot_id
+    shift 2
+    running_kernel_release=$(uname -r)
+    newest_kernel_release=$(newest_installed_kernel_release "${kernel_package}")
+    if [[ -z "${newest_kernel_release}" ]]; then
+        log_error "${kernel_package}: rpm lists no /lib/modules/<release>/vmlinuz - cannot tell whether a newer kernel is installed; no reboot is requested"
+        REBOOT_WITHHELD=1
+        return 0
+    fi
+    if [[ "${running_kernel_release}" == "${newest_kernel_release}" ]]; then
+        log "${*} false positive: running kernel is the newest installed (${running_kernel_release})"
+        write_kernel_reboot_attempts "${kernel_package}" "-" 0 \
+            || log_warning "${kernel_package}: could not clear ${KERNEL_REBOOT_ATTEMPT_FILE}"
+        return 0
+    fi
+    log "${*} genuine: running=${running_kernel_release} installed=${newest_kernel_release}"
+
+    grub_default_check_result=0
+    grub_default_is_kernel_release "${newest_kernel_release}" || grub_default_check_result=$?
+    if [[ "${grub_default_check_result}" -eq 1 ]]; then
+        log_error "${kernel_package}: the GRUB default is $(grubby --default-kernel 2>/dev/null), not the newest installed kernel ${newest_kernel_release} - a reboot would come back on the same kernel, so no reboot is requested until it is repaired: grubby --set-default /boot/vmlinuz-${newest_kernel_release}; then check that kernel updates advance it: grep GRUB_UPDATE_DEFAULT_KERNEL /etc/default/grub; grep DEFAULTKERNEL /etc/sysconfig/kernel"
+        REBOOT_WITHHELD=1
+        return 0
+    elif [[ "${grub_default_check_result}" -eq 2 ]]; then
+        log_warning "${kernel_package}: could not read the GRUB default; proceeding, the limit of ${KERNEL_REBOOT_ATTEMPT_LIMIT} reboot attempts still applies"
+    fi
+
+    # One attempt per boot: every check in a boot that still runs the old
+    # kernel - by hand, from the watchdog, or a repeated run - belongs to the
+    # same attempt, so only reboots use the budget.
+    kernel_reboot_attempts=$(read_kernel_reboot_attempts "${kernel_package}" "${newest_kernel_release}")
+    attempt_boot_id=$(read_kernel_reboot_attempt_boot_id "${kernel_package}" "${newest_kernel_release}")
+    if [[ -n "${current_boot_id}" && "${attempt_boot_id}" == "${current_boot_id}" ]]; then
+        log "${kernel_package}: attempt ${kernel_reboot_attempts} of ${KERNEL_REBOOT_ATTEMPT_LIMIT} for ${newest_kernel_release} is already counted in this boot"
+    else
+        if [[ "${kernel_reboot_attempts}" -ge "${KERNEL_REBOOT_ATTEMPT_LIMIT}" ]]; then
+            log_error "${kernel_package}: ${kernel_reboot_attempts} consecutive reboots for ${newest_kernel_release} did not make it the running kernel - no reboot is requested until an operator repairs the boot (grubby --info=ALL; journalctl -k -b -1), then resets the count: rm -f ${KERNEL_REBOOT_ATTEMPT_FILE#"${TEST_ROOT}"}"
+            REBOOT_WITHHELD=1
+            return 0
+        fi
+        if [[ -z "${current_boot_id}" ]]; then
+            log_warning "could not read boot_id - counting this check as a reboot attempt"
+        fi
+        # The limit only holds while each attempt is recorded; an attempt
+        # that cannot be recorded is not made.
+        if ! write_kernel_reboot_attempts "${kernel_package}" \
+                "${newest_kernel_release}" $(( kernel_reboot_attempts + 1 )) "${current_boot_id}"; then
+            log_error "${kernel_package}: cannot record reboot attempt $(( kernel_reboot_attempts + 1 )) in ${KERNEL_REBOOT_ATTEMPT_FILE} - withholding every reboot, the limit of ${KERNEL_REBOOT_ATTEMPT_LIMIT} reboot attempts could not be enforced"
+            REBOOT_VETOED=1
+            return 0
+        fi
+    fi
+    REBOOT_TRIGGER_PACKAGES+=("$@")
+}
+
+# running_kernel_is_behind_newest
+# Returns 0, after logging the repair, when the running kernel is not the
+# newest installed release of its family; 1 when it is, or when either cannot
+# be read.  needs-restarting flags a kernel only while it was installed in the
+# current boot, so a host that booted an older kernel than the newest
+# installed one is not flagged, and nothing else says so.  This check requests
+# no reboot and withholds none.
+running_kernel_is_behind_newest() {
+    local kernel_package running_kernel_release newest_kernel_release
+    local grub_default_check_result=0 repair
+    kernel_package=$(running_kernel_package)
+    [[ -n "${kernel_package}" ]] || return 1
+    running_kernel_release=$(uname -r)
+    newest_kernel_release=$(newest_installed_kernel_release "${kernel_package}")
+    [[ -n "${newest_kernel_release}" ]] || return 1
+    [[ "${running_kernel_release}" != "${newest_kernel_release}" ]] || return 1
+
+    grub_default_is_kernel_release "${newest_kernel_release}" || grub_default_check_result=$?
+    case "${grub_default_check_result}" in
+        0) repair="the GRUB default is on it, so a reboot runs it: systemctl reboot" ;;
+        1) repair="the GRUB default is $(grubby --default-kernel 2>/dev/null), so a reboot would not run it: grubby --set-default /boot/vmlinuz-${newest_kernel_release}; grep GRUB_UPDATE_DEFAULT_KERNEL /etc/default/grub; grep DEFAULTKERNEL /etc/sysconfig/kernel; systemctl reboot" ;;
+        *) repair="the GRUB default could not be read: grubby --default-kernel; grubby --set-default /boot/vmlinuz-${newest_kernel_release}; systemctl reboot" ;;
+    esac
+    log_error "${kernel_package}: the host runs ${running_kernel_release}, not the newest installed kernel ${newest_kernel_release}, which was installed before this boot and is not flagged - no reboot is requested for it; ${repair}. To keep the running kernel, remove the newer one"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -456,13 +507,13 @@ run_needs_restarting() {
         return 2
     fi
 
-    NEEDS_RESTARTING_OUTPUT=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
+    NEEDS_RESTARTING_OUTPUT=$(timeout --kill-after="${KILL_GRACE_SECONDS}s" "${DNF_QUERY_TIMEOUT_SECONDS}s" \
         "${DNF_BIN}" -q -C needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?
 
     if ! needs_restarting_gave_result "${exit_code}"; then
         log_warning "cache-only needs-restarting exited ${exit_code} without a result - retrying with a metadata refresh"
         exit_code=0
-        NEEDS_RESTARTING_OUTPUT=$(timeout "${NEEDS_RESTARTING_TIMEOUT_SEC}s" \
+        NEEDS_RESTARTING_OUTPUT=$(timeout --kill-after="${KILL_GRACE_SECONDS}s" "${DNF_QUERY_TIMEOUT_SECONDS}s" \
             "${DNF_BIN}" -q needs-restarting -r 2>"${stderr_capture_file}") || exit_code=$?
     fi
 
@@ -483,14 +534,14 @@ run_needs_restarting() {
 # ---------------------------------------------------------------------------
 # Classify every flagged package into REBOOT_TRIGGER_PACKAGES.
 # Sets REBOOT_WITHHELD when a genuine requirement exists that rebooting would
-# not satisfy, and REBOOT_VETOED when a kernel reboot attempt could not be
-# recorded: kernel_reboot_attempt_limit cannot be enforced then, so no reboot
-# may be requested at all, whatever else triggers one.
+# not satisfy, or that no check here can decide, and REBOOT_VETOED when a
+# kernel reboot attempt could not be recorded: KERNEL_REBOOT_ATTEMPT_LIMIT
+# cannot be enforced then.  Either stops every reboot, whatever else
+# triggers one.
 # ---------------------------------------------------------------------------
 classify_flagged_packages() {
-    local flagged_package_name target_kernel_version
-    local grub_default_check_result build_id_check_result kernel_reboot_attempts
-    local attempt_boot_id current_boot_id
+    local flagged_package_name build_id_check_result current_boot_id
+    local kernel_package="" kernel_package_read=0 kernel_family_names=()
     local build_id_verifier_available=1
 
     current_boot_id=$(cat "${BOOT_ID_FILE}" 2>/dev/null) || current_boot_id=""
@@ -510,71 +561,27 @@ classify_flagged_packages() {
 
     for flagged_package_name in "${FLAGGED_PACKAGE_NAMES[@]}"; do
 
-        # -- kernel packages: version-string check is the sole authority ----
+        # -- kernel packages: the running family's version check decides ----
         if [[ "${flagged_package_name}" == kernel* ]]; then
-            if [[ "${VERIFY_KERNEL_VERSION}" != "yes" ]] || ! is_filtered_package "${flagged_package_name}"; then
-                REBOOT_TRIGGER_PACKAGES+=("${flagged_package_name}")
-                continue
+            if [[ "${kernel_package_read}" -eq 0 ]]; then
+                kernel_package=$(running_kernel_package)
+                kernel_package_read=1
             fi
-
-            if running_kernel_is_newest "${flagged_package_name}"; then
-                log "${flagged_package_name} false positive: running kernel is the newest installed ($(uname -r))"
-                write_kernel_reboot_attempts "${flagged_package_name}" "-" 0 \
-                    || log_warning "${flagged_package_name}: could not clear ${KERNEL_REBOOT_ATTEMPT_FILE}"
-                continue
+            if [[ -z "${kernel_package}" ]]; then
+                log_error "${flagged_package_name}: no package owns /lib/modules/$(uname -r)/vmlinuz - cannot tell which kernel runs; no reboot is requested"
+                REBOOT_WITHHELD=1
+            elif [[ "${flagged_package_name}" == "${kernel_package}" \
+                    || "${flagged_package_name}" == "${kernel_package%-core}" ]]; then
+                kernel_family_names+=("${flagged_package_name}")
+            else
+                log_error "${flagged_package_name}: not the running kernel's package (${kernel_package}) - only the running kernel's family is checked; no reboot is requested until an operator decides (rpm -q ${flagged_package_name}; grubby --default-kernel)"
+                REBOOT_WITHHELD=1
             fi
-
-            target_kernel_version=$(newest_installed_kernel_version "${flagged_package_name}")
-            log "${flagged_package_name} genuine: running=$(uname -r) installed=${target_kernel_version}"
-
-            if [[ "${VERIFY_GRUB_DEFAULT}" == "yes" ]]; then
-                grub_default_check_result=0
-                grub_default_is_newest_kernel "${flagged_package_name}" || grub_default_check_result=$?
-                if [[ "${grub_default_check_result}" -eq 1 ]]; then
-                    log_error "${flagged_package_name}: GRUB default is $(grubby --default-kernel 2>/dev/null) but the newest installed kernel is ${target_kernel_version} - a reboot would return to the same kernel; withholding reboot, repair the BLS default"
-                    REBOOT_WITHHELD=1
-                    continue
-                elif [[ "${grub_default_check_result}" -eq 2 ]]; then
-                    log_warning "${flagged_package_name}: could not read the GRUB default; proceeding with the reboot decision"
-                fi
-            fi
-
-            # One attempt per boot: every check in a boot that still runs the
-            # old kernel - by hand, from the watchdog, or a repeated run -
-            # belongs to the same attempt, so only reboots use the budget.
-            if [[ "${KERNEL_REBOOT_ATTEMPT_LIMIT}" -gt 0 ]]; then
-                kernel_reboot_attempts=$(read_kernel_reboot_attempts \
-                    "${flagged_package_name}" "${target_kernel_version}")
-                attempt_boot_id=$(read_kernel_reboot_attempt_boot_id \
-                    "${flagged_package_name}" "${target_kernel_version}")
-                if [[ -n "${current_boot_id}" && "${attempt_boot_id}" == "${current_boot_id}" ]]; then
-                    log "${flagged_package_name}: attempt ${kernel_reboot_attempts} of ${KERNEL_REBOOT_ATTEMPT_LIMIT} for ${target_kernel_version} is already counted in this boot"
-                else
-                    if [[ "${kernel_reboot_attempts}" -ge "${KERNEL_REBOOT_ATTEMPT_LIMIT}" ]]; then
-                        log_error "${flagged_package_name}: ${kernel_reboot_attempts} consecutive reboots for ${target_kernel_version} did not make it the running kernel - giving up, manual intervention required"
-                        REBOOT_WITHHELD=1
-                        continue
-                    fi
-                    if [[ -z "${current_boot_id}" ]]; then
-                        log_warning "could not read boot_id - counting this check as a reboot attempt"
-                    fi
-                    # The limit only holds while each attempt is recorded; an
-                    # attempt that cannot be recorded is not made.
-                    if ! write_kernel_reboot_attempts "${flagged_package_name}" \
-                            "${target_kernel_version}" $(( kernel_reboot_attempts + 1 )) "${current_boot_id}"; then
-                        log_error "${flagged_package_name}: cannot record reboot attempt $(( kernel_reboot_attempts + 1 )) in ${KERNEL_REBOOT_ATTEMPT_FILE} - withholding every reboot, kernel_reboot_attempt_limit could not be enforced"
-                        REBOOT_VETOED=1
-                        continue
-                    fi
-                fi
-            fi
-
-            REBOOT_TRIGGER_PACKAGES+=("${flagged_package_name}")
             continue
         fi
 
-        # -- non-kernel packages in filter_packages: build-id check ---------
-        if is_filtered_package "${flagged_package_name}"; then
+        # -- build-id verified packages --------------------------------------
+        if is_build_id_verified_package "${flagged_package_name}"; then
             if [[ "${build_id_verifier_available}" -eq 0 ]]; then
                 REBOOT_TRIGGER_PACKAGES+=("${flagged_package_name}")
                 continue
@@ -591,6 +598,10 @@ classify_flagged_packages() {
         REBOOT_TRIGGER_PACKAGES+=("${flagged_package_name}")
         LEARNABLE_PACKAGE_NAMES["${flagged_package_name}"]=1
     done
+
+    if [[ "${#kernel_family_names[@]}" -gt 0 ]]; then
+        classify_running_kernel_family "${kernel_package}" "${current_boot_id}" "${kernel_family_names[@]}"
+    fi
     return 0
 }
 
@@ -614,7 +625,6 @@ apply_restart_state_learning() {
     local recorded_package_evr recorded_boot_id recorded_learned_state
     local learned_trigger_packages=()
 
-    [[ "${LEARN_FALSE_POSITIVES}" == "yes" ]] || return 0
     [[ "${#REBOOT_TRIGGER_PACKAGES[@]}" -gt 0 ]] || return 0
 
     current_boot_id=$(cat "${BOOT_ID_FILE}" 2>/dev/null) || true
@@ -678,7 +688,15 @@ apply_restart_state_learning() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
-    local needs_restarting_exit_code=0
+    local needs_restarting_exit_code=0 config_error trigger_package_name
+
+    if [[ "${#CONFIG_ERRORS[@]}" -gt 0 ]]; then
+        for config_error in "${CONFIG_ERRORS[@]}"; do
+            log_error "configuration: ${config_error}"
+        done
+        log_error "cannot decide while ${CONFIG_FILE#"${TEST_ROOT}"} is invalid - not rebooting; check it with: ${CHECK_CONFIG_COMMAND}"
+        exit 2
+    fi
 
     clear_kernel_reboot_attempts_for_running_kernel
 
@@ -687,6 +705,9 @@ main() {
 
     if [[ "${needs_restarting_exit_code}" -eq 0 ]]; then
         log "needs-restarting: no reboot needed"
+        if running_kernel_is_behind_newest; then
+            exit 3
+        fi
         exit 0
     fi
 
@@ -712,16 +733,28 @@ main() {
         exit 2
     fi
 
+    # A kernel the host would not boot, or has failed to boot too often, stops
+    # every reboot until an operator repairs it.
+    if [[ "${REBOOT_WITHHELD}" -eq 1 ]]; then
+        log_error "Reboot withheld for every package: a kernel needs an operator - see errors above"
+        exit 2
+    fi
+
     if [[ "${#REBOOT_TRIGGER_PACKAGES[@]}" -eq 0 ]]; then
-        if [[ "${REBOOT_WITHHELD}" -eq 1 ]]; then
-            log_error "Reboot withheld: a genuine kernel update is pending but rebooting would not boot it - see errors above"
-            exit 2
-        fi
         log "All triggers filtered as false positives - no reboot needed"
+        if running_kernel_is_behind_newest; then
+            exit 3
+        fi
         exit 0
     fi
 
     log "Reboot needed: $(printf '%s,' "${REBOOT_TRIGGER_PACKAGES[@]}" | sed 's/,$//')"
+    # The reboot another package needs goes ahead; a kernel it would not
+    # reach is named here and fails the first run after it.
+    for trigger_package_name in "${REBOOT_TRIGGER_PACKAGES[@]}"; do
+        [[ "${trigger_package_name}" != kernel* ]] || exit 1
+    done
+    running_kernel_is_behind_newest || true
     exit 1
 }
 

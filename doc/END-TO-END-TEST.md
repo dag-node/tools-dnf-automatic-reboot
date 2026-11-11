@@ -5,9 +5,12 @@ package respects shutdown inhibitors, can be cancelled while it waits, and goes
 ahead once the inhibitor is released. Containers and the test suite cannot
 show this: it needs real systemd, logind and SELinux.
 
-The test reboots the host once, at the end. It installs any updates that are
-available, as a nightly run would. Everything else it changes is undone by the
-steps below.
+The test reboots the host once, at the end. It reinstalls glibc at the version
+already installed, so that a reboot is genuinely due, and installs any updates
+that are available, as a nightly run would. It does not change the package's
+settings. Each run waits the fixed 5 minutes before its reboot, and section 4
+waits out the 30 minutes a blocked reboot is retried, so the test takes about
+an hour.
 
 ## Requirements
 
@@ -15,6 +18,8 @@ steps below.
 - No reboot pending: `ls /run/dnf-automatic-reboot.*` lists only `.lock` files.
 - A window in which the host may reboot, away from the nightly run at 03:00 UTC.
 - No `dnf` transaction of your own while the test runs.
+- The installed glibc version available from an enabled repository, for
+  `dnf reinstall`.
 - Three terminals on the host, logged in as a user other than root who becomes
   root with `sudo`. Section 5 then also shows that a logged-in user does not
   hold the reboot.
@@ -35,17 +40,15 @@ waitsync reports the clock synchronised`, without which no update run starts.
 
 ## 2. Prepare
 
-Terminal 1 adds test settings to the end of the package's config. The last
-occurrence of a key wins, so this also works on a config that predates a key:
+Terminal 1 makes glibc need a reboot, and removes what the package learned
+about glibc, so that a glibc flag it had confirmed as false on a host without
+a battery-backed clock is acted on again:
 
 ```bash
-printf '\n# exercise-begin\nreboot_delay_sec = 60\nalways_reboot = yes\nreboot_inhibited_wait_sec = 120\n# exercise-end\n' >> /etc/dnf/automatic-reboot.conf
+dnf -y reinstall glibc && sed -i '/^glibc\t/d' /var/lib/dnf-automatic-reboot/restart-state; LC_ALL=C dnf -q -C needs-restarting -r | grep -x '  \* glibc'
 ```
 
-`always_reboot = yes` makes the run request a reboot with no update pending,
-`reboot_delay_sec = 60` shortens the delay to one minute, and
-`reboot_inhibited_wait_sec = 120` gives up on an inhibited reboot after two
-minutes.
+Expected: `  * glibc`.
 
 Terminal 2 follows the run and the reboot unit for the whole test:
 
@@ -57,7 +60,7 @@ Terminal 3 holds the inhibitor in each scenario. It stands in for a package
 transaction started by hand:
 
 ```bash
-systemd-inhibit --what=shutdown --mode=block --who=exercise --why=test sleep 900
+systemd-inhibit --what=shutdown --mode=block --who=exercise --why=test sleep 2700
 ```
 
 ## 3. Cancel while the reboot is inhibited
@@ -66,8 +69,8 @@ No reboot.
 
 1. Terminal 3: start the inhibitor.
 2. Terminal 1: `systemctl start --no-block dnf-automatic-reboot.service`
-3. Terminal 2 shows `always_reboot=yes in config - scheduling reboot regardless`,
-   then `Reboot dispatch confirmed: … fires at <T>`. From `<T>` on, every
+3. Terminal 2 shows `Reboot needed: glibc`, then
+   `Reboot dispatch confirmed: … fires at <T>`. From `<T>` on, every
    30 seconds:
    `the reboot did not start: a shutdown inhibitor blocks it (… exercise … block) - retrying in 30s`.
 4. After the first such line, terminal 1:
@@ -89,8 +92,8 @@ No reboot.
 
 1. Terminal 3: start the inhibitor.
 2. Terminal 1: `systemctl start --no-block dnf-automatic-reboot.service`
-3. Terminal 2 shows `did not start` at `<T>`, `<T>`+30 s, … `<T>`+120 s, then
-   `the reboot did not start within 120s: a shutdown inhibitor blocks it … update runs stay held`.
+3. Terminal 2 shows `did not start` at `<T>`, `<T>`+30 s, … `<T>`+1800 s, then
+   `the reboot did not start within 1800s: a shutdown inhibitor blocks it … update runs stay held`.
    The reboot unit fails, and logged-in terminals receive
    `The scheduled reboot did not happen. Update runs stay blocked until the host reboots`.
 4. Terminal 1 checks that update runs are held:
@@ -116,19 +119,10 @@ Reboots the host.
 
 1. Terminal 3: start the inhibitor.
 2. Terminal 1: `systemctl start --no-block dnf-automatic-reboot.service`
-3. As soon as terminal 2 shows `Reboot dispatch confirmed`, terminal 1 removes
-   the test settings. The waiting reboot already holds its own; removing them
-   now keeps the next nightly run from rebooting again:
-
-   ```bash
-   sed -i '/^# exercise-begin$/,/^# exercise-end$/d' /etc/dnf/automatic-reboot.conf; grep -c exercise /etc/dnf/automatic-reboot.conf
-   ```
-
-   Expected: `0`.
-4. After the first `did not start … retrying in 30s`, terminal 3: Ctrl-C.
-5. Within 30 seconds terminal 2 shows `reboot-if-pending: Orderly reboot requested`,
+3. After the first `did not start … retrying in 30s`, terminal 3: Ctrl-C.
+4. Within 30 seconds terminal 2 shows `reboot-if-pending: Orderly reboot requested`,
    and the host reboots, although your user is still logged in.
-6. After the reboot:
+5. After the reboot:
 
    ```bash
    journalctl -b -1 --no-pager -u dnf-automatic-reboot-scheduled-reboot.service | tail -6; ls /run/dnf-automatic-reboot.*
@@ -140,13 +134,14 @@ Reboots the host.
 ## Stopping early
 
 ```bash
-sed -i '/^# exercise-begin$/,/^# exercise-end$/d' /etc/dnf/automatic-reboot.conf; /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh; echo "exit: $?"
+/usr/libexec/dnf-automatic-reboot/cancel-reboot.sh; echo "exit: $?"
 ```
 
-Then Ctrl-C in terminal 3. Check that `grep -c exercise /etc/dnf/automatic-reboot.conf`
-prints `0`, and that `ls /run/dnf-automatic-reboot.*` lists only `.lock` files.
+Then Ctrl-C in terminal 3. Check that `ls /run/dnf-automatic-reboot.*` lists
+only `.lock` files.
 If `cancel-reboot.sh` exits 1 because the reboot command already ran, the
-host is rebooting.
+host is rebooting. glibc stays flagged until the host reboots, so the next
+run schedules that reboot.
 
 ## Recording the result
 

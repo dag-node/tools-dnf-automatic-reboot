@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 NAME    = dnf-automatic-reboot
-VERSION = 1.5.0
+VERSION = 1.6.0
 TARBALL = $(NAME)-$(VERSION).tar.gz
 
 # /usr/libexec, not /usr/local/lib: /usr/local is reserved for the local
@@ -9,19 +9,26 @@ LIBEXECDIR   = /usr/libexec/$(NAME)
 UNITDIR      = /usr/lib/systemd/system
 CONFDIR      = /etc/dnf
 DOCDIR       = /usr/share/doc/$(NAME)
+# The configuration as shipped, which check-config.sh compares CONFDIR's with.
+SHAREDIR     = /usr/share/$(NAME)
 STATEDIR     = /var/lib/$(NAME)
 TMPFILESDIR  = /usr/lib/tmpfiles.d
 LOGROTATEDIR = /etc/logrotate.d
+# Package names the needs-restarting plugin adds to its reboot list.  The
+# plugin reads every line as a name, so install drops the file's # header.
+REBOOTLISTDIR = /etc/dnf/plugins/needs-restarting.d
 
 SCRIPTS = scripts/run.sh \
           scripts/watchdog.sh \
           scripts/needs-reboot.sh \
           scripts/notify-failure.sh \
           scripts/cancel-reboot.sh \
-          scripts/reboot-if-pending.sh
+          scripts/reboot-if-pending.sh \
+          scripts/check-config.sh
 # Sourced, never executed.
 LIBRARIES = scripts/reboot-request.sh \
-            scripts/run-state.sh
+            scripts/run-state.sh \
+            scripts/config.sh
 UNITS   = units/dnf-automatic-reboot.service \
           units/dnf-automatic-reboot.timer \
           units/dnf-automatic-watchdog.service \
@@ -30,6 +37,7 @@ UNITS   = units/dnf-automatic-reboot.service \
 CONF      = conf/automatic-reboot.conf
 TMPFILES  = tmpfiles/$(NAME).conf
 LOGROTATE = logrotate/$(NAME)
+REBOOTLIST = conf/needs-restarting.d/automatic-reboot.conf
 DOC       = doc/README
 # Repository and source archive only; it drives tools/, which the RPM does not ship.
 E2E_DOC   = doc/END-TO-END-TEST.md
@@ -87,7 +95,7 @@ lint:
 	else \
 	    echo "shellcheck not installed - skipping lint"; \
 	fi
-	@if LC_ALL=C grep -nP '[^\x00-\x7F]' $(SCRIPTS) $(LIBRARIES) $(TOOLS) $(CONF) $(UNITS) $(TMPFILES) $(LOGROTATE); then \
+	@if LC_ALL=C grep -nP '[^\x00-\x7F]' $(SCRIPTS) $(LIBRARIES) $(TOOLS) $(CONF) $(UNITS) $(TMPFILES) $(LOGROTATE) $(REBOOTLIST); then \
 	    echo "ERROR: non-ASCII characters found (scripts and config must be ASCII only)"; exit 1; \
 	else \
 	    echo "ascii OK"; \
@@ -103,13 +111,17 @@ install:
 	install -d -m 0755 $(DESTDIR)$(DOCDIR)
 	install -d -m 0755 $(DESTDIR)$(TMPFILESDIR)
 	install -d -m 0755 $(DESTDIR)$(LOGROTATEDIR)
+	install -d -m 0755 $(DESTDIR)$(REBOOTLISTDIR)
 	install -d -m 0750 $(DESTDIR)$(STATEDIR)
+	install -d -m 0755 $(DESTDIR)$(SHAREDIR)
 	install -m 0750 $(SCRIPTS)   $(DESTDIR)$(LIBEXECDIR)/
 	install -m 0640 $(LIBRARIES) $(DESTDIR)$(LIBEXECDIR)/
 	install -m 0644 $(UNITS)     $(DESTDIR)$(UNITDIR)/
+	install -m 0644 $(CONF)      $(DESTDIR)$(SHAREDIR)/automatic-reboot.conf
 	install -m 0640 $(CONF)      $(DESTDIR)$(CONFDIR)/automatic-reboot.conf
 	install -m 0644 $(TMPFILES)  $(DESTDIR)$(TMPFILESDIR)/$(NAME).conf
 	install -m 0644 $(LOGROTATE) $(DESTDIR)$(LOGROTATEDIR)/$(NAME)
+	sed '/^#/d' $(REBOOTLIST) | install -m 0644 /dev/stdin $(DESTDIR)$(REBOOTLISTDIR)/automatic-reboot.conf
 	install -m 0644 $(DOC)       $(DESTDIR)$(DOCDIR)/README
 	install -m 0644 $(LICENSE)   $(DESTDIR)$(DOCDIR)/LICENSE
 
@@ -121,13 +133,15 @@ uninstall:
 	rm -f  $(DESTDIR)$(UNITDIR)/dnf-automatic-reboot-notify@.service
 	rm -f  $(DESTDIR)$(TMPFILESDIR)/$(NAME).conf
 	rm -f  $(DESTDIR)$(LOGROTATEDIR)/$(NAME)
+	rm -f  $(DESTDIR)$(REBOOTLISTDIR)/automatic-reboot.conf
 	rm -rf $(DESTDIR)$(LIBEXECDIR)
 	rm -rf $(DESTDIR)$(DOCDIR)
+	rm -rf $(DESTDIR)$(SHAREDIR)
 	rm -rf $(DESTDIR)$(STATEDIR)
 
 dist: check
 	tar czf $(TARBALL) --transform 's,^,$(NAME)-$(VERSION)/,' \
-	    Makefile $(SCRIPTS) $(LIBRARIES) $(UNITS) $(CONF) $(TMPFILES) $(LOGROTATE) \
+	    Makefile $(SCRIPTS) $(LIBRARIES) $(UNITS) $(CONF) $(TMPFILES) $(LOGROTATE) $(REBOOTLIST) \
 	    $(TESTS) $(TOOLS) $(DOC) $(E2E_DOC) $(LICENSE) $(LICENSE_METADATA) $(NAME).spec \
 	    $(CONTAINER_BUILD_SCRIPT)
 	@echo "Created $(TARBALL)"
