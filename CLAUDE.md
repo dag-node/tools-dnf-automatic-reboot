@@ -715,7 +715,9 @@ A restart that fails, one still unfinished at `service_restart_timeout_seconds`,
 each fails the run. An excluded unit does not: it is left running by design. The run
 ends with one line naming the update, reboot and restart outcome, for example
 `Updates installed (packages: 3); no reboot needed; restart still pending for sshd.service. Check:
-systemctl status sshd.service`, logged and sent through `wall`.
+systemctl status sshd.service`, logged, and sent through `wall` when the run failed. `wall`
+carries only what a logged-in user has to know or act on: a scheduled reboot, a warning, a
+failure. A run that starts and ends without one writes to the log alone.
 
 ## `dnf-automatic` on EL8
 

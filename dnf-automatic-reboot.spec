@@ -570,6 +570,8 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   (verify_kernel_version), GRUB-default verification (verify_grub_default), false-positive
   learning (learn_false_positives), chrony-wait (enable_chrony_wait), wall messages
   (wall_messages).
+- CHANGE: Logged-in users get a message only for a scheduled reboot, a warning or a failure.
+  The start of a run and the summary of a run that succeeded go to the log alone.
   Built in: package filtering (filter_packages; running kernel packages checked by version,
   systemd by build-id, everything else learned).
   Replaced by the progress-based inactivity windows above: dnf_timeout_min,

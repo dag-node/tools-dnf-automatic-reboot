@@ -85,7 +85,7 @@ Between 03:00 and 03:10 UTC the package:
    `sudo /usr/libexec/dnf-automatic-reboot/cancel-reboot.sh`.
    If none does, restarts only the background services whose programs were
    updated, and the system keeps running.
-6. Ends with one line in the log and on logged-in terminals: updates
+6. Ends with one line in the log: updates
    installed, whether a restart is scheduled, and which services were
    restarted, failed to restart, or are left on the old program. A failed
    service restart counts as a failed run.
