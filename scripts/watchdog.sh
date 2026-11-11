@@ -421,11 +421,36 @@ report_reboot_pending_without_reboot() {
     return 1
 }
 
+# stall_still_holds SNAPSHOT
+# Re-reads, right before the kill, what the stall was measured on: the run's
+# progress signature and, while it updates, dnf's phase.  The verdict is from
+# the start of the cycle, and a run can resume in between.
+# Returns: 0 = the signature is unchanged and the phase read now still allows
+#              a kill after DNF_STALLED_MINUTES
+#          1 = the run made progress, or reached a phase with a longer window
+#          2 = the signature cannot be read
+# This narrows the time between the verdict and the kill to that of two
+# systemctl calls; it does not close it.
+stall_still_holds() {
+    local recorded_snapshot="$1" run_phase current_signature current_dnf_phase=""
+    current_signature=$(read_dnf_progress_signature) || return 2
+    [[ "${current_signature}" == "${DNF_PROGRESS_SIGNATURE}" ]] || return 1
+    run_phase=$(run_state_field "${recorded_snapshot}" phase)
+    if [[ "${run_phase}" == "updating" ]]; then
+        current_dnf_phase=$(read_dnf_run_phase "$(run_state_field "${recorded_snapshot}" dnf_log_inode)" \
+                                               "$(run_state_field "${recorded_snapshot}" dnf_log_offset)")
+    fi
+    [[ "${DNF_STALLED_MINUTES}" -ge "$(stall_window_minutes "${run_phase}" "${current_dnf_phase}")" ]] || return 1
+    return 0
+}
+
 # kill_service_cgroup SNAPSHOT PID
 # Returns: 0 = the recorded run was killed and systemd reports the unit
 #              inactive or failed
-#          1 = the run ended or was replaced; no process signalled
-#          2 = the run's identity cannot be established; no process signalled
+#          1 = the run ended, was replaced, or is no longer stalled; no
+#              process signalled
+#          2 = the run's identity or progress cannot be established; no
+#              process signalled
 #          3 = the kill failed, or the unit was still active
 #              KILL_CONFIRMATION_TIMEOUT_SECONDS seconds after it: recovery failed
 # Called between begin_recovery and the end of recovery.  The kill targets the
@@ -433,7 +458,8 @@ report_reboot_pending_without_reboot() {
 # then its number may belong to another process.
 kill_service_cgroup() {
     local recorded_snapshot="$1" recorded_pid="$2"
-    local systemd_version kill_target_option run_check_result=0 active_state="" waited_seconds=0
+    local systemd_version kill_target_option run_check_result=0 stall_check_result=0
+    local active_state="" waited_seconds=0
     recorded_run_is_unchanged "${recorded_snapshot}" "${recorded_pid}" \
         || run_check_result=$?
     if [[ "${run_check_result}" -eq 1 ]]; then
@@ -441,6 +467,14 @@ kill_service_cgroup() {
         return 1
     elif [[ "${run_check_result}" -ne 0 ]]; then
         log_error "the identity of PID ${recorded_pid} cannot be established - killing nothing, recovery abandoned"
+        return 2
+    fi
+    stall_still_holds "${recorded_snapshot}" || stall_check_result=$?
+    if [[ "${stall_check_result}" -eq 1 ]]; then
+        log "the run made progress, or reached a phase with a longer window, since the stall was measured - killing nothing, recovery abandoned"
+        return 1
+    elif [[ "${stall_check_result}" -ne 0 ]]; then
+        log_error "the progress of PID ${recorded_pid} cannot be read again - killing nothing, recovery abandoned"
         return 2
     fi
     systemd_version=$("${SYSTEMCTL_BIN}" --version 2>/dev/null \
@@ -593,6 +627,13 @@ main() {
     kill_service_cgroup "${state_snapshot}" "${service_pid}" || kill_result=$?
     [[ "${kill_result}" -eq 1 ]] && exit 0
     [[ "${kill_result}" -eq 0 ]] || exit 1
+    # The phase is read again now that nothing writes the log: a run that
+    # reached its transaction in the instant before the kill is not reported
+    # as having installed nothing.
+    if [[ "${run_phase}" == "updating" ]]; then
+        dnf_phase=$(read_dnf_run_phase "$(run_state_field "${state_snapshot}" dnf_log_inode)" \
+                                       "$(run_state_field "${state_snapshot}" dnf_log_offset)")
+    fi
     remove_inspected_run_state "${state_snapshot}"
     report_stopped_run "${run_phase}" "${dnf_phase}" || exit 1
     exit 0

@@ -617,6 +617,10 @@ echo "       systemctl enable --now dnf-automatic-reboot.timer dnf-automatic-wat
   password.
 - FIX: auditd.service is never restarted. systemd refuses the request, and the run failed.
 - FIX: The warning for a failed service restart carries the reason systemctl gave.
+- FIX: The watchdog checks again, right before it stops a stalled run, that the run has still
+  made no progress and has not started its rpm transaction, and leaves it alone otherwise.
+  The alert after a stop reads the transaction state again, so it does not say nothing was
+  installed for a run that had just begun installing.
 - FIX: A service with a space in a process name, such as spamassassin's "spamd child", is no
   longer restarted at every run. needs-restarting reads such a process as started at boot; a
   flagged service is left running, and named in the run's summary, when none of its processes

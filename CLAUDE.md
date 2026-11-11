@@ -360,6 +360,15 @@ updating; a kill on the old verdict would stop that run mid-transaction. A chang
 `MainPID`, abandons the recovery and leaves the state file alone (exit 0); a live `pid`
 with no numeric `MainPID` abandons it with exit 1.
 
+The stall is re-checked there too (`stall_still_holds`): the progress signature must be the
+one the stall was measured on, and dnf's phase, read again, must still allow a kill after
+that long. A run that wrote again, or reached its transaction, since the start of the cycle
+is left alone (exit 0); a signature that cannot be read again abandons the recovery with
+exit 1. This narrows the time between verdict and kill to that of two `systemctl` calls and
+does not close it, so the report after the kill reads the phase once more, from a log
+nothing writes any longer: a run that reached `Running transaction` in that instant is
+reported as a possibly incomplete transaction, never as having installed nothing.
+
 `systemctl kill` names the unit, not one invocation of it, so the re-check alone would
 leave a moment in which a new run could start and be killed and have its state file
 removed. The watchdog therefore creates

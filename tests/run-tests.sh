@@ -2509,6 +2509,73 @@ test_watchdog_stall_before_the_transaction_is_stopped() {
     return 0
 }
 
+# prepare_stalled_download -> a sourced watchdog over a live run, PID in
+# STALLED_RUN_PID, whose download changed nothing for 65 minutes.
+prepare_stalled_download() {
+    sleep 60 &
+    STALLED_RUN_PID=$!
+    load_watchdog_library
+    write_watchdog_state updating 70 "${STALLED_RUN_PID}"
+    start_run_dnf_log
+    append_dnf_log_messages "--- logging initialized ---"
+    write_stalled_progress_record "${STALLED_RUN_PID}" 70 65
+    stub_watchdog_kill_path
+}
+
+test_watchdog_run_that_resumes_before_the_kill_is_left_alone() {
+    prepare_stalled_download
+    # The stall is measured at the start of the cycle.  The download writes
+    # again while the watchdog re-checks the run's identity, its last step
+    # before the kill.
+    unit_main_pid() {
+        [[ -f "${RECOVERY_FILE}" ]] && write_process_io "${STUB_MAIN_PID}" 1000 9000
+        printf '%s' "${STUB_MAIN_PID:-}"
+    }
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${STALLED_RUN_PID}" 2>/dev/null
+    assert_exit_code 0 "${exit_code}" "a run that works again is no failure"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "the run resumed: not killed"
+    [[ -f "${STATE_FILE}" ]] || fail "the run is still supervised"
+    [[ -f "${RECOVERY_FILE}" ]] && fail "the recovery marker does not outlive the watchdog"
+    return 0
+}
+
+test_watchdog_run_that_reaches_its_transaction_before_the_kill_is_left_alone() {
+    prepare_stalled_download
+    # 65 minutes end a download, not a transaction: a run that reached
+    # "Running transaction" since the verdict has the longer window.
+    unit_main_pid() {
+        if [[ -f "${RECOVERY_FILE}" && ! -f "${TEST_ROOT_DIR}/transaction-started" ]]; then
+            append_dnf_log_messages "Running transaction check" "Running transaction"
+            : > "${TEST_ROOT_DIR}/transaction-started"
+        fi
+        printf '%s' "${STUB_MAIN_PID:-}"
+    }
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${STALLED_RUN_PID}" 2>/dev/null
+    assert_exit_code 0 "${exit_code}" "within the transaction's window"
+    assert_not_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "a transaction is not stopped after 65 minutes"
+}
+
+test_watchdog_report_reads_the_phase_after_the_kill() {
+    prepare_stalled_download
+    # The re-check cannot be the kill itself.  A run that reaches its
+    # transaction in the instant between them is killed, and must not be
+    # reported as having installed nothing.
+    signal_unit_processes() {
+        append_dnf_log_messages "Running transaction check" "Running transaction"
+        printf 'signal_unit_processes\n' >> "${STUB_LOG}"
+    }
+    local exit_code=0
+    ( main ) >/dev/null 2>&1 || exit_code=$?
+    kill "${STALLED_RUN_PID}" 2>/dev/null
+    assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "the run is stopped"
+    assert_contains "$(cat "${LOG_FILE}")" "an rpm transaction may be incomplete" "the report follows the log as the kill left it"
+    assert_not_contains "$(cat "${STUB_LOG}")" "Nothing was installed" "users are not told nothing was installed"
+}
+
 test_watchdog_stall_after_the_transaction_check_is_stopped() {
     run_stalled_watchdog updating 70 65 "--- logging initialized ---" "Running transaction check" "Transaction check succeeded."
     assert_contains "$(cat "${STUB_LOG}")" "signal_unit_processes" "rpm only checked: nothing installed"
@@ -4692,6 +4759,9 @@ run_test "notify: without invocation falls back to the unit" test_notify_without
 run_test "watchdog: unknown identity is not acted on" test_watchdog_unknown_identity_is_not_acted_on
 run_test "watchdog: unit has a start timeout"        test_watchdog_unit_has_a_start_timeout
 run_test "watchdog: stalled update does not reboot" test_watchdog_stalled_update_does_not_reboot needs-exec
+run_test "watchdog: run that resumes before the kill is left alone" test_watchdog_run_that_resumes_before_the_kill_is_left_alone
+run_test "watchdog: run that reaches its transaction before the kill is left alone" test_watchdog_run_that_reaches_its_transaction_before_the_kill_is_left_alone
+run_test "watchdog: report reads the phase after the kill" test_watchdog_report_reads_the_phase_after_the_kill
 run_test "watchdog: stalled reboot check does not reboot" test_watchdog_stalled_reboot_check_does_not_reboot needs-exec
 run_test "watchdog: systemd 239 kills with --kill-who" test_watchdog_stall_on_systemd_239_kills_with_kill_who needs-exec
 run_test "watchdog: stall before the transaction is stopped" test_watchdog_stall_before_the_transaction_is_stopped
