@@ -436,7 +436,7 @@ is_excluded_unit() {
 # pre-update code running that the run was meant to replace.  Excluded units
 # are left running by design and do not fail the run.
 restart_stale_services() {
-    local stale_service_output stale_service_name restart_exit_code
+    local stale_service_output stale_service_name restart_exit_code restart_error_output
     local summary_clauses=()
     RESTARTED_SERVICE_NAMES=()
     FAILED_SERVICE_NAMES=()
@@ -470,9 +470,10 @@ restart_stale_services() {
 
         # Bounded: a unit that hangs in stop or start must not hold the run.
         # Stopping the systemctl client leaves the restart job to systemd.
+        # systemctl's stderr is kept for the log: it names why a restart failed.
         restart_exit_code=0
-        timeout --kill-after="${KILL_GRACE_SECONDS}s" "${SERVICE_RESTART_TIMEOUT_SECONDS}s" \
-            "${SYSTEMCTL_BIN}" try-restart "${stale_service_name}" 2>/dev/null \
+        restart_error_output=$(timeout --kill-after="${KILL_GRACE_SECONDS}s" "${SERVICE_RESTART_TIMEOUT_SECONDS}s" \
+            "${SYSTEMCTL_BIN}" try-restart "${stale_service_name}" 2>&1 >/dev/null) \
             || restart_exit_code=$?
         # 124: still waiting at the deadline; 137: killed after the grace.
         if [[ "${restart_exit_code}" -eq 0 ]]; then
@@ -482,7 +483,8 @@ restart_stale_services() {
             log_warning "restart of ${stale_service_name} did not finish within ${SERVICE_RESTART_TIMEOUT_SECONDS}s - the job continues in systemd"
         else
             FAILED_SERVICE_NAMES+=("${stale_service_name}")
-            log_warning "failed to restart ${stale_service_name} - it is still running pre-update code"
+            restart_error_output=${restart_error_output%%$'\n'*}
+            log_warning "failed to restart ${stale_service_name} - it is still running pre-update code${restart_error_output:+ (systemctl: ${restart_error_output})}"
         fi
     done <<< "${stale_service_output}"
 

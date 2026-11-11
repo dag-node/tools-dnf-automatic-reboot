@@ -1353,6 +1353,23 @@ auditd.service"
     assert_not_contains "$(cat "${STUB_LOG}")" "try-restart auditd.service" "no restart is requested for auditd"
 }
 
+test_services_failed_restart_logs_the_reason() {
+    load_run_library
+    timeout() {
+        if [[ "$*" == *needs-restarting* ]]; then
+            printf 'nginx.service\n'
+            return 0
+        fi
+        printf 'Job for nginx.service failed because the control process exited with error code.\nSee "systemctl status nginx.service" for details.\n' >&2
+        return 1
+    }
+    local output
+    output=$(restart_stale_services 2>&1)
+    assert_contains "${output}" "failed to restart nginx.service - it is still running pre-update code (systemctl: Job for nginx.service failed because the control process exited with error code.)" \
+        "the log carries the first line systemctl printed"
+    assert_not_contains "${output}" "for details" "one line only"
+}
+
 test_run_summary_counts_what_was_installed() {
     load_run_library
     rpm() { printf '100\n200\n300\n'; }
@@ -4194,6 +4211,7 @@ run_test "conflicts: refuse what dnf-automatic would not do" test_conflicts_refu
 printf 'services\n'
 run_test "services: exclusions are additive"         test_services_exclusions_are_additive
 run_test "services: excluded units are not restarted" test_services_excluded_units_are_not_restarted needs-exec
+run_test "services: failed restart logs the reason"  test_services_failed_restart_logs_the_reason
 run_test "services: disabled by config"              test_services_disabled_by_config
 run_test "services: restart is bounded"              test_services_restart_is_bounded
 run_test "services: template units excluded by glob" test_services_template_units_are_excluded_by_glob
